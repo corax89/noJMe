@@ -1,3 +1,8 @@
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
+
 #ifndef MINIZ_EXPORT
 #define MINIZ_EXPORT
 #endif
@@ -1508,3 +1513,7 @@ extern "C"
 #endif
 
 #endif /* MINIZ_NO_ARCHIVE_APIS */
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif

@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 
 #include "jvm.h"
@@ -20,6 +21,18 @@
 
 /* Forward declarations */
 static JavaClass* create_stub_class(JVM* jvm, const char* name, const char* super_name, uint16_t access_flags);
+
+/* v34.15 FIX (Galaxy on Fire: ClassCastException on VolumeControl):
+   wire the "XyzImpl implements Xyz" links for concrete media stubs.
+   This table used to live ONLY inside get_or_create_stub_class(), but all
+   five classes already exist by then — init_stub_classes() creates them at
+   boot straight from the static stub_classes[] table WITHOUT interfaces.
+   get_or_create_stub_class() then found them "already loaded" and returned
+   them interface-less, so checkcast VolumeControl failed with CCE the first
+   time a game called Player.getControl("VolumeControl"). Extracted here and
+   called from BOTH creation paths. */
+static void stub_add_known_interfaces(JavaClass* stub);
+
 
 /* List of required J2ME stub classes */
 static const struct {
@@ -72,6 +85,21 @@ static const struct {
     { "java/util/Enumeration", "java/lang/Object", ACC_PUBLIC | ACC_INTERFACE },
     { "java/util/Timer", "java/lang/Object", ACC_PUBLIC },
     { "java/util/TimerTask", "java/lang/Object", ACC_PUBLIC | ACC_ABSTRACT },
+
+    /* v36.33 [SAX-XML]: javax.xml.parsers + org.xml.sax stubs (Speedx 3D
+     * and other games parse their bitmap-font descriptors through SAX).
+     * The natives live in jvm/sax.c. */
+    { "javax/xml/parsers/SAXParserFactory", "java/lang/Object", ACC_PUBLIC },
+    { "javax/xml/parsers/SAXParser", "java/lang/Object", ACC_PUBLIC },
+    { "javax/xml/parsers/ParserConfigurationException", "java/lang/Exception", ACC_PUBLIC },
+    { "org/xml/sax/SAXException", "java/lang/Exception", ACC_PUBLIC },
+    { "org/xml/sax/SAXNotRecognizedException", "org/xml/sax/SAXException", ACC_PUBLIC },
+    { "org/xml/sax/SAXNotSupportedException", "org/xml/sax/SAXException", ACC_PUBLIC },
+    { "org/xml/sax/InputSource", "java/lang/Object", ACC_PUBLIC },
+    { "org/xml/sax/Attributes", "java/lang/Object", ACC_PUBLIC | ACC_INTERFACE },
+    { "org/xml/sax/ContentHandler", "java/lang/Object", ACC_PUBLIC | ACC_INTERFACE },
+    { "org/xml/sax/helpers/DefaultHandler", "java/lang/Object", ACC_PUBLIC },
+    { "org/xml/sax/helpers/AttributesImpl", "java/lang/Object", ACC_PUBLIC },
     
     /* I/O classes */
     { "java/io/InputStream", "java/lang/Object", ACC_PUBLIC | ACC_ABSTRACT },
@@ -187,6 +215,14 @@ static const struct {
     { "com/nokia/mid/ui/DirectGraphics", "java/lang/Object", ACC_PUBLIC | ACC_INTERFACE },
     { "com/nokia/mid/ui/DirectUtils", "java/lang/Object", ACC_PUBLIC },
     { "com/nokia/mid/ui/DeviceControl", "java/lang/Object", ACC_PUBLIC },
+    /* [BATFIX] v36.41: собственный класс-API заряда для мидлетов —
+     * nojme.device.Battery.getLevel()I / isCharging()Z (нативы
+     * init_nojme_battery в native.c; диспетчер invokestatic резолвит их
+     * по имени класса даже без объявленных методов стаба — тот же путь,
+     * что у DeviceControl). Второй способ чтения — System.getProperty
+     * (ключи batterylevel / com.nokia.mid.batterylevel /
+     * nojme.batterylevel), см. sysprop_dynamic. */
+    { "nojme/device/Battery", "java/lang/Object", ACC_PUBLIC },
     { "com/nokia/mid/sound/Sound", "java/lang/Object", ACC_PUBLIC },
     { "com/nokia/mid/sound/SoundListener", "java/lang/Object", ACC_PUBLIC | ACC_INTERFACE },
     { "com/nokia/mid/ui/Clipboard", "java/lang/Object", ACC_PUBLIC },
@@ -363,6 +399,21 @@ static void ensure_cp_capacity(JavaClass* clazz, size_t needed) {
         free(clazz->constant_pool);
         clazz->constant_pool = new_pool;
         clazz->constant_pool_capacity = new_cap;
+
+        /* v34.35: the CP grew — CP-index inline caches (opcodes.c) were
+         * sized to the old constant_pool_count; drop them so they are
+         * re-allocated at the new size. (Incomplete types: free() only.) */
+        free(clazz->field_cache);
+        free(clazz->invoke_cache);
+        free(clazz->static_field_cache);
+        /* v34.59 PERF: GC mark-layout cache (пересоздаётся лениво) */
+        free(clazz->gc_ref_slots);
+        clazz->gc_ref_slots = NULL;
+        clazz->gc_ref_slot_count = 0;
+        clazz->gc_kind = 0;
+        clazz->field_cache = NULL;
+        clazz->invoke_cache = NULL;
+        clazz->static_field_cache = NULL;
     }
 }
 
@@ -488,6 +539,17 @@ static void ensure_methods_capacity(JavaClass* clazz) {
         free(clazz->methods);
         clazz->methods = new_methods;
         clazz->methods_capacity = new_cap;
+        
+        /* FIX (audit S-10, v18): all JavaMethod* previously handed out for this
+         * class point into the freed array. Flush the method cache so no
+         * dangling pointer is ever executed. */
+        method_cache_flush();
+        /* v34.35: the CP inline caches (opcodes.c InvokeRefCache) hold raw
+         * JavaMethod* too — bump the generation so they self-invalidate. */
+        {
+            extern uint16_t g_vm_cache_gen;
+            g_vm_cache_gen++;
+        }
     }
 }
 
@@ -511,6 +573,9 @@ static int create_stub_method(JavaClass* clazz, const char* name,
     method->access_flags = access_flags;
     method->attributes_count = 0;
     method->clazz = clazz;
+    /* FIX: sentinel "-1 = not yet computed" for the arg-count cache;
+     * memset() above zeroes it which falsely means "0 arguments". */
+    method->cached_arg_count = -1;
     
     /* Set is_native flag if ACC_NATIVE is set */
     method->is_native = (access_flags & ACC_NATIVE) ? 1 : 0;
@@ -536,7 +601,52 @@ static int create_stub_method(JavaClass* clazz, const char* name,
 }
 
 /* Create a stub class */
+/* ==== v20 (P0-4 / FIX-20g restore): static final constants for stub classes ====
+ * Platform stubs have no <clinit> and (as classfile stubs) no ConstantValue
+ * attribute parsing, so `getstatic Math.PI`, `Integer.MAX_VALUE`,
+ * `AnimationTrack.TRANSLATION`, `CompositingMode.REPLACE` ... all returned 0.
+ * These helpers materialize them as real static slots at stub creation. */
+static void stub_add_static_const(JavaClass* clazz, const char* name,
+                                  const char* descriptor, JavaValue value) {
+    if (!clazz || !name) return;
+    if (!clazz->static_fields) {
+        clazz->static_fields = (JavaStaticField*)calloc(16, sizeof(JavaStaticField));
+        if (!clazz->static_fields) return;
+        clazz->static_fields_count = 0;
+        clazz->static_fields_capacity = 16;
+    }
+    if (clazz->static_fields_count >= clazz->static_fields_capacity) {
+        int new_cap = clazz->static_fields_capacity * 2;
+        JavaStaticField* nf = (JavaStaticField*)realloc(
+            clazz->static_fields, (size_t)new_cap * sizeof(JavaStaticField));
+        if (!nf) return;
+        memset(nf + clazz->static_fields_capacity, 0,
+               (size_t)(new_cap - clazz->static_fields_capacity) * sizeof(JavaStaticField));
+        clazz->static_fields = nf;
+        clazz->static_fields_capacity = new_cap;
+    }
+    /* Do not duplicate (idempotent for repeated init paths). */
+    for (int i = 0; i < clazz->static_fields_count; i++) {
+        if (clazz->static_fields[i].name && strcmp(clazz->static_fields[i].name, name) == 0 &&
+            clazz->static_fields[i].descriptor && strcmp(clazz->static_fields[i].descriptor, descriptor) == 0) {
+            return;
+        }
+    }
+    JavaStaticField* sf = &clazz->static_fields[clazz->static_fields_count++];
+    sf->name = strdup(name);
+    sf->descriptor = strdup(descriptor);
+    sf->value = value;
+}
+
+static void stub_add_static_int_consts(JavaClass* clazz, const char* const* names, const jint* values, int count) {
+    for (int i = 0; i < count; i++) {
+        JavaValue v; memset(&v, 0, sizeof(v)); v.i = values[i];
+        stub_add_static_const(clazz, names[i], "I", v);
+    }
+}
+
 static JavaClass* create_stub_class(JVM* jvm, const char* name, const char* super_name, uint16_t access_flags) {
+    (void)jvm;
     if (!name) return NULL;
     
     JavaClass* clazz = (JavaClass*)calloc(1, sizeof(JavaClass));
@@ -574,11 +684,21 @@ static JavaClass* create_stub_class(JVM* jvm, const char* name, const char* supe
      */
     bool add_constructor = !(access_flags & ACC_INTERFACE);
     
-    /* List of classes that must NOT have a public constructor generated */
+    /* List of classes that must NOT have a public constructor generated.
+     * v18 FIX: added java/util/Date and java/util/Random — their native
+     * <init> handlers ARE registered (native_date_init[_millis],
+     * native_random_init[_seed]); the generated generic ctor used to win
+     * method resolution and silently skip them, leaving the internal
+     * field at 0 (Date.getTime() == 0, Random(seed) == Random(0)). */
     if (strcmp(name, "javax/microedition/lcdui/Image") == 0 ||
         strcmp(name, "javax/microedition/lcdui/Graphics") == 0 ||
         strcmp(name, "javax/microedition/lcdui/Font") == 0 ||
-        strcmp(name, "javax/microedition/lcdui/Display") == 0) {
+        strcmp(name, "javax/microedition/lcdui/Display") == 0 ||
+        strcmp(name, "java/util/Date") == 0 ||
+        strcmp(name, "java/util/Random") == 0 ||
+        /* v34.3: new String() must reach native_string_init (generic
+         * bytecode ctor left the value field NULL). */
+        strcmp(name, "java/lang/String") == 0) {
         add_constructor = false;
     }
     
@@ -645,37 +765,18 @@ static JavaClass* create_stub_class(JVM* jvm, const char* name, const char* supe
                           ACC_PUBLIC | ACC_NATIVE, NULL, 0);
     }
     
-    /* Special case for String: needs multiple constructors */
-    if (strcmp(name, "java/lang/String") == 0) {
-        /* String() - empty string */
-        uint8_t init_empty[1];
-        init_empty[0] = 0xB1; /* return */
-        create_stub_method(clazz, "<init>", "()V", ACC_PUBLIC, init_empty, 1);
-        
-        /* String(char[]) - from char array */
-        uint8_t init_chars[5];
-        init_chars[0] = 0x2A; /* aload_0 */
-        init_chars[1] = 0xB7; /* invokespecial */
-        init_chars[2] = 0x00; /* super index (will be fixed) */
-        init_chars[3] = 0x01;
-        init_chars[4] = 0xB1; /* return */
-        create_stub_method(clazz, "<init>", "([C)V", ACC_PUBLIC, init_chars, 5);
-        
-        /* String(byte[]) - from byte array */
-        create_stub_method(clazz, "<init>", "([B)V", ACC_PUBLIC, init_chars, 5);
-        
-        /* String(String) - copy constructor */
-        create_stub_method(clazz, "<init>", "(Ljava/lang/String;)V", ACC_PUBLIC, init_chars, 5);
-        
-        /* String(StringBuffer) - from StringBuffer */
-        create_stub_method(clazz, "<init>", "(Ljava/lang/StringBuffer;)V", ACC_PUBLIC, init_chars, 5);
-        
-        /* String(char[], int, int) - from char array with offset */
-        create_stub_method(clazz, "<init>", "([CII)V", ACC_PUBLIC, init_chars, 5);
-        
-        /* String(byte[], int, int) - from byte array with offset */
-        create_stub_method(clazz, "<init>", "([BII)V", ACC_PUBLIC, init_chars, 5);
-    }
+    /* FIX: java/lang/String constructor variants are NOT defined here anymore.
+     * Previously this block created bytecode "trampolines" that just called
+     * super.<init>() and silently dropped all arguments, so strings built with
+     * new String(char[])/(String)/(StringBuffer)... ended up empty (value=NULL),
+     * corrupting any MIDlet config parsing and later producing NullPointerExceptions.
+     *
+     * Now these constructors resolve through the native registry instead:
+     * jvm_resolve_method() fails -> op_invokespecial falls back to
+     * native_find(class, "<init>", descriptor) -> native_string_init_* runs
+     * with full argument semantics (see native.c registrations).
+     * Only <init>()V stays defined by the generic add_constructor path above.
+     */
     
     if (add_constructor) {
         /* 
@@ -732,30 +833,17 @@ static JavaClass* create_stub_class(JVM* jvm, const char* name, const char* supe
                               ACC_PUBLIC, paint_code, 1);
         }
 
-        /* Alert constructors:
-         *   Alert() — default (created by generic subclass constructor above)
-         *   Alert(String title) — title only
-         *   Alert(String title, String text, Image image, AlertType alertType) — full */
-        if (strcmp(name, "javax/microedition/lcdui/Alert") == 0) {
-            uint16_t super_init_ref = add_method_ref(clazz, "javax/microedition/lcdui/Screen", "<init>", "()V");
-
-            /* Simple init: just calls super.<init>()V and returns.
-             * The real Alert Java code will call setTitle()/setString() etc.
-             * We cannot do putfield from bytecode here because the Alert fields
-             * are added after stub class creation (in setup_stub_class_fields). */
-            uint8_t simple_init[5];
-            simple_init[0] = 0x2A; /* aload_0 */
-            simple_init[1] = 0xB7; /* invokespecial */
-            simple_init[2] = (super_init_ref >> 8) & 0xFF;
-            simple_init[3] = super_init_ref & 0xFF;
-            simple_init[4] = 0xB1; /* return */
-
-            create_stub_method(clazz, "<init>", "(Ljava/lang/String;)V", ACC_PUBLIC, simple_init, 5);
-
-            create_stub_method(clazz, "<init>",
-                "(Ljava/lang/String;Ljava/lang/String;Ljavax/microedition/lcdui/Image;Ljavax/microedition/lcdui/AlertType;)V",
-                ACC_PUBLIC, simple_init, 5);
-        }
+        /* v34.3 FIX: the stub bytecode constructors that used to live here
+         * only called super.<init>() and silently DROPPED their arguments.
+         * Before v34 the execute.c stub shortcut dispatched them to the
+         * registered native <init>; after the v34 narrowing ("stub shortcut
+         * only for methods WITHOUT bytecode") the no-op bytecode won and the
+         * native never ran (ByteArrayInputStream kept buf=NULL/count=0 ->
+         * Manager.createPlayer threw MediaException; Alert lost title/text;
+         * Sound/StringBuffer lost their data). All these constructors have
+         * registered natives now - resolution reaches them through the
+         * op_invokespecial constructor fallback (v18 FIX), so the block is
+         * simply gone. See FIXES.txt v34.3. */
 
         /* ИСПРАВЛЕНО: Добавляем paint() для Canvas тоже */
         if (strcmp(name, "javax/microedition/lcdui/Canvas") == 0) {
@@ -792,6 +880,212 @@ static JavaClass* create_stub_class(JVM* jvm, const char* name, const char* supe
             create_stub_method(clazz, "serviceRepaints", "()V", ACC_PUBLIC | ACC_NATIVE, NULL, 0);
             create_stub_method(clazz, "setFullScreenMode", "(Z)V", ACC_PUBLIC | ACC_NATIVE, NULL, 0);
             create_stub_method(clazz, "isShown", "()Z", ACC_PUBLIC | ACC_NATIVE, NULL, 0);
+
+            /* FIX-19o: MIDP-spec static constants. They were missing, so
+             * getstatic Canvas.UP/DOWN/... returned 0 for ALL actions -
+             * getKeyCode(0)==getKeyCode(0) collapsed UP/DOWN/LEFT/RIGHT/FIRE
+             * into one code and broke game-action roundtrips in every game. */
+            {
+                #define CANVAS_CONST_COUNT 21
+                static const struct { const char* name; int value; } canvas_consts[CANVAS_CONST_COUNT] = {
+                    { "KEY_NUM0", 48 }, { "KEY_NUM1", 49 }, { "KEY_NUM2", 50 },
+                    { "KEY_NUM3", 51 }, { "KEY_NUM4", 52 }, { "KEY_NUM5", 53 },
+                    { "KEY_NUM6", 54 }, { "KEY_NUM7", 55 }, { "KEY_NUM8", 56 },
+                    { "KEY_NUM9", 57 },
+                    { "KEY_STAR", 42 }, { "KEY_POUND", 35 },
+                    { "UP", 1 }, { "DOWN", 6 }, { "LEFT", 2 },
+                    { "RIGHT", 5 }, { "FIRE", 8 },
+                    { "GAME_A", 9 }, { "GAME_B", 10 },
+                    { "GAME_C", 11 }, { "GAME_D", 12 },
+                };
+                clazz->static_fields = (JavaStaticField*)calloc(24, sizeof(JavaStaticField));
+                clazz->static_fields_count = 0;
+                clazz->static_fields_capacity = 24;
+                if (clazz->static_fields) {
+                    for (int ci = 0; ci < CANVAS_CONST_COUNT; ci++) {
+                        JavaStaticField* sf = &clazz->static_fields[clazz->static_fields_count++];
+                        sf->name = strdup(canvas_consts[ci].name);
+                        sf->descriptor = strdup("I");
+                        memset(&sf->value, 0, sizeof(JavaValue));
+                        sf->value.i = canvas_consts[ci].value;
+                    }
+                }
+                #undef CANVAS_CONST_COUNT
+            }
+        }
+
+        /* ==== v20 (P0-4): java.lang static final constants on stubs ====
+         * Math.PI/E, Integer.MIN_VALUE/MAX_VALUE, Boolean.TRUE/FALSE,
+         * Double.NaN/... were all 0/null through getstatic (stubs have no
+         * <clinit>). */
+        if (strcmp(name, "java/lang/Math") == 0) {
+            JavaValue v; memset(&v, 0, sizeof(v));
+            v.d = 2.7182818284590452354;  stub_add_static_const(clazz, "E",  "D", v);
+            v.d = 3.14159265358979323846; stub_add_static_const(clazz, "PI", "D", v);
+        }
+        else if (strcmp(name, "java/lang/Integer") == 0) {
+            static const char* n[] = { "MIN_VALUE", "MAX_VALUE" };
+            const jint vals[] = { INT32_MIN, INT32_MAX };
+            stub_add_static_int_consts(clazz, n, vals, 2);
+        }
+        else if (strcmp(name, "java/lang/Long") == 0) {
+            /* 64-bit values: registered directly, not via the int-consts helper */
+            JavaValue v; memset(&v, 0, sizeof(v));
+            v.j = INT64_MIN; stub_add_static_const(clazz, "MIN_VALUE", "J", v);
+            v.j = INT64_MAX; stub_add_static_const(clazz, "MAX_VALUE", "J", v);
+        }
+        else if (strcmp(name, "java/lang/Short") == 0) {
+            const char* n[] = { "MIN_VALUE", "MAX_VALUE" };
+            const jint vals[] = { -32768, 32767 };
+            stub_add_static_int_consts(clazz, n, vals, 2);
+        }
+        else if (strcmp(name, "java/lang/Byte") == 0) {
+            const char* n[] = { "MIN_VALUE", "MAX_VALUE" };
+            const jint vals[] = { -128, 127 };
+            stub_add_static_int_consts(clazz, n, vals, 2);
+        }
+        else if (strcmp(name, "java/lang/Character") == 0) {
+            const char* n[] = { "MIN_RADIX", "MAX_RADIX" };
+            const jint vals[] = { 2, 36 };
+            stub_add_static_int_consts(clazz, n, vals, 2);
+            JavaValue v; memset(&v, 0, sizeof(v));
+            v.i = 0;     stub_add_static_const(clazz, "MIN_VALUE", "C", v);
+            v.i = 65535; stub_add_static_const(clazz, "MAX_VALUE", "C", v);
+        }
+        else if (strcmp(name, "java/lang/Float") == 0) {
+            JavaValue v; memset(&v, 0, sizeof(v));
+            v.f = 1.4e-45f;      stub_add_static_const(clazz, "MIN_VALUE", "F", v);
+            v.f = 3.4028234663852886e+38f; stub_add_static_const(clazz, "MAX_VALUE", "F", v);
+            v.f = INFINITY;      stub_add_static_const(clazz, "POSITIVE_INFINITY", "F", v);
+            v.f = -INFINITY;     stub_add_static_const(clazz, "NEGATIVE_INFINITY", "F", v);
+            v.f = NAN;           stub_add_static_const(clazz, "NaN", "F", v);
+        }
+        else if (strcmp(name, "java/lang/Double") == 0) {
+            JavaValue v; memset(&v, 0, sizeof(v));
+            v.d = 4.9e-324;      stub_add_static_const(clazz, "MIN_VALUE", "D", v);
+            v.d = 1.7976931348623157e+308; stub_add_static_const(clazz, "MAX_VALUE", "D", v);
+            v.d = INFINITY;      stub_add_static_const(clazz, "POSITIVE_INFINITY", "D", v);
+            v.d = -INFINITY;     stub_add_static_const(clazz, "NEGATIVE_INFINITY", "D", v);
+            v.d = NAN;           stub_add_static_const(clazz, "NaN", "D", v);
+        }
+        else if (strcmp(name, "java/lang/Boolean") == 0) {
+            /* v20: reserve TRUE/FALSE slots with the OBJECT descriptor.
+             * The instances are materialized at the END of
+             * init_stub_classes() — here the "value" instance field does not
+             * exist yet, so allocating now would produce objects without
+             * room for it (the v15 undersized-stub lesson). */
+            JavaValue rt; memset(&rt, 0, sizeof(rt)); rt.ref = NULL;
+            stub_add_static_const(clazz, "TRUE", "Ljava/lang/Boolean;", rt);
+            JavaValue rf; memset(&rf, 0, sizeof(rf)); rf.ref = NULL;
+            stub_add_static_const(clazz, "FALSE", "Ljava/lang/Boolean;", rf);
+        }
+
+        /* ==== v20 (FIX-20g restore): JSR-184 static final constants ====
+         * `new AnimationTrack(seq, AnimationTrack.TRANSLATION)` passed
+         * propertyId=0 without these, silently killing animation tracks
+         * created through the API. Values match JSR-184 and the internal
+         * M3G_ANIM_* evaluation table. */
+        if (strcmp(name, "javax/microedition/m3g/AnimationTrack") == 0) {
+            static const char* n[] = {
+                "ALPHA", "AMBIENT_COLOR", "COLOR", "CROP", "DENSITY",
+                "DIFFUSE_COLOR", "EMISSIVE_COLOR", "FAR_DISTANCE",
+                "FIELD_OF_VIEW", "INTENSITY", "MORPH_WEIGHTS",
+                "NEAR_DISTANCE", "ORIENTATION", "PICKABILITY", "SCALE",
+                "SHININESS", "SPECULAR_COLOR", "SPOT_ANGLE",
+                "SPOT_EXPONENT", "TRANSLATION", "VISIBILITY" };
+            static const jint v[] = {
+                256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266,
+                267, 268, 269, 270, 271, 272, 273, 274, 275, 276 };
+            stub_add_static_int_consts(clazz, n, v, 21);
+        }
+        else if (strcmp(name, "javax/microedition/m3g/KeyframeSequence") == 0) {
+            /* v23: JSR-184 javadoc literals — LINEAR=176, SLERP=177, SPLINE=178,
+             * SQUAD=179, STEP=180. Games that hardcode the javadoc values no
+             * longer hit off-by-one; the evaluator normalizes both encodings
+             * (0..3 legacy kept working via m3g_normalize_interpolation).
+             * v31 FIX: CONSTANT was 180 (= STEP, collision) and LOOP was
+             * MISSING entirely — getstatic KeyframeSequence.LOOP returned 0,
+             * setRepeatMode(0) never matched M3G_REPEAT_LOOP(193), so every
+             * LOOPING keyframe animation clamped to an endpoint and scenes
+             * froze at a single pose (M3GTest scenes 5 & 7 static). Real
+             * JSR-184 values: CONSTANT=192, LOOP=193 (same bytes the M3G
+             * file format stores). */
+            static const char* n[] = { "LINEAR", "SLERP", "SPLINE", "SQUAD", "STEP",
+                                       "CONSTANT", "LOOP" };
+            static const jint v[] = { 176, 177, 178, 179, 180, 192, 193 };
+            stub_add_static_int_consts(clazz, n, v, 7);
+        }
+        else if (strcmp(name, "javax/microedition/m3g/CompositingMode") == 0) {
+            static const char* n[] = { "ALPHA", "ALPHA_ADD", "MODULATE", "MODULATE_X2", "REPLACE" };
+            static const jint v[] = { 64, 65, 66, 67, 68 };
+            stub_add_static_int_consts(clazz, n, v, 5);
+        }
+        else if (strcmp(name, "javax/microedition/m3g/PolygonMode") == 0) {
+            /* v31 FIX: WINDING_CCW/WINDING_CW were SWAPPED (CW=168, CCW=169).
+             * Real JSR-184: WINDING_CCW=168, WINDING_CW=169 (matches the
+             * CULL_* block order used by every reference stub). */
+            static const char* n[] = { "CULL_BACK", "CULL_FRONT", "CULL_NONE",
+                                       "SHADE_FLAT", "SHADE_SMOOTH",
+                                       "WINDING_CCW", "WINDING_CW" };
+            static const jint v[] = { 160, 161, 162, 164, 165, 168, 169 };
+            stub_add_static_int_consts(clazz, n, v, 7);
+        }
+        else if (strcmp(name, "javax/microedition/m3g/Texture2D") == 0) {
+            /* v31 FIX: added the five FUNC_* blending constants (real JSR-184
+             * values: FUNC_ADD=224, FUNC_BLEND=225, FUNC_DECAL=226,
+             * FUNC_MODULATE=227, FUNC_REPLACE=228). They were MISSING from
+             * the stub — getstatic Texture2D.FUNC_REPLACE returned 0, so
+             * setBlending(0) landed on the "unset" default and every texture
+             * blending demonstration collapsed to MODULATE (M3GTest scene 4
+             * showed no per-quad blending difference). The renderer already
+             * maps the 224..228 block (it was labeled "Nokia-era" but it is
+             * the actual JSR-184 constant block). */
+            static const char* n[] = { "FILTER_BASE_LEVEL", "FILTER_LINEAR", "FILTER_NEAREST",
+                                       "FILTER_TRILINEAR", "WRAP_CLAMP", "WRAP_REPEAT",
+                                       "FUNC_ADD", "FUNC_BLEND", "FUNC_DECAL",
+                                       "FUNC_MODULATE", "FUNC_REPLACE" };
+            static const jint v[] = { 208, 209, 210, 211, 240, 241,
+                                      224, 225, 226, 227, 228 };
+            stub_add_static_int_consts(clazz, n, v, 11);
+        }
+        else if (strcmp(name, "javax/microedition/m3g/Camera") == 0) {
+            static const char* n[] = { "GENERIC", "PARALLEL", "PERSPECTIVE" };
+            static const jint v[] = { 0, 1, 2 };
+            stub_add_static_int_consts(clazz, n, v, 3);
+        }
+        else if (strcmp(name, "javax/microedition/m3g/Light") == 0) {
+            /* v31 FIX: the stub block 0..3 is kept as the internal encoding
+             * (m3g_light_mode_to_type accepts both), but the real JSR-184
+             * API values are 128..131 — midlets that inline the constants
+             * (compiled against the real API's `static final` fields) pass
+             * 128..131 to setMode, which the old stub never provided. */
+            static const char* n[] = { "AMBIENT", "DIRECTIONAL", "OMNI", "SPOT" };
+            static const jint v[] = { 128, 129, 130, 131 };
+            stub_add_static_int_consts(clazz, n, v, 4);
+        }
+        else if (strcmp(name, "javax/microedition/m3g/Material") == 0) {
+            /* v31 CRITICAL FIX: the Material stub registered NO constants —
+             * getstatic Material.AMBIENT (etc.) returned 0, and
+             * Material.setColor(0, argb) matched no component, so EVERY
+             * material kept its zero-initialized fields: ambient/diffuse/
+             * specular/emissive all 0x00000000 (m3gtest scene 3 rendered
+             * black). Real JSR-184 values: AMBIENT=32, DIFFUSE=33,
+             * EMISSIVE=34, SPECULAR=35 (setColor takes an enum, not a
+             * bitmask — the native now accepts both encodings). */
+            static const char* n[] = { "AMBIENT", "DIFFUSE", "EMISSIVE", "SPECULAR" };
+            static const jint v[] = { 32, 33, 34, 35 };
+            stub_add_static_int_consts(clazz, n, v, 4);
+        }
+        else if (strcmp(name, "javax/microedition/m3g/Fog") == 0) {
+            static const char* n[] = { "LINEAR", "EXPONENTIAL" };
+            static const jint v[] = { 80, 81 };
+            stub_add_static_int_consts(clazz, n, v, 2);
+        }
+        else if (strcmp(name, "javax/microedition/m3g/Image2D") == 0) {
+            static const char* n[] = { "FORMAT_ALPHA", "FORMAT_LUMINANCE", "FORMAT_LUMINANCE_ALPHA",
+                                       "FORMAT_RGB", "FORMAT_RGBA" };
+            static const jint v[] = { 96, 97, 98, 99, 100 };
+            stub_add_static_int_consts(clazz, n, v, 5);
         }
         
         /* Displayable native methods */
@@ -1192,96 +1486,29 @@ static JavaClass* create_stub_class(JVM* jvm, const char* name, const char* supe
             create_stub_method(clazz, "<init>", "(Ljava/lang/Runnable;Ljava/lang/String;)V", ACC_PUBLIC, init_runnable_string_code, 20);
         }
         
-        /* Special case for Nokia Sound: needs default constructor () and constructor ([BI) */
-        if (strcmp(name, "com/nokia/mid/sound/Sound") == 0) {
-            uint16_t super_init_ref = add_method_ref(clazz, "java/lang/Object", "<init>", "()V");
-            
-            /* Default constructor ()V - already added above, but we also need constructor with params */
-            
-            /* Constructor: Sound(byte[] data, int type) */
-            uint8_t init_bytes_int_code[5];
-            init_bytes_int_code[0] = 0x2A; /* aload_0 */
-            init_bytes_int_code[1] = 0xB7; /* invokespecial */
-            init_bytes_int_code[2] = (super_init_ref >> 8) & 0xFF;
-            init_bytes_int_code[3] = super_init_ref & 0xFF;
-            init_bytes_int_code[4] = 0xB1; /* return */
-            
-            create_stub_method(clazz, "<init>", "([BI)V", ACC_PUBLIC, init_bytes_int_code, 5);
-            
-            /* Constructor: Sound(byte[] data) - only data, no type */
-            uint8_t init_bytes_code[5];
-            init_bytes_code[0] = 0x2A; /* aload_0 */
-            init_bytes_code[1] = 0xB7; /* invokespecial */
-            init_bytes_code[2] = (super_init_ref >> 8) & 0xFF;
-            init_bytes_code[3] = super_init_ref & 0xFF;
-            init_bytes_code[4] = 0xB1; /* return */
-            
-            create_stub_method(clazz, "<init>", "([B)V", ACC_PUBLIC, init_bytes_code, 5);
-            
-            /* Constructor: Sound(byte[] data, int type, int frames) */
-            uint8_t init_bytes_int_int_code[5];
-            init_bytes_int_int_code[0] = 0x2A; /* aload_0 */
-            init_bytes_int_int_code[1] = 0xB7; /* invokespecial */
-            init_bytes_int_int_code[2] = (super_init_ref >> 8) & 0xFF;
-            init_bytes_int_int_code[3] = super_init_ref & 0xFF;
-            init_bytes_int_int_code[4] = 0xB1; /* return */
-            
-            create_stub_method(clazz, "<init>", "([BII)V", ACC_PUBLIC, init_bytes_int_int_code, 5);
-            
-            /* Constructor: Sound(int type, long data) - for tone sounds */
-            uint8_t init_int_long_code[5];
-            init_int_long_code[0] = 0x2A; /* aload_0 */
-            init_int_long_code[1] = 0xB7; /* invokespecial */
-            init_int_long_code[2] = (super_init_ref >> 8) & 0xFF;
-            init_int_long_code[3] = super_init_ref & 0xFF;
-            init_int_long_code[4] = 0xB1; /* return */
-            
-            create_stub_method(clazz, "<init>", "(IJ)V", ACC_PUBLIC, init_int_long_code, 5);
-            
-            /* Constructor: Sound(int type, double data) - alternative */
-            create_stub_method(clazz, "<init>", "(ID)V", ACC_PUBLIC, init_int_long_code, 5);
-            
-            /* Constructor: Sound(int) - just type */
-            uint8_t init_int_code[5];
-            init_int_code[0] = 0x2A; /* aload_0 */
-            init_int_code[1] = 0xB7; /* invokespecial */
-            init_int_code[2] = (super_init_ref >> 8) & 0xFF;
-            init_int_code[3] = super_init_ref & 0xFF;
-            init_int_code[4] = 0xB1; /* return */
-            
-            create_stub_method(clazz, "<init>", "(I)V", ACC_PUBLIC, init_int_code, 5);
-        }
+        /* v34.3 FIX: the stub bytecode constructors that used to live here
+         * only called super.<init>() and silently DROPPED their arguments.
+         * Before v34 the execute.c stub shortcut dispatched them to the
+         * registered native <init>; after the v34 narrowing ("stub shortcut
+         * only for methods WITHOUT bytecode") the no-op bytecode won and the
+         * native never ran (ByteArrayInputStream kept buf=NULL/count=0 ->
+         * Manager.createPlayer threw MediaException; Alert lost title/text;
+         * Sound/StringBuffer lost their data). All these constructors have
+         * registered natives now - resolution reaches them through the
+         * op_invokespecial constructor fallback (v18 FIX), so the block is
+         * simply gone. See FIXES.txt v34.3. */
         
-        /* Special case for ByteArrayInputStream: needs constructor (byte[]) */
-        if (strcmp(name, "java/io/ByteArrayInputStream") == 0) {
-            /* public ByteArrayInputStream(byte[] buf)
-             * Code: aload_0, invokespecial super.<init>(), aload_0, aload_1, putfield buf, 
-             *       aload_0, aload_1.arraylength, putfield count, return
-             * But simplified: just call super and the native handler will set fields
-             */
-            uint16_t super_init_ref = add_method_ref(clazz, "java/io/InputStream", "<init>", "()V");
-            
-            /* We need to add field reference for buf field - but since this is stub,
-             * the native code will handle initialization. Just create minimal constructor. */
-            uint8_t init_code[5];
-            init_code[0] = 0x2A; /* aload_0 */
-            init_code[1] = 0xB7; /* invokespecial */
-            init_code[2] = (super_init_ref >> 8) & 0xFF;
-            init_code[3] = super_init_ref & 0xFF;
-            init_code[4] = 0xB1; /* return */
-            
-            create_stub_method(clazz, "<init>", "([B)V", ACC_PUBLIC, init_code, 5);
-            
-            /* Also add constructor with offset and length: (byte[], int, int) */
-            uint8_t init_code_3[5];
-            init_code_3[0] = 0x2A; /* aload_0 */
-            init_code_3[1] = 0xB7; /* invokespecial */
-            init_code_3[2] = (super_init_ref >> 8) & 0xFF;
-            init_code_3[3] = super_init_ref & 0xFF;
-            init_code_3[4] = 0xB1; /* return */
-            
-            create_stub_method(clazz, "<init>", "([BII)V", ACC_PUBLIC, init_code_3, 5);
-        }
+        /* v34.3 FIX: the stub bytecode constructors that used to live here
+         * only called super.<init>() and silently DROPPED their arguments.
+         * Before v34 the execute.c stub shortcut dispatched them to the
+         * registered native <init>; after the v34 narrowing ("stub shortcut
+         * only for methods WITHOUT bytecode") the no-op bytecode won and the
+         * native never ran (ByteArrayInputStream kept buf=NULL/count=0 ->
+         * Manager.createPlayer threw MediaException; Alert lost title/text;
+         * Sound/StringBuffer lost their data). All these constructors have
+         * registered natives now - resolution reaches them through the
+         * op_invokespecial constructor fallback (v18 FIX), so the block is
+         * simply gone. See FIXES.txt v34.3. */
         
         /* Special case for ByteArrayOutputStream: needs default constructor */
         if (strcmp(name, "java/io/ByteArrayOutputStream") == 0) {
@@ -1338,88 +1565,63 @@ static JavaClass* create_stub_class(JVM* jvm, const char* name, const char* supe
             create_stub_method(clazz, "<init>", "(IF)V", ACC_PUBLIC, init_int_float_code, 5);
         }
         
-        /* Special case for StringBuffer: needs multiple constructors */
-        if (strcmp(name, "java/lang/StringBuffer") == 0) {
-            uint16_t super_init_ref = add_method_ref(clazz, "java/lang/Object", "<init>", "()V");
-            
-            /* Constructor: StringBuffer() - default */
-            uint8_t init_default_code[5];
-            init_default_code[0] = 0x2A; /* aload_0 */
-            init_default_code[1] = 0xB7; /* invokespecial */
-            init_default_code[2] = (super_init_ref >> 8) & 0xFF;
-            init_default_code[3] = super_init_ref & 0xFF;
-            init_default_code[4] = 0xB1; /* return */
-            
-            create_stub_method(clazz, "<init>", "()V", ACC_PUBLIC, init_default_code, 5);
-            
-            /* Constructor: StringBuffer(int capacity) */
-            uint8_t init_int_code[5];
-            init_int_code[0] = 0x2A; /* aload_0 */
-            init_int_code[1] = 0xB7; /* invokespecial */
-            init_int_code[2] = (super_init_ref >> 8) & 0xFF;
-            init_int_code[3] = super_init_ref & 0xFF;
-            init_int_code[4] = 0xB1; /* return */
-            
-            create_stub_method(clazz, "<init>", "(I)V", ACC_PUBLIC, init_int_code, 5);
-            
-            /* Constructor: StringBuffer(String str) */
-            uint8_t init_string_code[5];
-            init_string_code[0] = 0x2A; /* aload_0 */
-            init_string_code[1] = 0xB7; /* invokespecial */
-            init_string_code[2] = (super_init_ref >> 8) & 0xFF;
-            init_string_code[3] = super_init_ref & 0xFF;
-            init_string_code[4] = 0xB1; /* return */
-            
-            create_stub_method(clazz, "<init>", "(Ljava/lang/String;)V", ACC_PUBLIC, init_string_code, 5);
-        }
+        /* v34.3 FIX: the stub bytecode constructors that used to live here
+         * only called super.<init>() and silently DROPPED their arguments.
+         * Before v34 the execute.c stub shortcut dispatched them to the
+         * registered native <init>; after the v34 narrowing ("stub shortcut
+         * only for methods WITHOUT bytecode") the no-op bytecode won and the
+         * native never ran (ByteArrayInputStream kept buf=NULL/count=0 ->
+         * Manager.createPlayer threw MediaException; Alert lost title/text;
+         * Sound/StringBuffer lost their data). All these constructors have
+         * registered natives now - resolution reaches them through the
+         * op_invokespecial constructor fallback (v18 FIX), so the block is
+         * simply gone. See FIXES.txt v34.3. */
         
-        /* Special case for StringBuilder: needs multiple constructors */
-        if (strcmp(name, "java/lang/StringBuilder") == 0) {
-            uint16_t super_init_ref = add_method_ref(clazz, "java/lang/Object", "<init>", "()V");
-            
-            /* Constructor: StringBuilder() - default */
-            uint8_t init_default_code[5];
-            init_default_code[0] = 0x2A; /* aload_0 */
-            init_default_code[1] = 0xB7; /* invokespecial */
-            init_default_code[2] = (super_init_ref >> 8) & 0xFF;
-            init_default_code[3] = super_init_ref & 0xFF;
-            init_default_code[4] = 0xB1; /* return */
-            
-            create_stub_method(clazz, "<init>", "()V", ACC_PUBLIC, init_default_code, 5);
-            
-            /* Constructor: StringBuilder(int capacity) */
-            uint8_t init_int_code[5];
-            init_int_code[0] = 0x2A; /* aload_0 */
-            init_int_code[1] = 0xB7; /* invokespecial */
-            init_int_code[2] = (super_init_ref >> 8) & 0xFF;
-            init_int_code[3] = super_init_ref & 0xFF;
-            init_int_code[4] = 0xB1; /* return */
-            
-            create_stub_method(clazz, "<init>", "(I)V", ACC_PUBLIC, init_int_code, 5);
-            
-            /* Constructor: StringBuilder(String str) */
-            uint8_t init_string_code[5];
-            init_string_code[0] = 0x2A; /* aload_0 */
-            init_string_code[1] = 0xB7; /* invokespecial */
-            init_string_code[2] = (super_init_ref >> 8) & 0xFF;
-            init_string_code[3] = super_init_ref & 0xFF;
-            init_string_code[4] = 0xB1; /* return */
-            
-            create_stub_method(clazz, "<init>", "(Ljava/lang/String;)V", ACC_PUBLIC, init_string_code, 5);
-        }
+        /* v34.3 FIX: the stub bytecode constructors that used to live here
+         * only called super.<init>() and silently DROPPED their arguments.
+         * Before v34 the execute.c stub shortcut dispatched them to the
+         * registered native <init>; after the v34 narrowing ("stub shortcut
+         * only for methods WITHOUT bytecode") the no-op bytecode won and the
+         * native never ran (ByteArrayInputStream kept buf=NULL/count=0 ->
+         * Manager.createPlayer threw MediaException; Alert lost title/text;
+         * Sound/StringBuffer lost their data). All these constructors have
+         * registered natives now - resolution reaches them through the
+         * op_invokespecial constructor fallback (v18 FIX), so the block is
+         * simply gone. See FIXES.txt v34.3. */
         
         /* Special case for DataInputStream: needs constructor (InputStream) */
         if (strcmp(name, "java/io/DataInputStream") == 0) {
             uint16_t super_init_ref = add_method_ref(clazz, "java/io/InputStream", "<init>", "()V");
-            
-            uint8_t init_code[5];
+            uint16_t in_field_ref = add_field_ref(clazz, "java/io/DataInputStream", "in", "Ljava/io/InputStream;");
+
+            /* v34.2 FIX (Stalker: static picture / EOFException while parsing
+             * the '/d' resource): this stub constructor used to be ONLY
+             *   aload_0; invokespecial InputStream.<init>; return
+             * and relied on native_datainputstream_init (native registry)
+             * setting the "in" field. The v34 shortcut restriction
+             * ("stub shortcut only for methods WITHOUT bytecode") made the
+             * real bytecode run instead - the native <init> was never
+             * dispatched, "in" stayed NULL and every DataInputStream read
+             * returned EOF from the first byte. Games parse their resources
+             * in <clinit> via readShort() loops -> parse aborts -> static
+             * arrays stay NULL -> paint() NPEs every frame -> frozen image.
+             * Store the stream in bytecode, exactly like the
+             * InputStreamReader/BufferedReader stubs above:
+             *   aload_0; aload_1; putfield in; aload_0;
+             *   invokespecial InputStream.<init>; return */
+            uint8_t init_code[10];
             init_code[0] = 0x2A; /* aload_0 */
-            init_code[1] = 0xB7; /* invokespecial */
-            init_code[2] = (super_init_ref >> 8) & 0xFF;
-            init_code[3] = super_init_ref & 0xFF;
-            init_code[4] = 0xB1; /* return */
-            
-            create_stub_method(clazz, "<init>", "(Ljava/io/InputStream;)V", ACC_PUBLIC, init_code, 5);
+            init_code[1] = 0x2B; /* aload_1 (InputStream) */
+            init_code[2] = 0xB5; /* putfield */
+            init_code[3] = (in_field_ref >> 8) & 0xFF;
+            init_code[4] = in_field_ref & 0xFF;
+            init_code[5] = 0x2A; /* aload_0 */
+            init_code[6] = 0xB7; /* invokespecial */
+            init_code[7] = (super_init_ref >> 8) & 0xFF;
+            init_code[8] = super_init_ref & 0xFF;
+            init_code[9] = 0xB1; /* return */
+
+            create_stub_method(clazz, "<init>", "(Ljava/io/InputStream;)V", ACC_PUBLIC, init_code, 10);
         }
         
         /* Special case for InputStreamReader: needs constructor (InputStream) */
@@ -1605,11 +1807,79 @@ static JavaClass* create_stub_class(JVM* jvm, const char* name, const char* supe
     clazz->is_stub = true;
     clazz->initialized = false;
     clazz->initializing = false;
-    clazz->static_fields = NULL;
-    clazz->static_fields_count = 0;
-    clazz->static_fields_capacity = 0;
-    
+    /* FIX-19t: do NOT reset static_fields here! clazz comes from calloc()
+     * (already NULL) and the special-case blocks above (Canvas constants,
+     * System fields, ...) may have already populated static storage -
+     * resetting it leaked that memory and silently dropped Canvas.UP/DOWN
+     * etc., collapsing all game actions to key code 0. */
+
+    /* CRITICAL FIX (v15): default field capacity for stub objects.
+     *
+     * Native implementations routinely store per-object state in the raw
+     * fields[] slots of stub-class instances (RecordEnumerationImpl keeps
+     * {ids array ref, currentIndex, store handle}, M3G/LCDUI stubs keep
+     * nativePeer-ish handles, etc.). Historically a stub class without
+     * explicitly declared fields got instance_size == sizeof(ObjectHeader),
+     * so the FIRST instance allocated for such a class had NO room for
+     * fields: native writes then landed on the GC header of the NEXT heap
+     * object - silent heap corruption that desyncs the GC linear sweep
+     * (crashes / wedged GC on Windows, "corrupted magic" floods on Linux).
+     *
+     * setup_stub_class_fields() overrides instance_size for every class it
+     * declares fields for, so this default only affects fieldless stubs -
+     * exactly the dangerous ones. 8 slots covers all current native writers
+     * (grep '->fields\[' in midp/ shows max 7 used on fieldless stubs). */
+    if (clazz->instance_size < sizeof(ObjectHeader) + 8 * sizeof(JavaValue)) {
+        clazz->instance_size = sizeof(ObjectHeader) + 8 * sizeof(JavaValue);
+    }
+
     return clazz;
+}
+
+/* v34.15: interface wiring for concrete media stub classes (see forward
+ * declaration comment above). Idempotent: only fills interfaces if the
+ * stub has none yet, so calling from both creation paths is safe. */
+static void stub_add_known_interfaces(JavaClass* stub) {
+    if (!stub || !stub->class_name) return;
+    if (stub->interfaces_count > 0) return;  /* already wired */
+
+    if (strcmp(stub->class_name, "javax/microedition/media/PlayerImpl") == 0) {
+        /* PlayerImpl implements Player and Controllable interfaces */
+        stub->interfaces_count = 2;
+        stub->interfaces = (uint16_t*)calloc(2, sizeof(uint16_t));
+        if (stub->interfaces) {
+            stub->interfaces[0] = add_class_ref(stub, "javax/microedition/media/Player");
+            stub->interfaces[1] = add_class_ref(stub, "javax/microedition/media/Controllable");
+            CLASS_DEBUG("Added interfaces to PlayerImpl: Player, Controllable");
+        }
+    } else if (strcmp(stub->class_name, "javax/microedition/media/control/VolumeControlImpl") == 0) {
+        /* VolumeControlImpl implements VolumeControl */
+        stub->interfaces_count = 1;
+        stub->interfaces = (uint16_t*)calloc(1, sizeof(uint16_t));
+        if (stub->interfaces) {
+            stub->interfaces[0] = add_class_ref(stub, "javax/microedition/media/control/VolumeControl");
+            CLASS_DEBUG("Added interface to VolumeControlImpl: VolumeControl");
+        }
+    } else if (strcmp(stub->class_name, "javax/microedition/media/control/MIDIControlImpl") == 0) {
+        stub->interfaces_count = 1;
+        stub->interfaces = (uint16_t*)calloc(1, sizeof(uint16_t));
+        if (stub->interfaces) {
+            stub->interfaces[0] = add_class_ref(stub, "javax/microedition/media/control/MIDIControl");
+        }
+    } else if (strcmp(stub->class_name, "javax/microedition/media/control/ToneControlImpl") == 0) {
+        stub->interfaces_count = 1;
+        stub->interfaces = (uint16_t*)calloc(1, sizeof(uint16_t));
+        if (stub->interfaces) {
+            stub->interfaces[0] = add_class_ref(stub, "javax/microedition/media/control/ToneControl");
+        }
+    } else if (strcmp(stub->class_name, "javax/microedition/media/control/VideoControlImpl") == 0) {
+        stub->interfaces_count = 2;
+        stub->interfaces = (uint16_t*)calloc(2, sizeof(uint16_t));
+        if (stub->interfaces) {
+            stub->interfaces[0] = add_class_ref(stub, "javax/microedition/media/control/VideoControl");
+            stub->interfaces[1] = add_class_ref(stub, "javax/microedition/media/control/GUIControl");
+        }
+    }
 }
 
 /* Initialize built-in stub classes */
@@ -1653,6 +1923,11 @@ int init_stub_classes(JVM* jvm) {
         }
         
         jvm->class_loader.classes[jvm->class_loader.count++] = stub;
+        /* v34.15: wire "XyzImpl implements Xyz" links here too — the boot
+         * path bypassed get_or_create_stub_class() and left media control
+         * stubs without interfaces (root cause of the GoF VolumeControl
+         * ClassCastException). */
+        stub_add_known_interfaces(stub);
         count++;
         
         if (jvm->config.verbose_class) {
@@ -1792,6 +2067,7 @@ int init_stub_classes(JVM* jvm) {
                     clazz->fields[clazz->fields_count].access_flags = ACC_PRIVATE;
                     clazz->fields_count = new_count;
                     clazz->instance_size = sizeof(ObjectHeader) + new_count * sizeof(JavaValue);
+                    { extern uint16_t g_vm_cache_gen; g_vm_cache_gen++; }  /* v34.35 */
                     CLASS_DEBUG(" Added value field to java/lang/Integer (fields_count was %d)\n", new_count - 1);
                 }
             }
@@ -1835,7 +2111,73 @@ int init_stub_classes(JVM* jvm) {
             }
             CLASS_DEBUG(" Added value/offset/count/hash fields to java/lang/String\n");
         }
-        
+
+        /* v38 FIX (BlackShark3D .hm parser): java.lang.Float needs a "value"
+         * instance field. The game parses ALL float config via
+         * `new Float(Float.parseFloat(s)).floatValue()` — with no field
+         * (and no <init> storing it) every floatValue() returned 0.0f:
+         * hSegmentSize/vSegmentSize became 0, af.a(FF)F divided by zero,
+         * the terrain scroll loop in ai.a(FF) never terminated and the
+         * mission loading froze at 95% forever. */
+        else if (clazz->class_name && strcmp(clazz->class_name, "java/lang/Float") == 0) {
+            bool has_value_field = false;
+            for (int i = 0; i < clazz->fields_count; i++) {
+                if (clazz->fields && clazz->fields[i].name &&
+                    strcmp(clazz->fields[i].name, "value") == 0) {
+                    has_value_field = true;
+                    break;
+                }
+            }
+            if (!has_value_field) {
+                int new_count = clazz->fields_count + 1;
+                JavaField* new_fields = (JavaField*)realloc(clazz->fields, new_count * sizeof(JavaField));
+                if (new_fields) {
+                    clazz->fields = new_fields;
+                    memset(&clazz->fields[clazz->fields_count], 0, sizeof(JavaField));
+                    clazz->fields[clazz->fields_count].name = strdup("value");
+                    clazz->fields[clazz->fields_count].descriptor = strdup("F");
+                    clazz->fields[clazz->fields_count].name_index = add_utf8(clazz, "value");
+                    clazz->fields[clazz->fields_count].descriptor_index = add_utf8(clazz, "F");
+                    clazz->fields[clazz->fields_count].access_flags = ACC_PRIVATE;
+                    clazz->fields_count = new_count;
+                    clazz->instance_size = sizeof(ObjectHeader) + new_count * sizeof(JavaValue);
+                    { extern uint16_t g_vm_cache_gen; g_vm_cache_gen++; }  /* v34.35 */
+                    CLASS_DEBUG(" Added value field to java/lang/Float\n");
+                }
+            }
+        }
+
+        /* v38 FIX: java.lang.Double needs a "value" instance field (same
+         * pattern as Float — new Double(d).doubleValue() returned 0.0). */
+        else if (clazz->class_name && strcmp(clazz->class_name, "java/lang/Double") == 0) {
+            bool has_value_field = false;
+            for (int i = 0; i < clazz->fields_count; i++) {
+                if (clazz->fields && clazz->fields[i].name &&
+                    strcmp(clazz->fields[i].name, "value") == 0) {
+                    has_value_field = true;
+                    break;
+                }
+            }
+            if (!has_value_field) {
+                int new_count = clazz->fields_count + 1;
+                JavaField* new_fields = (JavaField*)realloc(clazz->fields, new_count * sizeof(JavaField));
+                if (new_fields) {
+                    clazz->fields = new_fields;
+                    memset(&clazz->fields[clazz->fields_count], 0, sizeof(JavaField));
+                    clazz->fields[clazz->fields_count].name = strdup("value");
+                    clazz->fields[clazz->fields_count].descriptor = strdup("D");
+                    clazz->fields[clazz->fields_count].name_index = add_utf8(clazz, "value");
+                    clazz->fields[clazz->fields_count].descriptor_index = add_utf8(clazz, "D");
+                    clazz->fields[clazz->fields_count].access_flags = ACC_PRIVATE;
+                    clazz->fields_count = new_count;
+                    /* D takes 2 JavaValue slots (header + value*2) */
+                    clazz->instance_size = sizeof(ObjectHeader) + new_count * sizeof(JavaValue) + sizeof(JavaValue);
+                    { extern uint16_t g_vm_cache_gen; g_vm_cache_gen++; }  /* v34.35 */
+                    CLASS_DEBUG(" Added value field to java/lang/Double\n");
+                }
+            }
+        }
+
         /* java.lang.Long needs value field - always ensure it exists */
         else if (clazz->class_name && strcmp(clazz->class_name, "java/lang/Long") == 0) {
             /* Check if "value" field already exists */
@@ -2261,9 +2603,10 @@ int init_stub_classes(JVM* jvm) {
         
         /* java.io.ByteArrayInputStream needs buffer and position fields */
         else if (clazz->class_name && strcmp(clazz->class_name, "java/io/ByteArrayInputStream") == 0) {
-            /* Fields: [0] = buf (byte[]), [1] = pos (int), [2] = count (int) */
-            clazz->fields_count = 3;
-            clazz->fields = (JavaField*)calloc(3, sizeof(JavaField));
+            /* Fields: [0] = buf (byte[]), [1] = pos (int), [2] = count (int),
+             *         [3] = mark (int) — v20: needed by DataInputStream.mark/reset */
+            clazz->fields_count = 4;
+            clazz->fields = (JavaField*)calloc(4, sizeof(JavaField));
             if (clazz->fields) {
                 /* Field 0: buf (byte[]) */
                 clazz->fields[0].name = strdup("buf");
@@ -2286,9 +2629,16 @@ int init_stub_classes(JVM* jvm) {
                 clazz->fields[2].descriptor_index = add_utf8(clazz, "I");
                 clazz->fields[2].access_flags = ACC_PROTECTED;
 
-                clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue) * 3;  /* Three JavaValue slots */
+                /* Field 3: mark (int) */
+                clazz->fields[3].name = strdup("mark");
+                clazz->fields[3].descriptor = strdup("I");
+                clazz->fields[3].name_index = add_utf8(clazz, "mark");
+                clazz->fields[3].descriptor_index = add_utf8(clazz, "I");
+                clazz->fields[3].access_flags = ACC_PROTECTED;
+
+                clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue) * 4;  /* Four JavaValue slots */
             }
-            CLASS_DEBUG(" Added buf/pos/count fields to java/io/ByteArrayInputStream\n");
+            CLASS_DEBUG(" Added buf/pos/count/mark fields to java/io/ByteArrayInputStream\n");
         }
         
         /* java.io.ByteArrayOutputStream needs buffer and count fields */
@@ -2404,7 +2754,7 @@ int init_stub_classes(JVM* jvm) {
                 clazz->fields[1].descriptor_index = add_utf8(clazz, "[Ljavax/microedition/lcdui/Item;");
                 clazz->fields[1].access_flags = ACC_PRIVATE;
                 
-                clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue) * 2;
+                clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue) * 4;
             }
             CLASS_DEBUG(" Added title/items fields to javax/microedition/lcdui/Form\n");
         }
@@ -2441,10 +2791,11 @@ int init_stub_classes(JVM* jvm) {
                 clazz->fields[4].name = strdup("listener");
                 clazz->fields[4].descriptor = strdup("Ljavax/microedition/lcdui/CommandListener;");
                 clazz->fields[4].name_index = add_utf8(clazz, "listener");
-                clazz->fields[4].descriptor_index = add_utf8(clazz, "Ljavax/microedition/lcdui/CommandListener;");
+                clazz->fields[4].descriptor_index = add_utf8(clazz, "Ljavax/microedition/lcdui/ChoiceGroupListener;");
                 clazz->fields[4].access_flags = ACC_PRIVATE;
                 
-                clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue) * 5;
+                /* 7 slots total: 2 from Displayable + 5 own fields */
+                clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue) * 7;
             }
             CLASS_DEBUG(" Added fields to javax/microedition/lcdui/List\n");
             
@@ -2495,7 +2846,8 @@ int init_stub_classes(JVM* jvm) {
                 clazz->fields[4].descriptor_index = add_utf8(clazz, "I");
                 clazz->fields[4].access_flags = ACC_PRIVATE;
                 
-                clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue) * 5;
+                /* 7 slots total: 2 from Displayable (commands, listener) + 5 own fields */
+                clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue) * 7;
             }
             CLASS_DEBUG(" Added fields to javax/microedition/lcdui/Alert\n");
         }
@@ -2529,7 +2881,7 @@ int init_stub_classes(JVM* jvm) {
                 clazz->fields[3].descriptor_index = add_utf8(clazz, "I");
                 clazz->fields[3].access_flags = ACC_PRIVATE;
                 
-                clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue) * 4;
+                clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue) * 6;
             }
             CLASS_DEBUG(" Added fields to javax/microedition/lcdui/TextBox\n");
         }
@@ -2864,8 +3216,8 @@ int init_stub_classes(JVM* jvm) {
         
         /* com.nokia.mid.sound.Sound needs data, type, state, and soundListener fields */
         else if (clazz->class_name && strcmp(clazz->class_name, "com/nokia/mid/sound/Sound") == 0) {
-            clazz->fields_count = 4;
-            clazz->fields = (JavaField*)calloc(4, sizeof(JavaField));
+            clazz->fields_count = 6;
+            clazz->fields = (JavaField*)calloc(6, sizeof(JavaField));
             if (clazz->fields) {
                 clazz->fields[0].name = strdup("data");
                 clazz->fields[0].descriptor = strdup("[B");
@@ -2891,7 +3243,21 @@ int init_stub_classes(JVM* jvm) {
                 clazz->fields[3].descriptor_index = add_utf8(clazz, "Lcom/nokia/mid/sound/SoundListener;");
                 clazz->fields[3].access_flags = ACC_PRIVATE;
 
-                clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue) * 4;
+                /* v17: gain (0..100) and native channel id */
+                clazz->fields_count = 6;
+                clazz->fields[4].name = strdup("gain");
+                clazz->fields[4].descriptor = strdup("I");
+                clazz->fields[4].name_index = add_utf8(clazz, "gain");
+                clazz->fields[4].descriptor_index = add_utf8(clazz, "I");
+                clazz->fields[4].access_flags = ACC_PRIVATE;
+
+                clazz->fields[5].name = strdup("soundId");
+                clazz->fields[5].descriptor = strdup("I");
+                clazz->fields[5].name_index = add_utf8(clazz, "soundId");
+                clazz->fields[5].descriptor_index = add_utf8(clazz, "I");
+                clazz->fields[5].access_flags = ACC_PRIVATE;
+
+                clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue) * 6;
             }
 
             /* Create static final int fields for Nokia Sound constants */
@@ -3029,6 +3395,32 @@ int init_stub_classes(JVM* jvm) {
             
             CLASS_DEBUG(" Added fields to javax/microedition/media/PlayerImpl\n");
         }
+
+        /* v34.53: the media control Impl stubs need a playerId instance
+         * field. getControl()/getControls() store player->id into
+         * ctrl_obj->fields[0] (skipped when fields_count==0), and every
+         * Volume/MIDI/Tone control native reads args[0]->fields[0].i to
+         * find its player — with no field the reads returned garbage, so
+         * e.g. VolumeControl.setLevel never found its player and volume
+         * adjustments silently did nothing. */
+        else if (clazz->class_name &&
+                 (strcmp(clazz->class_name, "javax/microedition/media/control/VolumeControlImpl") == 0 ||
+                  strcmp(clazz->class_name, "javax/microedition/media/control/MIDIControlImpl") == 0 ||
+                  strcmp(clazz->class_name, "javax/microedition/media/control/ToneControlImpl") == 0 ||
+                  strcmp(clazz->class_name, "javax/microedition/media/control/VideoControlImpl") == 0) &&
+                 clazz->fields_count == 0) {
+            clazz->fields_count = 1;
+            clazz->fields = (JavaField*)calloc(1, sizeof(JavaField));
+            if (clazz->fields) {
+                clazz->fields[0].name = strdup("playerId");
+                clazz->fields[0].descriptor = strdup("I");
+                clazz->fields[0].name_index = add_utf8(clazz, "playerId");
+                clazz->fields[0].descriptor_index = add_utf8(clazz, "I");
+                clazz->fields[0].access_flags = ACC_PRIVATE;
+                clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue);
+            }
+            CLASS_DEBUG(" Added playerId field to %s\n", clazz->class_name);
+        }
         
         /* com.nokia.mid.ui.DirectGraphics needs graphics reference */
         else if (clazz->class_name && strcmp(clazz->class_name, "com/nokia/mid/ui/DirectGraphics") == 0) {
@@ -3050,6 +3442,62 @@ int init_stub_classes(JVM* jvm) {
                 clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue) * 2;
             }
             CLASS_DEBUG(" Added fields to com/nokia/mid/ui/DirectGraphics\n");
+        }
+        
+        /* com.nokia.mid.m3d.Texture - v17: image + format for real texturing */
+        else if (clazz->class_name && strcmp(clazz->class_name, "com/nokia/mid/m3d/Texture") == 0) {
+            clazz->fields_count = 2;
+            clazz->fields = (JavaField*)calloc(2, sizeof(JavaField));
+            if (clazz->fields) {
+                clazz->fields[0].name = strdup("image");
+                clazz->fields[0].descriptor = strdup("Ljavax/microedition/lcdui/Image;");
+                clazz->fields[0].name_index = add_utf8(clazz, "image");
+                clazz->fields[0].descriptor_index = add_utf8(clazz, "Ljavax/microedition/lcdui/Image;");
+                clazz->fields[0].access_flags = ACC_PRIVATE;
+
+                clazz->fields[1].name = strdup("format");
+                clazz->fields[1].descriptor = strdup("I");
+                clazz->fields[1].name_index = add_utf8(clazz, "format");
+                clazz->fields[1].descriptor_index = add_utf8(clazz, "I");
+                clazz->fields[1].access_flags = ACC_PRIVATE;
+
+                clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue) * 2;
+            }
+            CLASS_DEBUG(" Added fields to com/nokia/mid/m3d/Texture\n");
+        }
+
+        /* com.nokia.mid.ui.SoftNotification - v17: real implementation state */
+        else if (clazz->class_name && strcmp(clazz->class_name, "com/nokia/mid/ui/SoftNotification") == 0) {
+            clazz->fields_count = 4;
+            clazz->fields = (JavaField*)calloc(4, sizeof(JavaField));
+            if (clazz->fields) {
+                clazz->fields[0].name = strdup("id");
+                clazz->fields[0].descriptor = strdup("I");
+                clazz->fields[0].name_index = add_utf8(clazz, "id");
+                clazz->fields[0].descriptor_index = add_utf8(clazz, "I");
+                clazz->fields[0].access_flags = ACC_PRIVATE;
+
+                clazz->fields[1].name = strdup("text");
+                clazz->fields[1].descriptor = strdup("Ljava/lang/String;");
+                clazz->fields[1].name_index = add_utf8(clazz, "text");
+                clazz->fields[1].descriptor_index = add_utf8(clazz, "Ljava/lang/String;");
+                clazz->fields[1].access_flags = ACC_PRIVATE;
+
+                clazz->fields[2].name = strdup("image");
+                clazz->fields[2].descriptor = strdup("Ljavax/microedition/lcdui/Image;");
+                clazz->fields[2].name_index = add_utf8(clazz, "image");
+                clazz->fields[2].descriptor_index = add_utf8(clazz, "Ljavax/microedition/lcdui/Image;");
+                clazz->fields[2].access_flags = ACC_PRIVATE;
+
+                clazz->fields[3].name = strdup("listener");
+                clazz->fields[3].descriptor = strdup("Lcom/nokia/mid/ui/SoftNotificationListener;");
+                clazz->fields[3].name_index = add_utf8(clazz, "listener");
+                clazz->fields[3].descriptor_index = add_utf8(clazz, "Lcom/nokia/mid/ui/SoftNotificationListener;");
+                clazz->fields[3].access_flags = ACC_PRIVATE;
+
+                clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue) * 4;
+            }
+            CLASS_DEBUG(" Added fields to com/nokia/mid/ui/SoftNotification\n");
         }
         
         /* com.nokia.mid.ui.DirectUtils - static utility class, no instance fields needed */
@@ -4110,6 +4558,33 @@ int init_stub_classes(JVM* jvm) {
         }
     }
 
+    /* v20: materialize Boolean.TRUE/FALSE canonical instances NOW — all
+     * wrapper stubs have their instance fields (incl. Boolean.value) and
+     * final instance_size at this point. */
+    {
+        JavaClass* bool_cls = NULL;
+        for (size_t i = 0; i < jvm->class_loader.count; i++) {
+            JavaClass* c = jvm->class_loader.classes[i];
+            if (c->class_name && strcmp(c->class_name, "java/lang/Boolean") == 0) { bool_cls = c; break; }
+        }
+        if (bool_cls) {
+            for (int s = 0; s < bool_cls->static_fields_count; s++) {
+                if (!bool_cls->static_fields[s].name) continue;
+                int is_true  = strcmp(bool_cls->static_fields[s].name, "TRUE") == 0;
+                int is_false = strcmp(bool_cls->static_fields[s].name, "FALSE") == 0;
+                if (!is_true && !is_false) continue;
+                JavaObject* b = jvm_new_object(jvm, bool_cls);
+                if (b) {
+                    JavaValue v; memset(&v, 0, sizeof(v));
+                    v.i = is_true ? 1 : 0;
+                    native_set_field_value(b, "value", v);
+                }
+                bool_cls->static_fields[s].value.ref = b;
+                if (b) jvm_add_root(jvm, b);  /* keep canonical TRUE/FALSE alive */
+            }
+        }
+    }
+
     if (class_class) {
         for (size_t i = 0; i < jvm->class_loader.count; i++) {
             JavaClass* clazz = jvm->class_loader.classes[i];
@@ -4136,7 +4611,21 @@ JavaClass* get_or_create_stub_class(JVM* jvm, const char* class_name) {
     for (size_t i = 0; i < jvm->class_loader.count; i++) {
         if (jvm->class_loader.classes[i]->class_name &&
             strcmp(jvm->class_loader.classes[i]->class_name, class_name) == 0) {
-            return jvm->class_loader.classes[i];
+            /* v34.49 FIX (3D Ferrari): classfile_parse() resolves every
+             * superclass/interface through HERE, and the early-return below
+             * handed out the BUILTIN stub (com/nokia/mid/ui/FullCanvas
+             * extends plain Canvas) even when the MIDlet ships its own
+             * version (extends com/hellomoto/fullscreen/FullCn). The broken
+             * hierarchy then threw ClassCastException in GameMIDlet.<init>
+             * (swallowed), skipping the text-resource init — the midlet
+             * died with an NPE in Ferrari3D.<init>. Give the JAR the same
+             * override chance the hash path has had since v20. */
+            JavaClass* found = jvm->class_loader.classes[i];
+            if (found->is_stub) {
+                JavaClass* real = jvm_stub_jar_override_linear(jvm, class_name, found);
+                if (real) return real;
+            }
+            return found;
         }
     }
     
@@ -4309,6 +4798,22 @@ JavaClass* get_or_create_stub_class(JVM* jvm, const char* class_name) {
         /* Other M3G classes extend Object */
     }
     
+    /* FIX-19v: generic exception/error fallback for unknown classes.
+     * Without this, classes like java/lang/StringIndexOutOfBoundsException
+     * (not in the explicit table) got super=java/lang/Object, so
+     * object_instance_of(sioobe, Exception) failed and exception handlers
+     * like 'catch (Exception e)' NEVER matched - GlomoUtil.JAD's internal
+     * safe-wrapper catch was skipped and SU-30's startApp died. */
+    else if (strstr(class_name, "Exception") == class_name + strlen(class_name) - strlen("Exception")) {
+        super_name = "java/lang/Exception";
+    }
+    else if (strstr(class_name, "Error") == class_name + strlen(class_name) - strlen("Error")) {
+        super_name = "java/lang/Error";
+    }
+    else if (strstr(class_name, "Throwable") == class_name + strlen(class_name) - strlen("Throwable")) {
+        super_name = "java/lang/Throwable";
+    }
+    
     /* Create stub class with proper super class */
     JavaClass* stub = create_stub_class(jvm, class_name, super_name, ACC_PUBLIC);
     if (!stub) return NULL;
@@ -4344,43 +4849,7 @@ JavaClass* get_or_create_stub_class(JVM* jvm, const char* class_name) {
     }
     
     /* Add interfaces for specific classes */
-    if (strcmp(class_name, "javax/microedition/media/PlayerImpl") == 0) {
-        /* PlayerImpl implements Player and Controllable interfaces */
-        stub->interfaces_count = 2;
-        stub->interfaces = (uint16_t*)calloc(2, sizeof(uint16_t));
-        if (stub->interfaces) {
-            stub->interfaces[0] = add_class_ref(stub, "javax/microedition/media/Player");
-            stub->interfaces[1] = add_class_ref(stub, "javax/microedition/media/Controllable");
-            CLASS_DEBUG("Added interfaces to PlayerImpl: Player, Controllable");
-        }
-    } else if (strcmp(class_name, "javax/microedition/media/control/VolumeControlImpl") == 0) {
-        /* VolumeControlImpl implements VolumeControl */
-        stub->interfaces_count = 1;
-        stub->interfaces = (uint16_t*)calloc(1, sizeof(uint16_t));
-        if (stub->interfaces) {
-            stub->interfaces[0] = add_class_ref(stub, "javax/microedition/media/control/VolumeControl");
-            CLASS_DEBUG("Added interface to VolumeControlImpl: VolumeControl");
-        }
-    } else if (strcmp(class_name, "javax/microedition/media/control/MIDIControlImpl") == 0) {
-        stub->interfaces_count = 1;
-        stub->interfaces = (uint16_t*)calloc(1, sizeof(uint16_t));
-        if (stub->interfaces) {
-            stub->interfaces[0] = add_class_ref(stub, "javax/microedition/media/control/MIDIControl");
-        }
-    } else if (strcmp(class_name, "javax/microedition/media/control/ToneControlImpl") == 0) {
-        stub->interfaces_count = 1;
-        stub->interfaces = (uint16_t*)calloc(1, sizeof(uint16_t));
-        if (stub->interfaces) {
-            stub->interfaces[0] = add_class_ref(stub, "javax/microedition/media/control/ToneControl");
-        }
-    } else if (strcmp(class_name, "javax/microedition/media/control/VideoControlImpl") == 0) {
-        stub->interfaces_count = 2;
-        stub->interfaces = (uint16_t*)calloc(2, sizeof(uint16_t));
-        if (stub->interfaces) {
-            stub->interfaces[0] = add_class_ref(stub, "javax/microedition/media/control/VideoControl");
-            stub->interfaces[1] = add_class_ref(stub, "javax/microedition/media/control/GUIControl");
-        }
-    }
+    stub_add_known_interfaces(stub);
 
     /* Initialize header for Class object support */
     JavaClass* class_class = NULL;

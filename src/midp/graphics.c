@@ -22,9 +22,149 @@
 #include "jvm.h"
 #include "bitmap_font.h"
 #include "stb_image.h"
+#include "render/render.h" /* v34.28: nojme_2d_scalar_forced() for getRGB A/B */
 
-/* Current graphics context */
+#include <pthread.h>
+
+/* Current graphics context (reserved) */
+__attribute__((unused))
 static MidpGraphics* current_gfx = NULL;
+
+/* ============================================================================
+ * v36.12 PEER-REGISTRY — the "heap memory is not freed at closing" fix.
+ *
+ * PROBLEM (measured, scripts/soak_close.sh, Asphalt 3 x5 sessions): every
+ * open/close cycle leaked ~430 KB of process malloc: 1060K -> 1490K ->
+ * 1905K -> 2311K -> 2713K uord, perfectly linear. Root cause: the lcdui
+ * NATIVE PEERS (MidpImage struct + its calloc'd pixel buffer, MidpGraphics
+ * context, MidpFont) are malloc'd C memory referenced from Java objects
+ * through the nativePeer field. When the Java object dies — at GC or at
+ * session-end heap_destroy — NOBODY walks the dead objects to free the
+ * peers: there is no finalizer and no peer registry. Every Image a game
+ * decoded (menu.png ~97503 bytes -> 176x220x4 pixels...) leaked its peer
+ * for the whole process lifetime; the Switch frontend lives for days, so
+ * the field [MEM] line ("uord=298005K" after ONE heavy session) is this
+ * leak scaled by game asset size.
+ *
+ * FIX: process-global registry of every peer we hand out (single choke
+ * points: midp_image_create / midp_image_get_graphics / midp_font_get /
+ * the GameCanvas graphics malloc in display.c). midp_peer_session_reset()
+ * (called from midp_session_reset at every jvm_destroy) destroys whatever
+ * is still registered — i.e. exactly the peers whose Java owners just died
+ * with the heap. Peers freed during the session (midp_image_destroy,
+ * midp_graphics_free, GameCanvas buffer re-create) unregister themselves,
+ * so the sweep only ever frees live-registered memory: no double-free.
+ * M3G is NOT in scope: its Image2D copies pixels into the VM heap (int[])
+ * and destroys the temp MidpImage immediately (m3g_make_image2d_from_png),
+ * and the M3G texture cache/buffers are freed by m3g_session_reset.
+ * ============================================================================ */
+typedef enum {
+    MIDP_PEER_IMAGE = 0,
+    MIDP_PEER_GFX   = 1,
+    MIDP_PEER_FONT  = 2
+} MidpPeerKind;
+
+typedef struct { void* p; MidpPeerKind kind; } MidpPeerSlot;
+static MidpPeerSlot* g_midp_peers = NULL;
+static size_t g_midp_peer_count = 0;
+static size_t g_midp_peer_cap = 0;
+static pthread_mutex_t g_midp_peer_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void midp_peer_register(void* p, MidpPeerKind kind) {
+    if (!p) return;
+    pthread_mutex_lock(&g_midp_peer_mutex);
+    if (g_midp_peer_count == g_midp_peer_cap) {
+        size_t ncap = g_midp_peer_cap ? g_midp_peer_cap * 2 : 128;
+        MidpPeerSlot* ns = (MidpPeerSlot*)realloc(g_midp_peers,
+                                                  ncap * sizeof(MidpPeerSlot));
+        if (ns) {
+            g_midp_peers = ns;
+            g_midp_peer_cap = ncap;
+        } else {
+            /* OOM growing the registry: skip the registration (the peer
+             * then leaks — the pre-v36.12 status quo) instead of corrupting
+             * the array. Unreachable in practice. */
+            pthread_mutex_unlock(&g_midp_peer_mutex);
+            return;
+        }
+    }
+    g_midp_peers[g_midp_peer_count].p = p;
+    g_midp_peers[g_midp_peer_count].kind = kind;
+    g_midp_peer_count++;
+    pthread_mutex_unlock(&g_midp_peer_mutex);
+}
+
+static void midp_peer_unregister(void* p) {
+    if (!p) return;
+    pthread_mutex_lock(&g_midp_peer_mutex);
+    for (size_t i = 0; i < g_midp_peer_count; i++) {
+        if (g_midp_peers[i].p == p) {
+            /* swap-remove: order is irrelevant for a destroy-all sweep */
+            g_midp_peers[i] = g_midp_peers[g_midp_peer_count - 1];
+            g_midp_peer_count--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_midp_peer_mutex);
+}
+
+/* v36.12: the ONLY sanctioned way to free a MidpGraphics peer (unregisters,
+ * so the session sweep cannot double-free it). */
+void midp_graphics_free(MidpGraphics* gfx) {
+    if (!gfx) return;
+    midp_peer_unregister(gfx);
+    free(gfx);
+}
+
+/* v36.12: register an EXTERNALLY created MidpGraphics peer (display.c
+ * GameCanvas context). NEVER wrap stack/value graphics — only heap peers
+ * owned by a nativePeer field. */
+void midp_graphics_register(MidpGraphics* gfx) {
+    midp_peer_register(gfx, MIDP_PEER_GFX);
+}
+
+void midp_peer_session_reset(void) {
+    /* Quiescent point: jvm_destroy already verified every VM thread idle.
+     * Steal the array under the lock, destroy OUTSIDE it — the destroyers
+     * call midp_peer_unregister, which would self-deadlock otherwise. */
+    pthread_mutex_lock(&g_midp_peer_mutex);
+    MidpPeerSlot* slots = g_midp_peers;
+    size_t n = g_midp_peer_count;
+    g_midp_peers = NULL;
+    g_midp_peer_count = 0;
+    g_midp_peer_cap = 0;
+    pthread_mutex_unlock(&g_midp_peer_mutex);
+
+    if (!n) { free(slots); return; }
+    size_t imgs = 0, gfxs = 0, fonts = 0;
+    size_t img_bytes = 0;
+    for (size_t i = 0; i < n; i++) {
+        switch (slots[i].kind) {
+            case MIDP_PEER_IMAGE:
+                if (slots[i].p) {
+                    MidpImage* im = (MidpImage*)slots[i].p;
+                    img_bytes += (size_t)im->width * (size_t)im->height
+                                 * sizeof(uint32_t) + sizeof(MidpImage);
+                }
+                midp_image_destroy((MidpImage*)slots[i].p); /* unregister = no-op */
+                imgs++;
+                break;
+            case MIDP_PEER_GFX:
+                midp_graphics_free((MidpGraphics*)slots[i].p);
+                gfxs++;
+                break;
+            case MIDP_PEER_FONT:
+                free(slots[i].p);
+                fonts++;
+                break;
+        }
+    }
+    free(slots);
+    /* Always-on one-liner (LOG_SAFE survives without logging toggle): this
+     * IS the "close freed the game memory" proof for the field log. */
+    LOG_SAFE("[PEERS] session reset: freed %zu image, %zu graphics, %zu font peer(s)"
+             " (~%zu KB pixels)\n", imgs, gfxs, fonts, img_bytes >> 10);
+}
 
 /* Headless text capture - tracks drawn text for console output */
 #ifdef J2ME_HEADLESS
@@ -48,7 +188,7 @@ int headless_check_text_activity(void) {
 }
 
 /* Add a text entry to the headless log */
-static void headless_log_text(const char* text, int x, int y, uint32_t color) {
+void midp_headless_log_text(const char* text, int x, int y, uint32_t color) {
     if (!text || text[0] == '\0') return;
     
     /* Skip very short or whitespace-only strings */
@@ -107,7 +247,7 @@ void headless_print_captured_text(void) {
             int b = c & 0xFF;
             fprintf(stdout, "  [TEXT] (%d,%d) rgb(%d,%d,%d): %s\n",
                     g_headless_text_log[i].x, g_headless_text_log[i].y, r, g, b, text);
-            snprintf(seen_texts[seen_count], 512, "%s", text);
+            snprintf(seen_texts[seen_count], 512, "%.511s", text);
             seen_count++;
         }
     }
@@ -135,38 +275,10 @@ void midp_set_screen_dimensions(int width, int height) {
     DEBUG_LOG("[MIDP] Screen dimensions set to %dx%d", width, height);
 }
 
-/* Forward declaration */
-static void set_pixel(MidpGraphics* gfx, int x, int y);
+/* v34.20: set_pixel fwd decl removed — the 2D primitives (incl. the
+ * set_pixel definition) now live in src/render/render.c. */
 
-/* Draw a single character using the bitmap font (legacy single-byte) */
-static void midp_graphics_draw_char(MidpGraphics* gfx, char c, int x, int y) {
-    const uint8_t* char_data = get_char_data(c);
-    
-    for (int row = 0; row < FONT_HEIGHT; row++) {
-        uint8_t row_data = char_data[row];
-        for (int col = 0; col < FONT_WIDTH; col++) {
-            /* MSB is leftmost pixel, so use (FONT_WIDTH - 1 - col) to get correct bit */
-            if (row_data & (1 << (FONT_WIDTH - 1 - col))) {
-                set_pixel(gfx, x + col, y + row);
-            }
-        }
-    }
-}
 
-/* Draw a single character using Unicode codepoint */
-static void midp_graphics_draw_char_unicode(MidpGraphics* gfx, int codepoint, int x, int y) {
-    const uint8_t* char_data = get_char_data_unicode(codepoint);
-    
-    for (int row = 0; row < FONT_HEIGHT; row++) {
-        uint8_t row_data = char_data[row];
-        for (int col = 0; col < FONT_WIDTH; col++) {
-            /* MSB is leftmost pixel, so use (FONT_WIDTH - 1 - col) to get correct bit */
-            if (row_data & (1 << (FONT_WIDTH - 1 - col))) {
-                set_pixel(gfx, x + col, y + row);
-            }
-        }
-    }
-}
 
 /* Initialize MIDP2 */
 int midp_init(JVM* jvm) {
@@ -191,6 +303,38 @@ int midp_init(JVM* jvm) {
     return JNI_OK;
 }
 
+/* ============================================================================
+ * v35.08 MULTI-SESSION (Switch frontend: menu -> game -> menu -> game):
+ * process-global MIDP statics pointed into the PREVIOUS session's Java
+ * heap. jvm_destroy() NULLs every root-registered slot centrally
+ * (gc_roots_reset_all) and then calls THIS hook (weak) for everything the
+ * root wipe cannot reach: unrooted object pointers, "already rooted"
+ * latches, queue indices, UI booleans. Field-repro for the bug class:
+ * game two launched from the frontend menu died in Display.setCurrent on
+ * a stale Display singleton ("Object has NULL or invalid class pointer").
+ * ============================================================================ */
+void midp_session_reset(void) {
+    extern void midp_display_session_reset(void);
+    extern void midp_form_session_reset(void);
+    extern void m3g_session_reset(void);
+    extern void midp_rms_session_reset(void);
+    /* v36.22 [MC-RESET] DIAG: Mascot Capsule ctor diagnostics are per-session
+     * counters — without this session 2+ printed nothing about its own
+     * ActionTable/Figure startup (the Treasure Towers relaunch crash was
+     * invisible in the field log). */
+    extern void mc_diag_session_reset(void);
+    mc_diag_session_reset();
+    midp_display_session_reset();
+    midp_form_session_reset();
+    m3g_session_reset();
+    midp_rms_session_reset();
+    /* v36.12 PEER-REGISTRY: LAST — the layer resets above just NULL their
+     * pointers (game_canvas.graphics/offscreen_buffer etc.); the sweep
+     * then frees every still-registered lcdui peer of the dead session.
+     * Measured on the v36.11 soak: exactly the ~430 KB/session leak. */
+    midp_peer_session_reset();
+}
+
 /*
  * Graphics operations
  */
@@ -209,9 +353,16 @@ void midp_graphics_init(MidpGraphics* gfx, uint32_t* pixels, int width, int heig
     gfx->alpha = 255;
     gfx->stroke_style = 0;
     gfx->font = 0;
+    gfx->owner_image = NULL; /* v34.51: set by midp_image_get_graphics */
 }
 
 void midp_graphics_set_clip(MidpGraphics* gfx, int x, int y, int width, int height) {
+    /* NOTE: this is a LOW-LEVEL helper: x/y are DEVICE-space coordinates.
+     * The Java-facing MIDP translation semantics (clip coords relative to
+     * the current translate, JSR-118) are applied in the nativeGraphics
+     * setClip/clipRect handlers (display.c) which add gfx->translate_*.
+     * Internal emulator paths (soft bar, LayerManager) call this with
+     * device coords directly. */
     gfx->clip_x = x;
     gfx->clip_y = y;
     gfx->clip_width = width;
@@ -250,765 +401,28 @@ void midp_graphics_set_color(MidpGraphics* gfx, int rgb, int alpha) {
     gfx->alpha = alpha;
 }
 
-static void set_pixel(MidpGraphics* gfx, int x, int y) {
-    x += gfx->translate_x;
-    y += gfx->translate_y;
-    
-    if (x < gfx->clip_x || x >= gfx->clip_x + gfx->clip_width ||
-        y < gfx->clip_y || y >= gfx->clip_y + gfx->clip_height) {
-        return;
-    }
-    
-    if (x < 0 || x >= gfx->width || y < 0 || y >= gfx->height) {
-        return;
-    }
-    
-    uint32_t color = (gfx->alpha << 24) | gfx->rgb_color;
-    gfx->pixels[y * gfx->width + x] = color;
-}
-
-void midp_graphics_draw_line(MidpGraphics* gfx, int x1, int y1, int x2, int y2) {
-    GFX_DEBUG("drawLine: (%d,%d) -> (%d,%d), color=0x%06X", 
-            x1, y1, x2, y2, gfx->rgb_color);
-    x1 += gfx->translate_x;
-    y1 += gfx->translate_y;
-    x2 += gfx->translate_x;
-    y2 += gfx->translate_y;
-    
-    /* Pre-compute clip bounds once for inline pixel writes */
-    int clip_x1 = gfx->clip_x;
-    int clip_y1 = gfx->clip_y;
-    int clip_x2 = gfx->clip_x + gfx->clip_width;
-    int clip_y2 = gfx->clip_y + gfx->clip_height;
-    int scr_w = gfx->width;
-    int scr_h = gfx->height;
-    uint32_t color = (gfx->alpha << 24) | gfx->rgb_color;
-    
-    /* Bresenham's line algorithm */
-    int dx = abs(x2 - x1);
-    int dy = abs(y2 - y1);
-    int sx = x1 < x2 ? 1 : -1;
-    int sy = y1 < y2 ? 1 : -1;
-    int err = dx - dy;
-    
-    /* MIDP spec: the line does not include the endpoint (x2, y2) */
-    while (true) {
-        if (x1 == x2 && y1 == y2) break;  /* Don't draw the endpoint */
-        
-        /* Inline clip check and direct framebuffer write */
-        if (x1 >= clip_x1 && x1 < clip_x2 && y1 >= clip_y1 && y1 < clip_y2 &&
-            x1 >= 0 && x1 < scr_w && y1 >= 0 && y1 < scr_h) {
-            gfx->pixels[y1 * scr_w + x1] = color;
-        }
-        
-        int e2 = 2 * err;
-        if (e2 > -dy) { err -= dy; x1 += sx; }
-        if (e2 < dx) { err += dx; y1 += sy; }
-    }
-}
-
-void midp_graphics_fill_rect(MidpGraphics* gfx, int x, int y, int w, int h) {
-    GFX_DEBUG("fillRect: (%d,%d) %dx%d, color=0x%06X, clip=(%d,%d %dx%d)", 
-            x, y, w, h, gfx->rgb_color, gfx->clip_x, gfx->clip_y, gfx->clip_width, gfx->clip_height);
-    x += gfx->translate_x;
-    y += gfx->translate_y;
-    
-    /* Compute clipped rect once */
-    int x1 = x > gfx->clip_x ? x : gfx->clip_x;
-    int y1 = y > gfx->clip_y ? y : gfx->clip_y;
-    int x2 = (x + w) < (gfx->clip_x + gfx->clip_width) ? (x + w) : (gfx->clip_x + gfx->clip_width);
-    int y2 = (y + h) < (gfx->clip_y + gfx->clip_height) ? (y + h) : (gfx->clip_y + gfx->clip_height);
-    
-    /* Clamp to screen bounds once */
-    if (x1 < 0) x1 = 0;
-    if (y1 < 0) y1 = 0;
-    if (x2 > gfx->width) x2 = gfx->width;
-    if (y2 > gfx->height) y2 = gfx->height;
-    
-    int row_width = x2 - x1;
-    if (row_width <= 0) return;
-    
-    uint32_t color = (gfx->alpha << 24) | gfx->rgb_color;
-    
-    /* Fast path: opaque fill — tight loop, no per-pixel bounds checks */
-    if (gfx->alpha == 255) {
-        for (int py = y1; py < y2; py++) {
-            uint32_t *row = gfx->pixels + py * gfx->width + x1;
-            for (int i = 0; i < row_width; i++) {
-                row[i] = color;
-            }
-        }
-    } else {
-        /* Alpha blend path with pre-computed values */
-        uint8_t alpha = gfx->alpha;
-        uint8_t inv_alpha = 255 - alpha;
-        uint8_t sr = (gfx->rgb_color >> 16) & 0xFF;
-        uint8_t sg = (gfx->rgb_color >> 8) & 0xFF;
-        uint8_t sb = gfx->rgb_color & 0xFF;
-        for (int py = y1; py < y2; py++) {
-            uint32_t *row = gfx->pixels + py * gfx->width + x1;
-            for (int i = 0; i < row_width; i++) {
-                uint32_t dst = row[i];
-                uint8_t r = (sr * alpha + ((dst >> 16) & 0xFF) * inv_alpha + 128) >> 8;
-                uint8_t g = (sg * alpha + ((dst >> 8) & 0xFF) * inv_alpha + 128) >> 8;
-                uint8_t b = (sb * alpha + (dst & 0xFF) * inv_alpha + 128) >> 8;
-                row[i] = (alpha << 24) | (r << 16) | (g << 8) | b;
-            }
-        }
-    }
-}
-
-void midp_graphics_draw_rect(MidpGraphics* gfx, int x, int y, int w, int h) {
-    midp_graphics_draw_line(gfx, x, y, x + w - 1, y);
-    midp_graphics_draw_line(gfx, x, y + h - 1, x + w - 1, y + h - 1);
-    midp_graphics_draw_line(gfx, x, y, x, y + h - 1);
-    midp_graphics_draw_line(gfx, x + w - 1, y, x + w - 1, y + h - 1);
-}
-
-void midp_graphics_draw_arc(MidpGraphics* gfx, int x, int y, int w, int h,
-                            int start_angle, int arc_angle) {
-    x += gfx->translate_x;
-    y += gfx->translate_y;
-    
-    if (w < 0 || h < 0) return;
-    
-    double cx = x + w / 2.0;
-    double cy = y + h / 2.0;
-    double rx = w / 2.0;
-    double ry = h / 2.0;
-    
-    /* MIDP uses clockwise angles with 0=right, 90=up, 180=left, 270=down
-     * Mathematical convention: 0=right, 90=down (screen coords), 180=left, 270=up
-     * Need to negate the angle to convert from MIDP to screen coordinates */
-    double start_rad = -start_angle * M_PI / 180.0;
-    double end_rad = -(start_angle + arc_angle) * M_PI / 180.0;
-    
-    int steps = abs(arc_angle) * 2;
-    if (steps < 4) steps = 4;
-    if (steps > 720) steps = 720;
-    
-    double step = (end_rad - start_rad) / steps;
-    
-    /* Pre-compute clip bounds for inline pixel writes */
-    int clip_x1 = gfx->clip_x;
-    int clip_y1 = gfx->clip_y;
-    int clip_x2 = gfx->clip_x + gfx->clip_width;
-    int clip_y2 = gfx->clip_y + gfx->clip_height;
-    int scr_w = gfx->width;
-    int scr_h = gfx->height;
-    uint32_t color = (gfx->alpha << 24) | gfx->rgb_color;
-    
-    int prev_px = -1, prev_py = -1;
-    for (int i = 0; i <= steps; i++) {
-        double angle = start_rad + i * step;
-        int px = (int)(cx + rx * cos(angle));
-        int py = (int)(cy + ry * sin(angle));
-        /* Only draw if position changed (avoid overdraw) */
-        if (px != prev_px || py != prev_py) {
-            /* Inline clip check and direct framebuffer write */
-            if (px >= clip_x1 && px < clip_x2 && py >= clip_y1 && py < clip_y2 &&
-                px >= 0 && px < scr_w && py >= 0 && py < scr_h) {
-                gfx->pixels[py * scr_w + px] = color;
-            }
-            prev_px = px;
-            prev_py = py;
-        }
-    }
-}
-
-void midp_graphics_fill_arc(MidpGraphics* gfx, int x, int y, int w, int h,
-                            int start_angle, int arc_angle) {
-    x += gfx->translate_x;
-    y += gfx->translate_y;
-    
-    if (w <= 0 || h <= 0) return;
-    
-    double cx = x + w / 2.0;
-    double cy = y + h / 2.0;
-    double rx = w / 2.0;
-    double ry = h / 2.0;
-    
-    double start_rad = -start_angle * M_PI / 180.0;
-    double end_rad = -(start_angle + arc_angle) * M_PI / 180.0;
-    
-    /* Normalize angles to [0, 2*PI) */
-    while (start_rad < 0) start_rad += 2 * M_PI;
-    while (start_rad >= 2 * M_PI) start_rad -= 2 * M_PI;
-    while (end_rad < 0) end_rad += 2 * M_PI;
-    while (end_rad >= 2 * M_PI) end_rad -= 2 * M_PI;
-    
-    double arc_start, arc_end;
-    
-    if (arc_angle > 0) {
-        arc_start = end_rad;
-        arc_end = start_rad;
-    } else {
-        arc_start = start_rad;
-        arc_end = end_rad;
-    }
-    
-    bool full_circle = (abs(arc_angle) >= 360);
-    
-    /* Pre-compute clip bounds for inline pixel writes */
-    int clip_x1 = gfx->clip_x;
-    int clip_y1 = gfx->clip_y;
-    int clip_x2 = gfx->clip_x + gfx->clip_width;
-    int clip_y2 = gfx->clip_y + gfx->clip_height;
-    int scr_w = gfx->width;
-    int scr_h = gfx->height;
-    uint32_t color = (gfx->alpha << 24) | gfx->rgb_color;
-    
-    /* Fast path for full circle: use row-based ellipse scan without angle check */
-    if (full_circle) {
-        int bx1 = x > clip_x1 ? x : clip_x1;
-        int by1 = y > clip_y1 ? y : clip_y1;
-        int bx2 = (x + w) < clip_x2 ? (x + w) : clip_x2;
-        int by2 = (y + h) < clip_y2 ? (y + h) : clip_y2;
-        if (bx1 < 0) bx1 = 0;
-        if (by1 < 0) by1 = 0;
-        if (bx2 > scr_w) bx2 = scr_w;
-        if (by2 > scr_h) by2 = scr_h;
-        
-        for (int py = by1; py < by2; py++) {
-            double ndy = (py - cy) / ry;
-            double ndy2 = ndy * ndy;
-            if (ndy2 > 1.0) continue;
-            double ndx_max = sqrt(1.0 - ndy2);
-            int px_start = (int)(cx - ndx_max * rx);
-            int px_end = (int)(cx + ndx_max * rx);
-            if (px_start < bx1) px_start = bx1;
-            if (px_end >= bx2) px_end = bx2 - 1;
-            uint32_t *row = gfx->pixels + py * scr_w;
-            for (int px = px_start; px <= px_end; px++) {
-                row[px] = color;
-            }
-        }
-        return;
-    }
-    
-    /* Pre-compute direction vectors for cross-product arc sector test.
-     * This replaces per-pixel atan2() with just multiply+compare ops.
-     * For a point (dx,dy), cross(dir_A, P) and cross(P, dir_B) determine
-     * whether the point's angle falls within the arc sector. */
-    double sin_start = sin(arc_start);
-    double cos_start = cos(arc_start);
-    double sin_end = sin(arc_end);
-    double cos_end = cos(arc_end);
-    /* cross_AB = sin(arc_end - arc_start), determines sector winding */
-    double cross_AB = cos_start * sin_end - sin_start * cos_end;
-    
-    for (int py = y; py < y + h && py < scr_h; py++) {
-        if (py < 0 || py < clip_y1 || py >= clip_y2) continue;
-        
-        for (int px = x; px < x + w && px < scr_w; px++) {
-            if (px < 0 || px < clip_x1 || px >= clip_x2) continue;
-            
-            if (rx <= 0 || ry <= 0) continue;
-            
-            double dx = (px - cx) / rx;
-            double dy = (py - cy) / ry;
-            
-            if (dx * dx + dy * dy > 1.0) continue;
-            
-            /* Cross-product sector test: much faster than atan2 on ARM */
-            double cross_ap = cos_start * dy - sin_start * dx;
-            double cross_pb = dx * sin_end - dy * cos_end;
-            
-            bool in_arc;
-            if (cross_AB >= 0) {
-                /* Non-wrapping sector: point must be CCW from A and B CCW from P */
-                in_arc = (cross_ap >= 0) && (cross_pb >= 0);
-            } else {
-                /* Wrapping sector: point must be on either side */
-                in_arc = (cross_ap >= 0) || (cross_pb >= 0);
-            }
-            
-            if (in_arc) {
-                gfx->pixels[py * scr_w + px] = color;
-            }
-        }
-    }
-}
-
-void midp_graphics_draw_round_rect(MidpGraphics* gfx, int x, int y, int w, int h,
-                                   int arc_w, int arc_h) {
-    /* Draw lines (drawLine excludes endpoint, so pass arc boundary as endpoint
-     * to draw pixels up to one pixel before the arc starts) */
-    midp_graphics_draw_line(gfx, x + arc_w/2, y, x + w - arc_w/2, y);
-    midp_graphics_draw_line(gfx, x + arc_w/2, y + h - 1, x + w - arc_w/2, y + h - 1);
-    midp_graphics_draw_line(gfx, x, y + arc_h/2, x, y + h - arc_h/2);
-    midp_graphics_draw_line(gfx, x + w - 1, y + arc_h/2, x + w - 1, y + h - arc_h/2);
-    
-    /* Draw arcs */
-    midp_graphics_draw_arc(gfx, x, y, arc_w, arc_h, 90, 90);
-    midp_graphics_draw_arc(gfx, x + w - arc_w, y, arc_w, arc_h, 0, 90);
-    midp_graphics_draw_arc(gfx, x + w - arc_w, y + h - arc_h, arc_w, arc_h, 270, 90);
-    midp_graphics_draw_arc(gfx, x, y + h - arc_h, arc_w, arc_h, 180, 90);
-}
-
-void midp_graphics_fill_round_rect(MidpGraphics* gfx, int x, int y, int w, int h,
-                                   int arc_w, int arc_h) {
-    /* Fill center */
-    midp_graphics_fill_rect(gfx, x + arc_w/2, y, w - arc_w, h);
-    midp_graphics_fill_rect(gfx, x, y + arc_h/2, arc_w/2, h - arc_h);
-    midp_graphics_fill_rect(gfx, x + w - arc_w/2, y + arc_h/2, arc_w/2, h - arc_h);
-    
-    /* Fill corners */
-    midp_graphics_fill_arc(gfx, x, y, arc_w, arc_h, 90, 90);
-    midp_graphics_fill_arc(gfx, x + w - arc_w, y, arc_w, arc_h, 0, 90);
-    midp_graphics_fill_arc(gfx, x + w - arc_w, y + h - arc_h, arc_w, arc_h, 270, 90);
-    midp_graphics_fill_arc(gfx, x, y + h - arc_h, arc_w, arc_h, 180, 90);
-}
-
-void midp_graphics_draw_string(MidpGraphics* gfx, const char* str,
-                               int x, int y, int anchor) {
-    GFX_DEBUG("drawString: str='%s', x=%d, y=%d, anchor=%d, color=0x%06X",
-            str ? str : "(null)", x, y, anchor, gfx ? gfx->rgb_color : 0);
-    if (!str || !gfx) return;
-    
-#ifdef J2ME_HEADLESS
-    /* Capture text for headless console output */
-    headless_log_text(str, x, y, gfx->rgb_color);
-#endif
-    
-    int byte_len = strlen(str);
-    if (byte_len == 0) return;
-    
-    /* Count characters (not bytes) using UTF-8 decoding */
-    int char_count = utf8_strlen(str);
-    if (char_count == 0) return;
-    
-    /* ИСПРАВЛЕНО: Properly truncate both char_count and calculate max byte_len */
-    int max_chars = 4096;
-    if (char_count > max_chars) {
-        char_count = max_chars;
-        /* Find the byte offset for the truncated character count */
-        int chars_seen = 0;
-        int safe_byte_len = 0;
-        while (chars_seen < max_chars && safe_byte_len < byte_len) {
-            int codepoint = utf8_decode(str, &safe_byte_len, byte_len);
-            if (codepoint < 0) break;
-            chars_seen++;
-        }
-        byte_len = safe_byte_len;
-    }
-    
-    /* Calculate text dimensions based on character count */
-    int text_width = char_count * (FONT_WIDTH + 1) - 1;  /* +1 for spacing between chars */
-    int text_height = FONT_HEIGHT;
-    
-    /* Apply translation */
-    int draw_x = x + gfx->translate_x;
-    int draw_y = y + gfx->translate_y;
-    
-    /* MIDP2 anchor constants:
-     * HCENTER = 1, VCENTER = 2, LEFT = 4, RIGHT = 8, TOP = 16, BOTTOM = 32, BASELINE = 64
-     */
-    
-    /* Apply horizontal anchor */
-    if (anchor & 0x01) {        /* HCENTER = 1 */
-        draw_x -= text_width / 2;
-    } else if (anchor & 0x08) { /* RIGHT = 8 */
-        draw_x -= text_width;
-    }
-    /* LEFT = 4 is default (no adjustment needed) */
-    
-    /* Apply vertical anchor */
-    if (anchor & 0x02) {        /* VCENTER = 2 */
-        draw_y -= text_height / 2;
-    } else if (anchor & 0x40) { /* BASELINE = 64 */
-        draw_y -= FONT_HEIGHT - 2;  /* Baseline is near bottom */
-    } else if (anchor & 0x20) { /* BOTTOM = 32 */
-        draw_y -= text_height;
-    }
-    /* TOP = 16 is default (no adjustment needed) */
-    
-    /* Debug output for anchor calculation */
-    GFX_DEBUG("drawString: char_count=%d, text_width=%d, draw_x=%d, draw_y=%d (anchor: HCENTER=%d RIGHT=%d LEFT=%d)",
-            char_count, text_width, draw_x, draw_y, 
-            (anchor & 0x01) ? 1 : 0, 
-            (anchor & 0x08) ? 1 : 0,
-            (anchor & 0x04) ? 1 : 0);
-    
-    /* Draw each character, decoding UTF-8 */
-    /* Use a separate counter to limit drawn characters (prevents buffer issues) */
-    int cur_x = draw_x;
-    int i = 0;
-    int chars_drawn = 0;
-    while (i < byte_len && chars_drawn < char_count) {
-        int codepoint = utf8_decode(str, &i, byte_len);
-        if (codepoint >= 0) {
-            midp_graphics_draw_char_unicode(gfx, codepoint, cur_x, draw_y);
-            cur_x += FONT_WIDTH + 1;  /* +1 for spacing between characters */
-            chars_drawn++;
-        }
-    }
-}
-
-void midp_graphics_draw_image(MidpGraphics* gfx, MidpImage* img,
-                              int x, int y, int anchor) {
-    x += gfx->translate_x;
-    y += gfx->translate_y;
-    
-    if (!img || !img->pixels) {
-        return;
-    }
-    
-    /* MIDP2 anchor constants:
-     * HCENTER = 1, VCENTER = 2, LEFT = 4, RIGHT = 8, TOP = 16, BOTTOM = 32, BASELINE = 64
-     */
-    
-    /* Apply horizontal anchor */
-    if (anchor & 0x01) {        /* HCENTER */
-        x -= img->width / 2;
-    } else if (anchor & 0x08) { /* RIGHT */
-        x -= img->width;
-    }
-    /* LEFT = 4 is default */
-    
-    /* Apply vertical anchor */
-    if (anchor & 0x02) {        /* VCENTER */
-        y -= img->height / 2;
-    } else if (anchor & 0x20) { /* BOTTOM */
-        y -= img->height;
-    }
-    /* TOP = 16 is default */
-    
-    /* Compute clipped destination region once */
-    int dst_x1 = x > gfx->clip_x ? x : gfx->clip_x;
-    int dst_y1 = y > gfx->clip_y ? y : gfx->clip_y;
-    int dst_x2 = (x + img->width) < (gfx->clip_x + gfx->clip_width) ? 
-                  (x + img->width) : (gfx->clip_x + gfx->clip_width);
-    int dst_y2 = (y + img->height) < (gfx->clip_y + gfx->clip_height) ?
-                 (y + img->height) : (gfx->clip_y + gfx->clip_height);
-    
-    /* Clamp to screen bounds */
-    if (dst_x1 < 0) dst_x1 = 0;
-    if (dst_y1 < 0) dst_y1 = 0;
-    if (dst_x2 > gfx->width) dst_x2 = gfx->width;
-    if (dst_y2 > gfx->height) dst_y2 = gfx->height;
-    
-    int copy_w = dst_x2 - dst_x1;
-    int copy_h = dst_y2 - dst_y1;
-    if (copy_w <= 0 || copy_h <= 0) return;
-    
-    /* Compute source region offset */
-    int src_x_off = dst_x1 - x;
-    int src_y_off = dst_y1 - y;
-    
-    /* Check if image is likely fully opaque by sampling corner pixels */
-    bool likely_opaque = !img->alpha;
-    if (!likely_opaque) {
-        uint32_t p1 = img->pixels[src_y_off * img->width + src_x_off];
-        if (((p1 >> 24) & 0xFF) == 0xFF) {
-            uint32_t p2 = img->pixels[(src_y_off + copy_h - 1) * img->width + (src_x_off + copy_w - 1)];
-            if (((p2 >> 24) & 0xFF) == 0xFF) {
-                uint32_t p3 = img->pixels[src_y_off * img->width + (src_x_off + copy_w - 1)];
-                uint32_t p4 = img->pixels[(src_y_off + copy_h - 1) * img->width + src_x_off];
-                if (((p3 >> 24) & 0xFF) == 0xFF && ((p4 >> 24) & 0xFF) == 0xFF) {
-                    likely_opaque = true;
-                }
-            }
-        }
-    }
-    
-    if (likely_opaque) {
-        /* Fast path: memcpy per row for opaque images */
-        for (int py = 0; py < copy_h; py++) {
-            uint32_t *src_row = img->pixels + (src_y_off + py) * img->width + src_x_off;
-            uint32_t *dst_row = gfx->pixels + (dst_y1 + py) * gfx->width + dst_x1;
-            memcpy(dst_row, src_row, copy_w * sizeof(uint32_t));
-        }
-    } else {
-        /* Alpha blending path with shift instead of division (faster on ARM) */
-        for (int py = 0; py < copy_h; py++) {
-            uint32_t *src_row = img->pixels + (src_y_off + py) * img->width + src_x_off;
-            uint32_t *dst_row = gfx->pixels + (dst_y1 + py) * gfx->width + dst_x1;
-            for (int px = 0; px < copy_w; px++) {
-                uint32_t src_color = src_row[px];
-                uint8_t alpha = (src_color >> 24) & 0xFF;
-                if (alpha == 255) {
-                    dst_row[px] = src_color;
-                } else if (alpha > 0) {
-                    uint32_t dst_color = dst_row[px];
-                    uint8_t inv_alpha = 255 - alpha;
-                    uint8_t r = (((src_color >> 16) & 0xFF) * alpha + 
-                                 ((dst_color >> 16) & 0xFF) * inv_alpha + 128) >> 8;
-                    uint8_t g = (((src_color >> 8) & 0xFF) * alpha + 
-                                 ((dst_color >> 8) & 0xFF) * inv_alpha + 128) >> 8;
-                    uint8_t b = ((src_color & 0xFF) * alpha + 
-                                 (dst_color & 0xFF) * inv_alpha + 128) >> 8;
-                    dst_row[px] = (0xFF << 24) | (r << 16) | (g << 8) | b;
-                }
-            }
-        }
-    }
-}
-
-/* Draw a region of an image with optional transform
- * MIDP2 Transform constants:
- * TRANS_NONE = 0, TRANS_MIRROR_ROT180 = 1, TRANS_MIRROR = 2, TRANS_ROT180 = 3
- * TRANS_MIRROR_ROT270 = 4, TRANS_ROT90 = 5, TRANS_ROT270 = 6, TRANS_MIRROR_ROT90 = 7
- */
-void midp_graphics_draw_region(MidpGraphics* gfx, MidpImage* img,
-                               int x_src, int y_src, int w, int h,
-                               int transform, int x_dest, int y_dest, int anchor) {
-    x_dest += gfx->translate_x;
-    y_dest += gfx->translate_y;
-    
-    if (!img || !img->pixels) return;
-    if (w <= 0 || h <= 0) return;
-    if (x_src < 0 || y_src < 0 || x_src + w > img->width || y_src + h > img->height) return;
-    
-    /* Calculate output dimensions based on transform */
-    int out_w = w;
-    int out_h = h;
-    
-    /* Rotations 90 and 270 swap width and height */
-    if (transform == 5 || transform == 6 || transform == 4 || transform == 7) {
-        out_w = h;
-        out_h = w;
-    }
-    
-    /* Apply anchor */
-    if (anchor & 0x01) {        /* HCENTER */
-        x_dest -= out_w / 2;
-    } else if (anchor & 0x08) { /* RIGHT */
-        x_dest -= out_w;
-    }
-    
-    if (anchor & 0x02) {        /* VCENTER */
-        y_dest -= out_h / 2;
-    } else if (anchor & 0x20) { /* BOTTOM */
-        y_dest -= out_h;
-    }
-    
-    /* Fast path for TRANS_NONE: pre-compute clipped region, use memcpy for opaque */
-    if (transform == 0) {
-        int dx1 = x_dest > gfx->clip_x ? x_dest : gfx->clip_x;
-        int dy1 = y_dest > gfx->clip_y ? y_dest : gfx->clip_y;
-        int dx2 = (x_dest + w) < (gfx->clip_x + gfx->clip_width) ?
-                  (x_dest + w) : (gfx->clip_x + gfx->clip_width);
-        int dy2 = (y_dest + h) < (gfx->clip_y + gfx->clip_height) ?
-                  (y_dest + h) : (gfx->clip_y + gfx->clip_height);
-        if (dx1 < 0) dx1 = 0;
-        if (dy1 < 0) dy1 = 0;
-        if (dx2 > gfx->width) dx2 = gfx->width;
-        if (dy2 > gfx->height) dy2 = gfx->height;
-        
-        int cw = dx2 - dx1;
-        int ch = dy2 - dy1;
-        if (cw <= 0 || ch <= 0) return;
-        
-        int sx_off = dx1 - x_dest;
-        int sy_off = dy1 - y_dest;
-        
-        /* Check opacity by sampling pixels */
-        bool opaque = !img->alpha;
-        if (!opaque) {
-            uint32_t p = img->pixels[(y_src + sy_off) * img->width + (x_src + sx_off)];
-            if (((p >> 24) & 0xFF) == 0xFF) {
-                p = img->pixels[(y_src + sy_off + ch - 1) * img->width + (x_src + sx_off + cw - 1)];
-                if (((p >> 24) & 0xFF) == 0xFF) opaque = true;
-            }
-        }
-        
-        if (opaque) {
-            for (int py = 0; py < ch; py++) {
-                memcpy(gfx->pixels + (dy1 + py) * gfx->width + dx1,
-                       img->pixels + (y_src + sy_off + py) * img->width + (x_src + sx_off),
-                       cw * sizeof(uint32_t));
-            }
-        } else {
-            for (int py = 0; py < ch; py++) {
-                uint32_t *src_row = img->pixels + (y_src + sy_off + py) * img->width + (x_src + sx_off);
-                uint32_t *dst_row = gfx->pixels + (dy1 + py) * gfx->width + dx1;
-                for (int px = 0; px < cw; px++) {
-                    uint32_t sc = src_row[px];
-                    uint8_t a = (sc >> 24) & 0xFF;
-                    if (a == 255) {
-                        dst_row[px] = sc;
-                    } else if (a > 0) {
-                        uint32_t dc = dst_row[px];
-                        uint8_t ia = 255 - a;
-                        uint8_t r = (((sc >> 16) & 0xFF) * a + ((dc >> 16) & 0xFF) * ia + 128) >> 8;
-                        uint8_t g = (((sc >> 8) & 0xFF) * a + ((dc >> 8) & 0xFF) * ia + 128) >> 8;
-                        uint8_t b = ((sc & 0xFF) * a + (dc & 0xFF) * ia + 128) >> 8;
-                        dst_row[px] = (0xFF << 24) | (r << 16) | (g << 8) | b;
-                    }
-                }
-            }
-        }
-        return;
-    }
-    
-    /* General transform path with pre-computed clip bounds and optimized alpha blend */
-    int clip_x1 = gfx->clip_x;
-    int clip_y1 = gfx->clip_y;
-    int clip_x2 = gfx->clip_x + gfx->clip_width;
-    int clip_y2 = gfx->clip_y + gfx->clip_height;
-    int scr_w = gfx->width;
-    int scr_h = gfx->height;
-    
-    for (int py = 0; py < h; py++) {
-        for (int px = 0; px < w; px++) {
-            int src_x = x_src + px;
-            int src_y = y_src + py;
-            
-            uint32_t src_color = img->pixels[src_y * img->width + src_x];
-            uint8_t alpha = (src_color >> 24) & 0xFF;
-            if (alpha == 0) continue;
-            
-            /* Calculate destination coordinates based on transform */
-            int dst_px, dst_py;
-            
-            switch (transform) {
-                /* MIDP2 Sprite Transform constants:
-                 * TRANS_NONE = 0: no transform
-                 * TRANS_MIRROR_ROT180 = 1: reflect horizontally (X-axis mirror), same as 180° rotation then mirror
-                 * TRANS_MIRROR = 2: reflect vertically (Y-axis mirror)  
-                 * TRANS_ROT180 = 3: rotate 180° clockwise
-                 * TRANS_MIRROR_ROT270 = 4: reflect horizontally then rotate 90° counter-clockwise
-                 * TRANS_ROT90 = 5: rotate 90° clockwise
-                 * TRANS_ROT270 = 6: rotate 270° clockwise (90° counter-clockwise)
-                 * TRANS_MIRROR_ROT90 = 7: reflect horizontally then rotate 90° clockwise
-                 */
-                case 1: /* TRANS_MIRROR_ROT180 - vertical flip (Y-axis mirror) */
-                    dst_px = px; dst_py = h - 1 - py; break;
-                case 2: /* TRANS_MIRROR - horizontal flip (X-axis mirror) */
-                    dst_px = w - 1 - px; dst_py = py; break;
-                case 3: /* TRANS_ROT180 */
-                    dst_px = w - 1 - px; dst_py = h - 1 - py; break;
-                case 4: /* TRANS_MIRROR_ROT270 - reflect X, then rotate 90° CCW = transpose */
-                    dst_px = py; dst_py = px; break;
-                case 5: /* TRANS_ROT90 - rotate 90° clockwise */
-                    dst_px = h - 1 - py; dst_py = px; break;
-                case 6: /* TRANS_ROT270 - rotate 270° clockwise (90° CCW) */
-                    dst_px = py; dst_py = w - 1 - px; break;
-                case 7: /* TRANS_MIRROR_ROT90 - reflect X, then rotate 90° CW */
-                    dst_px = h - 1 - py; dst_py = w - 1 - px; break;
-                default: 
-                    dst_px = px; dst_py = py; break;
-            }
-            
-            int dst_x = x_dest + dst_px;
-            int dst_y = y_dest + dst_py;
-            
-            /* Clip check */
-            if (dst_x < clip_x1 || dst_x >= clip_x2 || dst_y < clip_y1 || dst_y >= clip_y2) continue;
-            if (dst_x < 0 || dst_x >= scr_w || dst_y < 0 || dst_y >= scr_h) continue;
-            
-            /* Alpha blending with shift instead of division */
-            if (alpha == 255) {
-                gfx->pixels[dst_y * scr_w + dst_x] = src_color;
-            } else {
-                uint32_t dst_color = gfx->pixels[dst_y * scr_w + dst_x];
-                uint8_t inv_alpha = 255 - alpha;
-                uint8_t r = (((src_color >> 16) & 0xFF) * alpha + 
-                             ((dst_color >> 16) & 0xFF) * inv_alpha + 128) >> 8;
-                uint8_t g = (((src_color >> 8) & 0xFF) * alpha +
-                             ((dst_color >> 8) & 0xFF) * inv_alpha + 128) >> 8;
-                uint8_t b = (((src_color & 0xFF) * alpha +
-                             (dst_color & 0xFF) * inv_alpha + 128)) >> 8;
-                gfx->pixels[dst_y * scr_w + dst_x] = (0xFF << 24) | (r << 16) | (g << 8) | b;
-            }
-        }
-    }
-}
-
-/* Copy a region within the graphics context */
-void midp_graphics_copy_area(MidpGraphics* gfx, int x_src, int y_src,
-                             int w, int h, int x_dest, int y_dest, int anchor) {
-    x_src += gfx->translate_x;
-    y_src += gfx->translate_y;
-    x_dest += gfx->translate_x;
-    y_dest += gfx->translate_y;
-    
-    if (w <= 0 || h <= 0) return;
-    
-    /* Apply anchor for destination */
-    if (anchor & 0x01) {        /* HCENTER */
-        x_dest -= w / 2;
-    } else if (anchor & 0x08) { /* RIGHT */
-        x_dest -= w;
-    }
-    
-    if (anchor & 0x02) {        /* VCENTER */
-        y_dest -= h / 2;
-    } else if (anchor & 0x20) { /* BOTTOM */
-        y_dest -= h;
-    }
-    
-    /* Compute valid source region clamped to screen bounds */
-    int sx1 = x_src > 0 ? x_src : 0;
-    int sy1 = y_src > 0 ? y_src : 0;
-    int sx2 = (x_src + w) < gfx->width ? (x_src + w) : gfx->width;
-    int sy2 = (y_src + h) < gfx->height ? (y_src + h) : gfx->height;
-    int cw = sx2 - sx1;
-    int ch = sy2 - sy1;
-    if (cw <= 0 || ch <= 0) return;
-    
-    /* Corresponding destination coords */
-    int dx1 = x_dest + (sx1 - x_src);
-    int dy1 = y_dest + (sy1 - y_src);
-    
-    /* Clip destination to clip region and screen */
-    int clip_x2 = gfx->clip_x + gfx->clip_width;
-    int clip_y2 = gfx->clip_y + gfx->clip_height;
-    int adj;
-    adj = gfx->clip_x - dx1; if (adj > 0) { dx1 += adj; sx1 += adj; cw -= adj; }
-    adj = gfx->clip_y - dy1; if (adj > 0) { dy1 += adj; sy1 += adj; ch -= adj; }
-    if (dx1 + cw > clip_x2) cw = clip_x2 - dx1;
-    if (dy1 + ch > clip_y2) ch = clip_y2 - dy1;
-    if (dx1 + cw > gfx->width) cw = gfx->width - dx1;
-    if (dy1 + ch > gfx->height) ch = gfx->height - dy1;
-    if (cw <= 0 || ch <= 0) return;
-    
-    /* Use temp buffer for safe copy (handles overlapping regions), memcpy per row */
-    size_t row_bytes = (size_t)cw * sizeof(uint32_t);
-    uint32_t* temp = (uint32_t*)malloc(ch * row_bytes);
-    if (!temp) return;
-    
-    for (int py = 0; py < ch; py++) {
-        memcpy(temp + (size_t)py * cw,
-               gfx->pixels + (sy1 + py) * gfx->width + sx1,
-               row_bytes);
-    }
-    for (int py = 0; py < ch; py++) {
-        memcpy(gfx->pixels + (dy1 + py) * gfx->width + dx1,
-               temp + (size_t)py * cw,
-               row_bytes);
-    }
-    
-    free(temp);
-}
-
-void midp_graphics_get_rgb(MidpGraphics* gfx, jint* rgb_data,
-                           int offset, int scanlength, int x, int y, int w, int h) {
-    x += gfx->translate_x;
-    y += gfx->translate_y;
-    
-    for (int py = 0; py < h; py++) {
-        int src_y = y + py;
-        if (src_y < 0 || src_y >= gfx->height) continue;
-        
-        for (int px = 0; px < w; px++) {
-            int src_x = x + px;
-            if (src_x < 0 || src_x >= gfx->width) continue;
-            
-            rgb_data[offset + py * scanlength + px] = 
-                (jint)gfx->pixels[src_y * gfx->width + src_x];
-        }
-    }
-}
 
 /*
  * Image operations
  */
 
-/* Maximum image dimension to prevent OOM from malformed data */
-#define MIDP_MAX_IMAGE_DIMENSION 2048
+/* Maximum image dimension to prevent OOM from malformed data.
+ * v34.77 FIX (Asphalt 4 loading freeze): the old 2048 cap rejected the
+ * game's perfectly legal 2500x1 loading-bar strips (GLLib's f.P builds a
+ * width x 1 progress bar; real phones impose NO dimension cap — only
+ * available memory). The rejection made midp_image_create return NULL,
+ * which the JNI layer mapped to OutOfMemoryError — an Error, not an
+ * Exception — so the game's catch(Exception) in its paint() wrapper let
+ * it escape, the reentrancy guard stayed set and every later paint()
+ * returned instantly: permanent loading-screen freeze. Raised to 4096;
+ * MIDP_MAX_IMAGE_PIXELS plus the calloc failure path still guard against
+ * genuinely absurd (decoder-garbage) requests. */
+#define MIDP_MAX_IMAGE_DIMENSION 4096
 #define MIDP_MAX_IMAGE_PIXELS (MIDP_MAX_IMAGE_DIMENSION * MIDP_MAX_IMAGE_DIMENSION)
+
+/* [v34.20] All 2D drawing primitives (set_pixel, drawLine, fillRect,
+ * arcs, glyphs, drawString, drawImage/drawRegion, copyArea, getRGB)
+ * moved to src/render/render.c — see render/render.h. */
 
 MidpImage* midp_image_create(int width, int height, bool mutable) {
     /* Validate dimensions to prevent OOM from malformed images */
@@ -1043,13 +457,59 @@ MidpImage* midp_image_create(int width, int height, bool mutable) {
     img->height = height;
     img->mutable = mutable;
     img->alpha = true;
+    /* v34.51 PINK-FIX: mutable images start white-opaque but graphics ops
+     * may later write alpha != 0xFF — the scan stays unvalidated (lazily
+     * recomputed on first draw, invalidated on alpha writes). */
+    img->alpha_scan_valid = false;
+    img->alpha_all_opaque = false;
     
     /* MIDP spec: mutable images are initially filled with white pixels */
     if (mutable) {
         memset(img->pixels, 0xFF, pixel_count * sizeof(uint32_t));
     }
     
+    /* v36.12 PEER-REGISTRY: single choke point of ALL image creation
+     * (create_from_rgb / create_from_data funnel through here). The peer
+     * dies either via midp_image_destroy (unregisters) or at the session
+     * sweep when its Java owner died with the heap. */
+    midp_peer_register(img, MIDP_PEER_IMAGE);
+    
     return img;
+}
+
+/* v34.51 PINK-FIX: exact per-image opacity.
+ *
+ * The old drawImage/drawRegion heuristic sampled the corner pixels of the
+ * blitted region; when all happened to be opaque it memcpy'd the whole
+ * sprite. Sprites whose transparent color-key pixels (pink (255,0,255)
+ * with alpha==0 from PNG tRNS) were INSIDE the region — e.g. a car sprite
+ * with an opaque outline — passed that corner test and the raw pink pixels
+ * were copied to the framebuffer, where the presentation stage (XRGB8888/
+ * RGB565) drops alpha -> PINK BOXES on screen.
+ *
+ * This function replaces the heuristic with the exact cached state:
+ * alpha==false means the image can never contain transparency; otherwise
+ * a one-time full scan (early-exit on the first non-opaque pixel) decides
+ * memcpy vs blend. Immutable images get the scan folded into their decode
+ * loops (see below); mutable images rescan after invalidating writes. */
+bool midp_image_all_opaque(MidpImage* img) {
+    if (!img || !img->pixels) return false;
+    if (!img->alpha) return true;            /* no transparency possible */
+    if (!img->alpha_scan_valid) {
+        const size_t total = (size_t)img->width * (size_t)img->height;
+        const uint32_t* p = img->pixels;
+        bool all = true;
+        for (size_t i = 0; i < total; i++) {
+            if ((p[i] >> 24) != 0xFFu) { all = false; break; }
+        }
+        img->alpha_all_opaque = all ? JNI_TRUE : JNI_FALSE;
+        img->alpha_scan_valid = JNI_TRUE;
+    }
+    return img->alpha_all_opaque ? true : false;
+}
+
+void midp_image_invalidate_alpha_scan(MidpImage* img) {
+    if (img && img->alpha) img->alpha_scan_valid = JNI_FALSE;
 }
 
 MidpImage* midp_image_create_from_rgb(const jint* rgb, int width, int height,
@@ -1058,20 +518,28 @@ MidpImage* midp_image_create_from_rgb(const jint* rgb, int width, int height,
     MidpImage* img = midp_image_create(width, height, false);
     if (!img) return NULL;
     
+    bool has_nonopaque = false; /* v34.51: exact scan, folded into the copy */
     for (int i = 0; i < width * height; i++) {
         if (process_alpha) {
             img->pixels[i] = (uint32_t)rgb[i];
+            if ((img->pixels[i] >> 24) != 0xFFu) has_nonopaque = true;
         } else {
             img->pixels[i] = 0xFF000000 | ((uint32_t)rgb[i] & 0xFFFFFF);
         }
     }
     
-    img->alpha = process_alpha;
+    img->alpha = process_alpha && has_nonopaque;
+    img->alpha_scan_valid = JNI_TRUE;      /* exact knowledge from this loop */
+    img->alpha_all_opaque = !img->alpha;
     return img;
 }
 
 void midp_image_destroy(MidpImage* img) {
     if (img) {
+        /* v36.12 PEER-REGISTRY: unregister FIRST (while the pointer is
+         * still the live key), then free — the session sweep must never
+         * see (and double-free) an already-destroyed peer. */
+        midp_peer_unregister(img);
         free(img->pixels);
         free(img);
     }
@@ -1080,17 +548,43 @@ void midp_image_destroy(MidpImage* img) {
 void midp_image_get_rgb(MidpImage* img, jint* rgb, int offset, int scanlength,
                         int x, int y, int width, int height) {
     if (!img || !rgb) return;
-    
-    for (int py = 0; py < height; py++) {
-        int src_y = y + py;
-        if (src_y < 0 || src_y >= img->height) continue;
-        
-        for (int px = 0; px < width; px++) {
-            int src_x = x + px;
-            if (src_x < 0 || src_x >= img->width) continue;
+
+    /* v34.28: hoisted bounds — the in-bounds source window per row is ONE
+     * contiguous run; same elements, same 32-bit values, bit-identical to
+     * the per-pixel reference (kept for NOJME_2D_SCALAR=1). */
+    if (nojme_2d_scalar_forced()) {
+        for (int py = 0; py < height; py++) {
+            int src_y = y + py;
+            if (src_y < 0 || src_y >= img->height) continue;
             
-            rgb[offset + py * scanlength + px] = 
-                (jint)img->pixels[src_y * img->width + src_x];
+            for (int px = 0; px < width; px++) {
+                int src_x = x + px;
+                if (src_x < 0 || src_x >= img->width) continue;
+                
+                rgb[offset + py * scanlength + px] = 
+                    (jint)img->pixels[src_y * img->width + src_x];
+            }
+        }
+        return;
+    }
+
+    const int sxlo = x > 0 ? x : 0;
+    const int sylo = y > 0 ? y : 0;
+    const int sxhi = ((long long)x + width < (long long)img->width) ? (x + width) : img->width;
+    const int syhi = ((long long)y + height < (long long)img->height) ? (y + height) : img->height;
+    const int pxlo = sxlo - x, pxhi = sxhi - x;
+    const int pylo = sylo - y, pyhi = syhi - y;
+    const int run = pxhi - pxlo;
+
+    for (int py = pylo; py < pyhi; py++) {
+        const uint32_t* src_row = img->pixels + (size_t)(y + py) * img->width + sxlo;
+        jint* dst_row = rgb + (size_t)offset + (size_t)py * scanlength + pxlo;
+        if (run == width && run > 8) {
+            memcpy(dst_row, src_row, (size_t)run * sizeof(uint32_t));
+        } else {
+            for (int px = 0; px < run; px++) {
+                dst_row[px] = (jint)src_row[px];
+            }
         }
     }
 }
@@ -1104,6 +598,11 @@ MidpGraphics* midp_image_get_graphics(MidpImage* img) {
     if (!gfx) return NULL;
     
     midp_graphics_init(gfx, img->pixels, img->width, img->height);
+    gfx->owner_image = img; /* v34.51: alpha-scan invalidation hook */
+    
+    /* v36.12 PEER-REGISTRY: Graphics peers die at the session sweep when
+     * their Java wrapper is gone (no GC finalizer for nativePeer fields). */
+    midp_peer_register(gfx, MIDP_PEER_GFX);
     
     return gfx;
 }
@@ -1161,12 +660,19 @@ MidpImage* midp_image_create_from_data(const uint8_t* data, int offset, int leng
     }
     
     /* Convert from stb_image format (RGBA bytes) to our format (ARGB uint32_t)
-     * Optimized: pointer arithmetic, process 4 pixels at a time */
+     * Optimized: pointer arithmetic, process 4 pixels at a time
+     * v34.51 PINK-FIX: the loop already touches every pixel — fold the exact
+     * opacity scan in (has_nonopaque). An RGBA PNG whose pixels are ALL
+     * alpha==0xFF is marked alpha==false: drawImage/drawRegion then use the
+     * memcpy path, exactly like an RGB PNG. A PNG with real transparency
+     * (tRNS color-key incl. pink (255,0,255,0) backgrounds) keeps alpha==true
+     * and always renders through the src-over path — no more pink boxes. */
     {
         const uint8_t *src = pixels;
         uint32_t *dst = img->pixels;
         int total = width * height;
         int i = 0;
+        bool has_nonopaque = false;
         
         /* Process 4 pixels at a time for better instruction pipelining */
         for (; i + 3 < total; i += 4) {
@@ -1174,16 +680,21 @@ MidpImage* midp_image_create_from_data(const uint8_t* data, int offset, int leng
             dst[i + 1] = ((uint32_t)src[7] << 24) | ((uint32_t)src[4] << 16) | ((uint32_t)src[5] << 8) | src[6];
             dst[i + 2] = ((uint32_t)src[11] << 24) | ((uint32_t)src[8] << 16) | ((uint32_t)src[9] << 8) | src[10];
             dst[i + 3] = ((uint32_t)src[15] << 24) | ((uint32_t)src[12] << 16) | ((uint32_t)src[13] << 8) | src[14];
+            if (src[3] != 0xFF || src[7] != 0xFF || src[11] != 0xFF || src[15] != 0xFF)
+                has_nonopaque = true;
             src += 16;
         }
         /* Handle remaining pixels */
         for (; i < total; i++) {
             dst[i] = ((uint32_t)src[3] << 24) | ((uint32_t)src[0] << 16) | ((uint32_t)src[1] << 8) | src[2];
+            if (src[3] != 0xFF) has_nonopaque = true;
             src += 4;
         }
+        
+        img->alpha = (channels == 4) && has_nonopaque;
+        img->alpha_scan_valid = JNI_TRUE;  /* exact knowledge from the loop */
+        img->alpha_all_opaque = !img->alpha;
     }
-    
-    img->alpha = (channels == 4);
     
     stbi_image_free(pixels);
     return img;
@@ -1193,13 +704,30 @@ MidpImage* midp_image_create_from_data(const uint8_t* data, int offset, int leng
  * Font operations
  */
 
+/* v36.29 [FONT-2X]: pixel scale of the shared 5x7 bitmap font for a font
+ * object. SIZE_LARGE renders and measures 2x — the standard J2ME way to
+ * get bigger text (FACE/STYLE stay cosmetic). SIZE_SMALL/SIZE_MEDIUM map
+ * to scale 1 (there is no smaller bitmap). */
+int midp_font_pixel_scale(const MidpFont* font) {
+    return (font && font->size == FONT_SIZE_LARGE) ? 2 : 1;
+}
+
+/* v36.29 [FONT-HEIGHT]: getHeight() must include the inter-line LEADING.
+ * The glyph box is 7px tall and 5x7 glyphs have ink in BOTH the first and
+ * the last row (285/328 glyphs ink row 0, all ink row 6), so with the old
+ * height==7 games drawing multi-line text with y += getHeight() produced
+ * zero pixel gap — "буквы рисуются вплотную друг к другу по высоте".
+ * Real devices always return ascent+descent+leading here. 7 + 2 = 9. */
+#define MIDP_FONT_LINE_HEIGHT (FONT_HEIGHT + 2)
+#define MIDP_FONT_BASELINE    (FONT_HEIGHT - 2)   /* ascent: unchanged */
+
 MidpFont* midp_font_get_default(void) {
     static MidpFont default_font = {
         .face = FONT_FACE_SYSTEM,
         .style = FONT_STYLE_PLAIN,
         .size = FONT_SIZE_MEDIUM,
-        .height = FONT_HEIGHT,
-        .baseline = FONT_HEIGHT - 2,
+        .height = MIDP_FONT_LINE_HEIGHT,
+        .baseline = MIDP_FONT_BASELINE,
         .native_font = NULL
     };
     return &default_font;
@@ -1212,36 +740,47 @@ MidpFont* midp_font_get(int face, int style, int size) {
     font->face = face;
     font->style = style;
     font->size = size;
-    /* Use bitmap font dimensions */
-    font->height = FONT_HEIGHT;
-    font->baseline = FONT_HEIGHT - 2;
+    /* v36.29: LARGE is the 2x font — metrics double together with the
+     * rendering scale (midp_font_pixel_scale); SMALL shares MEDIUM. */
+    if (size == FONT_SIZE_LARGE) {
+        font->height = MIDP_FONT_LINE_HEIGHT * 2;
+        font->baseline = MIDP_FONT_BASELINE * 2;
+    } else {
+        font->height = MIDP_FONT_LINE_HEIGHT;
+        font->baseline = MIDP_FONT_BASELINE;
+    }
     font->native_font = NULL;
+    
+    /* v36.12 PEER-REGISTRY: Font.getFont() had NO destroy path at all —
+     * every call leaked a MidpFont for the process lifetime. */
+    midp_peer_register(font, MIDP_PEER_FONT);
     
     return font;
 }
 
 int midp_font_string_width(MidpFont* font, const char* str) {
     if (!font || !str) return 0;
-    /* Each character is FONT_WIDTH pixels + 1 pixel spacing */
+    /* Each character is FONT_WIDTH pixels + 1 pixel spacing, scaled */
+    int scale = midp_font_pixel_scale(font);
     /* Count UTF-8 characters, not bytes */
     int char_count = utf8_strlen(str);
     /* Prevent integer overflow for very long strings */
     if (char_count > 4096) char_count = 4096;
-    return char_count > 0 ? char_count * (FONT_WIDTH + 1) - 1 : 0;
+    return char_count > 0 ? char_count * ((FONT_WIDTH + 1) * scale) - scale : 0;
 }
 
 int midp_font_char_width(MidpFont* font, jchar ch) {
     (void)ch;
     if (!font) return 0;
-    return FONT_WIDTH;
+    return FONT_WIDTH * midp_font_pixel_scale(font);
 }
 
 int midp_font_height(MidpFont* font) {
-    return font ? font->height : FONT_HEIGHT;
+    return font ? font->height : MIDP_FONT_LINE_HEIGHT;
 }
 
 int midp_font_baseline_position(MidpFont* font) {
-    return font ? font->baseline : FONT_HEIGHT - 2;
+    return font ? font->baseline : MIDP_FONT_BASELINE;
 }
 
 /*

@@ -20,10 +20,15 @@
 /* Global configuration */
 DrmBypassConfig g_drm_bypass;
 
-/* Properties to hide in hideEmulation mode (from KEmulator) */
+/* Properties to hide in hideEmulation mode (from KEmulator).
+ * v36.25 [SYSPROPS]: префикс "java." УДАЛЁН из списка скрытия — раньше
+ * он глотал java.name/java.version/java.vm.name/java.heap.* и подобные
+ * (запрос пользователя: «стоит их установить для совместимости»). Наши
+ * значения теперь неотличимы от реального телефона (java.version=1.4.2,
+ * java.vm.name=CLDC-HI — как у Nokia S60 с Sun CLDC-HI), скрывать больше
+ * нечего: спуф сам по себе выглядит легитимно для DRM-детекторов. */
 static const char* hidden_property_prefixes[] = {
     "os.",           /* os.name, os.version, os.arch */
-    "java.",         /* java.version, java.vendor, etc. */
     "sun.",          /* Sun-specific properties */
     "org.pigler.",   /* Pigler automation */
     "ru.nnproject.", /* NNProject emulator detection */
@@ -45,7 +50,8 @@ static const char* emulator_revealing_properties[] = {
     NULL
 };
 
-/* Classes to hide in hideEmulation mode */
+/* Classes to hide in hideEmulation mode (reserved for future use) */
+__attribute__((unused))
 static const char* hidden_class_prefixes[] = {
     "kemnn.",
     "emulator.",
@@ -252,7 +258,11 @@ const char* drm_get_spoofed_property(const char* key) {
     
     /* Motorola-specific */
     if (strcmp(key, "motorola.microedition.locale") == 0) {
-        return "en";
+        /* v36.25: тот же источник, что и microedition.locale — язык Switch
+         * с учётом MIDlet-Languages мидлета ([LOCALE-COMPAT]). */
+        extern const char* nojme_sysprop_locale(void);
+        const char* c = nojme_sysprop_locale();
+        return (c && c[0]) ? c : "en";
     }
     
     /* Samsung-specific */

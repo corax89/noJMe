@@ -31,7 +31,16 @@
 #else
 #include <pthread.h>
 #include <sched.h>  /* For sched_yield() */
+#include <time.h>    /* v34.9: nanosleep for safepoint wait */
 #endif
+
+/* v34.9 GC safepoint API (defined in threads.c, declared in
+ * include/threads.h). v34.10: these externs moved OUT of the POSIX-only
+ * branch — the Windows build runs VM threads as native threads too, so
+ * gc_collect() must request a stop-the-world there as well, and the
+ * heap_lock ticket wait loop polls the same request. */
+extern volatile int g_gc_safepoint_request;
+void jvm_gc_safepoint_park(void);
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,9 +54,27 @@
 #include "debug_macros.h"
 #include "native.h"  /* For string field slot accessors */
 #include "midp.h"    /* For M3G registry GC root support */
+#include "threads.h" /* v34.71: jvm_os_thread_is_main_java for the TLAB gate */
 
-/* External function for error display in libretro mode */
-extern void sdl_set_error_info(const char* title, const char* message, const char* stack_trace);
+/* v34 FIX (VmTest false "UNCAUGHT EXCEPTION"): heap-full is NOT a fatal error.
+ * Per JVM spec an allocation failure is delivered to Java as a NORMAL catchable
+ * OutOfMemoryError (MemTests/MemBudget in VmTest and many real games probe the
+ * heap by allocating until OOME and catching it). The old code called
+ * sdl_set_error_info() here, which printed a misleading "[J2ME UNCAUGHT
+ * EXCEPTION]" banner and set sdl_has_error() -> the headless loop aborted the
+ * run mid-test and libretro/SDL stuck a permanent error screen over a running
+ * game that had legitimately recovered. Fatal-OOM reporting now happens ONLY
+ * at the MIDlet-death layer (main.c / libretro.c uncaught-exception handlers),
+ * which read detailMessage from the actually-thrown exception.
+ * These globals keep the sizes of the LAST failed allocation so
+ * native_throw_oome() can build the same diagnostic detailMessage. */
+static size_t g_last_oom_requested = 0;
+static size_t g_last_oom_available = 0;
+
+void heap_get_last_oom_info(size_t* requested, size_t* available) {
+    if (requested)  *requested  = g_last_oom_requested;
+    if (available)  *available  = g_last_oom_available;
+}
 
 /* ============================================================
  * GC DEBUG LOGGING CONTROL
@@ -133,7 +160,7 @@ static volatile int heap_log_initialized = 0;
 static void heap_log_init(void) {
     /* CRITICAL FIX: Thread-safe initialization using CAS */
     int expected = 0;
-    if (ATOMIC_CAS(&heap_log_initialized, expected, 1)) {
+    if (__sync_bool_compare_and_swap(&heap_log_initialized, expected, 1)) {
         /* We won the race - open the log file */
         FILE* f = fopen("heap_debug.log", "w");
         if (!f) {
@@ -180,6 +207,10 @@ JVM* g_jvm_for_instanceof = NULL;
 
 /* Global counter for strings fixed during GC (reset each cycle) */
 static int gc_strings_fixed_this_cycle = 0;
+/* v34.80: recycled headers neutralized by the gc_mark_object class-guard
+ * (see the OBJ_TYPE_OBJECT case) — diagnostic counter, same style as
+ * gc_strings_fixed_this_cycle; racily read by telemetry. */
+static int gc_recycled_headers_skipped = 0;
 
 /* Выравнивание объектов. 
  * На 32-битных системах double/long требуют выравнивания по 8 байт. 
@@ -263,18 +294,53 @@ static void heap_mutex_init(void) {
     }
 }
 
-/* Lock heap mutex */
-static inline void heap_lock(void) {
-    heap_mutex_init();
+/* ============ v34.9 HEAP LOCK: TICKET (STRICTLY FAIR) ============
+ * The heap mutex is a recursive primitive (PTHREAD_MUTEX_RECURSIVE on
+ * POSIX, CRITICAL_SECTION on Windows). Under contention between a
+ * spinning thread (the Bounce Tales loader choreography calls System.gc()
+ * in a busy loop) and a single-shot acquirer (the loader thread inside
+ * GameCanvas.getGraphics()), the plain mutex let the spinner re-acquire
+ * forever (barge) and starved the loader -> white loading screen hang
+ * after "New game". A ticket queue makes acquisition strictly FIFO:
+ * every caller takes a ticket and only the serving ticket may touch the
+ * mutex. Re-entrant (recursive) callers bypass the ticket queue.
+ * The GC safepoint is honored while waiting for a ticket.
+ *
+ * v34.10: ONE implementation for POSIX and Windows. v34.9 shipped the
+ * ticket queue only in the POSIX branch of heap_lock/heap_unlock, so the
+ * Windows libretro build kept the unfair plain mutex and was still
+ * exposed to the same loader starvation. Thread identity is abstracted
+ * through heap_native_tid_t (pthread_t vs GetCurrentThreadId()). */
+static volatile int heap_ticket_serving = 0;
+static volatile int heap_ticket_next = 0;
+
+/* Native thread identity for the recursive fast-path */
+#ifdef _WIN32
+typedef DWORD heap_native_tid_t;
+#define HEAP_TID_SELF()       GetCurrentThreadId()
+#define HEAP_TID_EQUAL(a, b)  ((a) == (b))
+#define HEAP_YIELD()          SwitchToThread()
+#else
+typedef pthread_t heap_native_tid_t;
+#define HEAP_TID_SELF()       pthread_self()
+#define HEAP_TID_EQUAL(a, b)  pthread_equal((a), (b))
+#define HEAP_YIELD()          sched_yield()
+#endif
+
+static volatile heap_native_tid_t g_heap_owner_native;  /* primitive-mutex owner */
+static volatile int g_heap_owner_valid = 0;
+static volatile int g_heap_owner_tid = -1;              /* JavaThread id (diag) */
+static volatile int g_heap_lock_stall_reported = 0;
+static volatile int g_heap_recursion_count = 0;   /* v34.9: inner (re-entrant) lock depth */
+
+static inline void heap_prim_lock(void) {
 #ifdef _WIN32
     EnterCriticalSection(&heap_mutex);
 #else
     pthread_mutex_lock(&heap_mutex);
 #endif
 }
-
-/* Unlock heap mutex */
-static inline void heap_unlock(void) {
+static inline void heap_prim_unlock(void) {
 #ifdef _WIN32
     LeaveCriticalSection(&heap_mutex);
 #else
@@ -282,11 +348,288 @@ static inline void heap_unlock(void) {
 #endif
 }
 
+static inline void heap_lock(void) {
+    heap_mutex_init();
+    {
+        heap_native_tid_t self = HEAP_TID_SELF();
+        /* Recursive fast-path: we already own the primitive mutex (recursive
+         * on both platforms: PTHREAD_MUTEX_RECURSIVE / CRITICAL_SECTION).
+         * The matching unlock must NOT advance the ticket queue
+         * (v34.9: a lost ticket deadlock). */
+        if (g_heap_owner_valid && HEAP_TID_EQUAL(g_heap_owner_native, self)) {
+            heap_prim_lock();
+            g_heap_recursion_count++;
+            return;
+        }
+        {
+            int my = __sync_fetch_and_add(&heap_ticket_next, 1);
+            int spins = 0;
+            while (heap_ticket_serving != my) {
+                if (g_gc_safepoint_request) jvm_gc_safepoint_park();
+                HEAP_YIELD();
+                /* v34.96: the v34.9 report was ONE-SHOT per process
+                 * (g_heap_lock_stall_reported latched) — a SECOND stall in
+                 * the same session was silent, and the v34.95 freeze trace
+                 * provably lacked the report although a ticket stall was a
+                 * candidate. Report the FIRST stall, then re-report every
+                 * 5 s while the stall persists, now including next= (the
+                 * queued ticket count) — a serving that never advances
+                 * across reports is a dead ticket queue, an advancing one
+                 * is just heavy contention. */
+                if (++spins >= 50000) {
+                    static volatile long long s_last_rep_ms = 0;
+#ifdef _WIN32
+                    long long rep_now = (long long)GetTickCount64();
+#else
+                    struct timespec rep_ts;
+                    clock_gettime(CLOCK_MONOTONIC, &rep_ts);
+                    long long rep_now =
+                        (long long)rep_ts.tv_sec * 1000LL + rep_ts.tv_nsec / 1000000LL;
+#endif
+                    if (!g_heap_lock_stall_reported ||
+                        rep_now - s_last_rep_ms >= 5000) {
+                        g_heap_lock_stall_reported = 1;
+                        s_last_rep_ms = rep_now;
+                        extern JavaThread* thread_current(JVM*);
+                        JavaThread* t = thread_current(NULL);
+                        LOG_SAFE("[HEAPDIAG] TICKET STALL: my=%d serving=%d next=%d "
+                                 "owner_tid=%d owner_valid=%d waiter_tid=%d\n",
+                                 my, heap_ticket_serving, heap_ticket_next,
+                                 g_heap_owner_tid,
+                                 g_heap_owner_valid, t ? t->id : -1);
+                    }
+                    spins = 0;
+                }
+            }
+            heap_prim_lock();
+        }
+        {
+            extern JavaThread* thread_current(JVM*);
+            JavaThread* t = thread_current(NULL);
+            g_heap_owner_tid = t ? t->id : -1;
+        }
+        g_heap_owner_native = self;
+        g_heap_owner_valid = 1;
+    }
+}
+
+static inline void heap_unlock(void) {
+    if (g_heap_recursion_count > 0) {
+        /* Inner (re-entrant) release: the primitive mutex is still held by
+         * the outer owner — do NOT pass the ticket. */
+        g_heap_recursion_count--;
+        heap_prim_unlock();
+        return;
+    }
+    g_heap_owner_valid = 0;
+    g_heap_owner_tid = -1;
+    /* v34.11: advance the ticket BEFORE releasing the primitive mutex.
+     * Advancing it after the unlock let the next-ticket thread acquire the
+     * primitive mutex and observe a stale serving pointer (harmless spin,
+     * but it also allowed an out-of-order mutex handoff window). */
+    heap_ticket_serving++;
+    heap_prim_unlock();
+}
+
+/* v19: Emergency reserve. When the Java heap is FULL, the VM must still be
+ * able to allocate the OutOfMemoryError (or any other Throwable) object so
+ * the MIDlet can CATCH it (J2ME spec: OOME is a normal Throwable). Without
+ * the reserve the exception object allocation itself fails, no exception is
+ * pending, and interpret() treats the opcode failure as fatal -> VM stops.
+ * The reserve sits BEYOND heap.end and is only used by *_emergency allocs. */
+#define HEAP_EMERGENCY_RESERVE (256 * 1024)
+
+/* ============================================================
+ * v34.58 PERF: SIZE-CLASS ALLOCATOR (segregated free lists)
+ * ============================================================
+ * Раньше try_alloc_from_free_list() делал first-fit по ОДНОМУ
+ * линейному списку всех свободных блоков. На фрагментированной
+ * куче (стринг-churn игр даёт 100k+ блоков) каждый miss — O(n)
+ * pointer chases. Теперь:
+ *
+ *  - Блоки <= SC_SMALL_MAX (1024 байт) раскладываются по
+ *    SC_NUM_BUCKETS бакетам: LIFO-пуш при освобождении/split,
+ *    pop головы при аллокации — O(1) в общем случае.
+ *  - Блоки > 1024 байт живут в одном large-списке (короткий:
+ *    крупные буферы игр редки), first-fit по нему остаётся
+ *    O(крупные блоки).
+ *  - Поиск: сначала СВОЙ бакет, затем бакеты постарше, затем
+ *    large-список. Это best-fit-by-class: меньше фрагментации,
+ *    чем чистый first-fit по адресам.
+ *
+ * sc_lut[] — прямая таблица «размер>>3 -> индекс бакета» для всех
+ * 8-байтовых шагов до 1024, строится в heap_init (зависит от
+ * sizeof(GCObjectHeader) — минимального возможного total_size).
+ *
+ * ИНВАРИАНТЫ, которые обязан сохранять каждый путь:
+ *  1) Каждый свободный регион начинается с валидного
+ *     GCObjectHeader/FreeBlock (size по общему смещению,
+ *     type=OBJ_TYPE_FREE) — линейные обходы (sweep, presweep,
+ *     heap_validate, heap_check_magic) прыгают по size целыми
+ *     регионами и не должны спотыкаться о мусор в середине.
+ *  2) Блок, взятый из бакета и разрезанный, даёт remainder,
+ *     который кладётся в бакет СВОЕГО размера (не в голову
+ *     чужого списка) — так мелочь не накапливается.
+ *  3) Sweep-фаза rebuild'ит ВСЕ бакеты с нуля (самоочистка от
+ *     любого рассинхрона) и заодно coalesce'ит соседние свободные
+ *     блоки одним проходом (адреса растут — слияние на лету).
+ *     Попутно устранён старый дефект: блоки, уже свободные ДО
+ *     этого GC, теперь заново попадают в новые списки (раньше
+ *     они просто выпадали из учёта — емкость кучи деградировала).
+ * ============================================================ */
+#define SC_NUM_BUCKETS 18
+static const uint32_t sc_bucket_limit[SC_NUM_BUCKETS] = {
+    48,  56,  64,  72,  80,  96,  112, 128, 160, 192,
+    224, 256, 320, 384, 512, 640, 768, 1024
+};
+#define SC_SMALL_MAX  1024
+#define SC_LARGE_IDX  SC_NUM_BUCKETS          /* виртуальный индекс large-списка */
+#define SC_LUT_SIZE   ((SC_SMALL_MAX >> 3) + 1)
+static uint8_t sc_lut[SC_LUT_SIZE];          /* размер>>3 -> бакет */
+
+/* Быстрое определение бакета по total_size (выравнивание 8 гарантировано). */
+static inline int size_class_idx(size_t total_size) {
+    if (total_size <= SC_SMALL_MAX) return sc_lut[total_size >> 3];
+    return SC_LARGE_IDX;
+}
+
+/* Построение LUT: для каждого 8-байтового размера — индекс первого
+ * бакета, чей limit >= размер. Бакеты упорядочены по возрастанию. */
+static void sc_build_lut(void) {
+    int b = 0;
+    for (size_t i = 0; i < SC_LUT_SIZE; i++) {
+        size_t bytes = i << 3;
+        while (b + 1 < SC_NUM_BUCKETS && bytes > sc_bucket_limit[b]) b++;
+        sc_lut[i] = (uint8_t)b;
+    }
+}
+
+/* ============================================================
+ * v34.59 PERF: TLAB — ПОТОКОВО-ЛОКАЛЬНЫЕ БУФЕРЫ АЛЛОКАЦИИ
+ * ============================================================
+ * Профиль 3D-игр (Asphalt 3 3D / M3G, см. execute.c v41: ~400 МБ/с
+ * мусора): каждый кадр рождает СОТНИ мелких объектов и массивов —
+ * векторы координат, float[16] матрицы, boxed-числа. После v34.58
+ * (size-классы, O(1)-pop) на одну мелкую аллокацию приходится:
+ * ticket-lock (fetch_and_add + ожидание билета + pthread_mutex) +
+ * pop из бакета + memset + инициализация заголовка — 100+ тактов И
+ * глобальная точка сериализации на КАЖДУЮ мелочь. Многопоточные
+ * игры (game thread + render/timer) платят ещё и кохерентностью
+ * кэш-линий ticket-счётчиков.
+ *
+ * TLAB: каждый поток РАЗ в ~350-500 мелких аллокаций (под
+ * heap_lock) вырезает себе чанк 16 КБ (сперва из large-списка —
+ * переиспользование памяти, собранной GC; затем с топа кучи) и
+ * дальше мелкие аллокации (total <= TLAB_MAX_TOTAL) бампаются в
+ * чанке ВООБЩЕ без блокировок: ~10-15 тактов на аллокацию.
+ *
+ * ИНВАРИНТЫ СОВМЕСТИМОСТИ С MARK-SWEEP:
+ *  1) Под-объекты чанка — ОБЫЧНЫЕ блоки с валидными GCObjectHeader
+ *     (memset + все поля): линейный sweep/presweep ходят по ним как
+ *     по обычным объектам; метки живости mark ставит по стекам/полям
+ *     владельца — во время STW владелец чанка запаркован, гонок нет.
+ *  2) Неиспользованный хвост чанка [top, limit) ВСЕГДА >= 40 байт
+ *     (fast path не бампает, если не влезает объект + хвостовой
+ *     заголовок; carve даёт чанк >= 16К, total <= 1024). Хвост
+ *     закрывается валидным free-заголовком ТОЛЬКО в точках закрытия
+ *     (исчерпание/refill, flush); между ними хвост недоступен никому:
+ *     sweep/presweep идут строго под stop-the-world ПОСЛЕ flush'а
+ *     всех чанков; heap_validate/check_magic в проде не вызываются
+ *     (их debug-режимы J2ME_GC_DEBUG / DEBUG_HEAP_CORRUPTION полностью
+ *     отключают TLAB — см. условия ниже).
+ *  3) Flush (закрытие своего чанка) происходит:
+ *       - в jvm_gc_safepoint_park() — ДО arrival-broadcast, т.е. до
+ *         того как коллектор начнёт walk (threads.c);
+ *       - при входе в gc_collect() — сам коллектор;
+ *       - перед выходом pthread/win-раннера (native.c) — смерть
+ *         потока с активным чанком.
+ *     Остаток остаётся валидным свободным блоком ВНЕ списков —
+ *     ближайший sweep втянет его в новые бакеты (v34.58: блоки,
+ *     уже свободные до GC, участвуют в rebuild).
+ *  4) heap.allocated ведётся атомарно на каждую TLAB-аллокацию;
+ *     во время STW конкурентных TLAB-записей нет — вычеты sweep
+ *     остаются точными, heap_get_stats() не врёт.
+ *  5) safepoint_request читается в fast path ДО бампа: если GC
+ *     уже запросил мир, мы уходим в медленный путь (парк там же).
+ *     Коллектор физически не может быть в mark/sweep, пока владелец
+ *     чанка не запарковался (wait_arrivals), а парк закрывает хвост.
+ *  6) Отключение: NOJME_TLAB=0 (env), J2ME_GC_DEBUG=1,
+ *     DEBUG_HEAP_CORRUPTION=1 (compile-time) — полный откат на
+ *     поведение v34.58.
+ * ============================================================ */
+#define TLAB_CHUNK_SIZE  (16 * 1024)
+#define TLAB_MAX_TOTAL   SC_SMALL_MAX      /* fast path только для total <= 1024 */
+
+typedef struct {
+    uint8_t* base;
+    uint8_t* top;     /* следующая позиция bump */
+    uint8_t* limit;   /* конец чанка */
+} TLAB;
+static __thread TLAB tlab;   /* нулевой по умолчанию: limit == NULL */
+
+/* Диагностика (racy-инкременты — только для логов/бенчмарков). */
+static volatile uint64_t g_tlab_carves = 0;
+static volatile uint64_t g_tlab_fast_allocs = 0;
+void heap_tlab_stats(uint64_t* carves, uint64_t* fast_allocs) {
+    if (carves) *carves = g_tlab_carves;
+    if (fast_allocs) *fast_allocs = g_tlab_fast_allocs;
+}
+
+/* Страховочный выключатель: NOJME_TLAB=0 отключает (кэш env, читается
+ * только в медленном пути при refill — fast path лишь проверяет limit).
+ * Отсутствие переменной/любое другое значение — включено. */
+static int tlab_enabled_cache = -1;
+static int tlab_enabled(void) {
+    if (tlab_enabled_cache < 0) {
+        const char* e = getenv("NOJME_TLAB");
+        tlab_enabled_cache = (e && e[0] == '0') ? 0 : 1;
+    }
+    return tlab_enabled_cache;
+}
+
+/* Валидный free-заголовок, закрывающий хвост чанка [top, limit).
+ * Вызывается только владельцем чанка (TLS) или под heap_lock
+ * (refill); размер >= sizeof(GCObjectHeader) гарантирован инвариантом
+ * №2 (проверяется вызывающими). */
+static FILE* heap_diag_alloc_log(void);  /* v34.71 DIAG 2 (defined below) */
+static void tlab_write_tail(uint8_t* top, uint8_t* limit) {
+    GCObjectHeader* tail = (GCObjectHeader*)top;
+    memset(tail, 0, sizeof(GCObjectHeader));
+    tail->size  = (uint32_t)(limit - top);
+    tail->type  = OBJ_TYPE_FREE;
+    tail->magic = GC_HEADER_MAGIC;
+    /* v34.71 DIAG 2: tail-write event for the alloc log */
+    {
+        FILE* alloc_log = heap_diag_alloc_log();
+        if (alloc_log) {
+            fprintf(alloc_log, "T %p %ld\n", (void*)top, (long)(limit - top));
+        }
+    }
+}
+
+/* Закрыть свой чанк (если активен): хвост — валидный свободный блок,
+ * НЕ включённый в списки; sweep втянет его при ближайшем GC. Вызывается
+ * БЕЗ heap_lock — трогает только TLS владельца и его чанк. Идемпотентно.
+ * Должно быть вызвано ДО arrival-broadcast в jvm_gc_safepoint_park() и
+ * при входе в gc_collect(). */
+void heap_tlab_flush_self(void) {
+    if (tlab.limit == NULL) return;
+    if (tlab.top + sizeof(GCObjectHeader) <= tlab.limit) {
+        tlab_write_tail(tlab.top, tlab.limit);
+    }
+    /* top + 40 > limit недостижимо: инвариант №2 (bump всегда оставляет
+     * место под хвостовой заголовок); guard оставлен как страховка от
+     * внешней порчи — в этом случае блок остаётся невалидным, но и не
+     * попадает ни в какие списки. */
+    tlab.base = tlab.top = tlab.limit = NULL;
+}
+
 /* Heap state */
 static struct {
     uint8_t* start;
     uint8_t* current;   /* Bump pointer for new allocations */
-    uint8_t* end;
+    uint8_t* end;       /* Soft limit: normal allocations stop here */
+    uint8_t* hard_end;  /* v19: start + size + HEAP_EMERGENCY_RESERVE */
     size_t size;
     size_t allocated;   /* Total bytes currently occupied by live objects */
     size_t freed;       /* Total historical freed bytes */
@@ -294,9 +637,21 @@ static struct {
     /* Мы не используем linked list heap.objects для обхода GC, 
        так как линейный проход по памяти надежнее. 
        Но можно оставить для статистики. */
-    
-    FreeBlock* free_list;  /* Free list for recycled memory (sorted by address for coalescing) */
-    
+
+    /* v34.58 PERF (size-class allocator): segregated free lists.
+     * БЫЛО: один глобальный free_list, first-fit по линейному списку —
+     * O(n) на каждый miss при 100k+ свободных блоках (v34.15 отмечал
+     * O(n^2) в sweep; first-fit в alloc страдал тем же).
+     * СТАЛО: 18 size-class бакетов для блоков <= 1024 байт (LIFO,
+     * head-pop O(1) в общем случае) + один large-список для блокков
+     * > 1024 байт (короткий: крупные буферы игр редки). Sweep-фаза
+     * rebuild'ит все бакеты с on-the-fly coalescing (см. gc_collect).
+     * Остаток (remainder) от split'а уходит в бакет СВОЕГО размера,
+     * а не в голову общего списка — упорядоченность больше не
+     * разрушается, мелкие блоки не скапливаются перед крупными. */
+    FreeBlock* free_lists[SC_NUM_BUCKETS];  /* small buckets (<= 1024) */
+    FreeBlock* large_free_list;             /* blocks > 1024, address-ordered by sweep */
+
     void*** roots;
     size_t root_count;
     size_t root_capacity;
@@ -310,30 +665,345 @@ static struct {
 void* g_heap_start = NULL;
 void* g_heap_end = NULL;
 
+/* v34.59: верхняя граница занятой области кучи (для диагностических
+ * обходов: после top-rewind current может опускаться ниже high-water
+ * mark аллокаций — обход выше current читает девственную память). */
+void* heap_top_ptr(void) { return heap.current; }
+
+/* v34.94 DIAG: arena bump offset in bytes for the frontend diag line
+ * ("top=") — the monotonic per-session allocation watermark the user's
+ * v34.93 log tracked. Weak fallback in switch_trace.c returns 0 when the
+ * heap module is not linked. */
+size_t heap_arena_top_bytes(void) {
+    return (heap.current && heap.start && heap.current >= heap.start)
+        ? (size_t)((uint8_t*)heap.current - (uint8_t*)heap.start) : 0;
+}
+
+/* v34.71 DIAG 2: ONE shared unbuffered handle for the allocation log —
+ * separate stdio buffers on the same path interleave chunks out of order
+ * and made the first forensic attempt unreadable. Opened lazily once. */
+static FILE* heap_diag_alloc_log(void) {
+    static FILE* log = NULL;
+    static int checked = 0;
+    if (!checked) {
+        checked = 1;
+        const char* p = getenv("NOJME_ALLOC_LOG");
+        if (p && p[0]) {
+            log = fopen(p, "a");
+            if (log) setvbuf(log, NULL, _IONBF, 0);
+        }
+    }
+    return log;
+}
+
+/* Положить свободный блок в его бакет (LIFO). Возвращает индекс бакета.
+ * Вызывается только под heap_lock (alloc slow path / sweep rebuild). */
+static int sc_push_free(FreeBlock* fb) {
+    int idx;
+    if (fb->size > SC_SMALL_MAX) {
+        fb->next = heap.large_free_list;
+        heap.large_free_list = fb;
+        idx = SC_LARGE_IDX;
+    } else {
+        idx = size_class_idx((size_t)fb->size);
+        fb->next = heap.free_lists[idx];
+        heap.free_lists[idx] = fb;
+    }
+    /* v34.71 DIAG 2: push event for the alloc log */
+    {
+        FILE* alloc_log = heap_diag_alloc_log();
+        if (alloc_log) {
+            fprintf(alloc_log, "P %p %u %d\n", (void*)fb, fb->size, idx);
+        }
+    }
+    return idx;
+}
+
+/* v34.43 PERF-DIAG: total gc_collect() invocations (racy read is fine —
+ * used only by the SLOWFRAME telemetry to attribute frame stalls to GC). */
+uint64_t g_gc_collections = 0;
+
+/* v35.03: GC pause accounting for the diag line + [GC-SLOW] watchdog.
+ * The "1 fps after a lap" field report needs a GC-storm verdict from the
+ * log: gms= last pause ms, gxm= worst pause since the last diag tick
+ * (reset by diag_emit), gte= monotonic ms stamp of the last GC end (the
+ * trace beat checks recency without reaching into GC internals). */
+volatile uint32_t g_gc_last_ms = 0;
+volatile uint32_t g_gc_worst_ms = 0;
+volatile long long g_gc_last_end_ms = 0;
+
+static void gc_pause_account(const struct timespec* t0) {
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long dur_us = (t1.tv_sec - t0->tv_sec) * 1000000L +
+                  (t1.tv_nsec - t0->tv_nsec) / 1000;
+    uint32_t ms = (uint32_t)(dur_us / 1000);
+    g_gc_last_ms = ms;
+    if (ms > g_gc_worst_ms) g_gc_worst_ms = ms;
+    g_gc_last_end_ms = (long long)t1.tv_sec * 1000LL + t1.tv_nsec / 1000000LL;
+}
+
+/* v34.95 SAFEPOINT-BACKOFF: monotonic-ms deadline until which gc_collect()
+ * declines to run. Set after a safepoint-timeout abort: the straggler
+ * (a VM thread stuck inside a long native that never polls) makes every
+ * collection burn its full 2000 ms stop-the-world wait and abort — with
+ * an allocation-triggered collector that degenerates into a livelock
+ * (each allocation = 2 s world stop; the frontend's paint() stuck in the
+ * heap-lock queue is exactly the v34.94 "STUCK: stage=repaints" report).
+ * During the window allocations fall through to the catchable
+ * OutOfMemoryError path instead; once the straggler reaches a poll the
+ * next collection succeeds normally. */
+volatile jlong g_gc_backoff_until_ms = 0;
+
+/* ========================================================================
+ * v35.04 PERIODIC GC: allocation-budget trigger.
+ *
+ * FIELD EVIDENCE (v35.03 race trace, 197 s): gc=77..182 during the first
+ * ~15 s (class loading garbage), then gc=0 for the ENTIRE race while the
+ * heap grew monotonically 1.9 -> 6.8 MB (~150 KB/s of garbage). By design
+ * this collector only runs when the free list AND the bump top are
+ * exhausted — with a 64 MB heap that means the first gameplay collection
+ * happens ~7 minutes in, over ~60 MB of accumulated garbage: a multi-
+ * second stop-the-world pause (the "sudden 1 fps after a lap" storm
+ * v35.03 built [GC-SLOW] to catch) and, on longer sessions, a real OOM —
+ * a J2ME phone with a 1-4 MB heap survives this game, so the 150 KB/s is
+ * GARBAGE, not live data, and periodic collection keeps the heap small.
+ *
+ * Trigger: when the bytes allocated since the last successful collection
+ * exceed the budget (default 4 MB, env NOJME_GC_BUDGET_MB, 0 = disable)
+ * AND at least 3 s passed since the previous periodic attempt, run a
+ * normal collection from the next allocation. Mark/sweep over a small
+ * live set costs single-digit ms (loading-phase GCs measured gms=1..2 in
+ * the field trace), so a once-per-~30 s pause at 150 KB/s is invisible.
+ * ======================================================================== */
+static volatile size_t g_gc_alloc_at_last_gc = 0; /* heap.allocated snapshot */
+static volatile long long g_gc_periodic_last_ms = 0;
+#define NOJME_GC_PERIODIC_MIN_MS 3000
+
+static size_t gc_periodic_budget(void) {
+    static size_t budget = 0;
+    static int env_read = 0;
+    if (!env_read) {
+        env_read = 1;
+        budget = (size_t)4 << 20; /* 4 MB default */
+        const char* e = getenv("NOJME_GC_BUDGET_MB");
+        if (e && e[0]) {
+            long v = atol(e);
+            if (v > 0) budget = (size_t)v << 20;
+            else budget = 0;      /* 0 disables the periodic trigger */
+        }
+    }
+    return budget;
+}
+
+/* Cheap predicate: allocation budget reached AND the per-session rate
+ * limiter allows another attempt. Sets the attempt stamp so concurrent
+ * mutators do not stampede (a losing racer no-ops inside gc_collect via
+ * gc_in_progress anyway). Racy reads of heap.allocated are fine: the
+ * worst case is one 3 s-late or one aggregated collection. */
+static int gc_periodic_due(void) {
+    size_t budget = gc_periodic_budget();
+    if (!budget) return 0;
+    size_t alloc = heap.allocated, base = g_gc_alloc_at_last_gc;
+    if (alloc < base || alloc - base < budget) return 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long long now = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    long long last = g_gc_periodic_last_ms;
+    if (last && now - last < NOJME_GC_PERIODIC_MIN_MS) return 0;
+    g_gc_periodic_last_ms = now;
+    return 1;
+}
+
+/* v50 DIAG (Asphalt 3 3D stall): wall ms the LAST collection spent waiting
+ * for VM threads to park (0 when the world stopped instantly). Printed by
+ * [GCSTAMP] as sp_wait= — a large value pins the stall on a straggler
+ * thread executing a long native instead of on mark/sweep itself. */
+double g_gc_last_sp_wait_ms = 0.0;
+
 /* Forward declarations */
 static void gc_mark_object(void* ptr);
 static void* try_alloc_from_free_list(size_t total_size, size_t* actual_size);
 
-/* Проверка, является ли указатель частью кучи */
-static inline bool is_heap_ptr(void* ptr) {
-    return ptr >= (void*)heap.start && ptr < (void*)heap.end;
+/* Проверка, является ли указатель частью кучи
+ * v19: include the emergency reserve (hard_end). Exception objects allocated
+ * there are reachable through thread stacks / pending_exception and MUST
+ * validate as heap pointers for GC marking and heap_java_object_valid().
+ * v36.38: parameter is now const void* — callers holding const pointers
+ * (e.g. string_chars_null_trace) no longer discard the qualifier
+ * (-Wdiscarded-qualifiers under -Wall -Wextra). */
+static inline bool is_heap_ptr(const void* ptr) {
+    return (const void*)ptr >= (const void*)heap.start &&
+           (const void*)ptr <  (const void*)heap.hard_end;
+}
+
+/* =====================================================================
+ * v34.14: NATIVE-SCOPE AUTO-PINNING (аналог JNI local references)
+ *
+ * Проблема (Nescube SIGSEGV): нативные методы (M3G Loader.load, медиа,
+ * RMS, PNG-декодеры...) аллоцируют Java-объекты (Image2D, пиксельные
+ * массивы, строки) и держат их ТОЛЬКО в C-локалах. Если аллокация
+ * внутри натива сама триггерит gc_collect(), mark-фаза не видит ни
+ * одной Java-ссылки на эти объекты (Java-фреймов ещё нет), sweep их
+ * освобождает, heap-rewind затирает память — и натив возвращает
+ * мёртвый указатель («field lookup on DEAD object» + SIGSEGV).
+ *
+ * Фикс: пока на потоке исполняется натив (TLS g_gc_in_native > 0),
+ * каждая кучная аллокация рождается PINNED и записывается в
+ * per-thread (TLS) auto-pin журнал. При выходе из натива
+ * gc_autopin_release(base) снимает pin со всех объектов, записанных
+ * после base. Вложенность диспетчей поддерживается: каждый уровень
+ * запоминает свой base. Pinned-объекты, кроме того, останавливают
+ * heap-top rewind — их память не может быть переиспользована, пока
+ * натив их держит.
+ * ===================================================================== */
+__thread int g_gc_in_native = 0;
+
+__thread void** g_gc_autopin_log = NULL;
+__thread size_t g_gc_autopin_len = 0;
+__thread size_t g_gc_autopin_cap = 0;
+
+size_t gc_autopin_base(void) { return g_gc_autopin_len; }
+
+void gc_autopin_note(void* obj) {
+    if (!g_gc_in_native) return;  /* обычная интерпретаторная аллокация */
+    if (g_gc_autopin_len >= g_gc_autopin_cap) {
+        size_t ncap = g_gc_autopin_cap ? g_gc_autopin_cap * 2 : 64;
+        void** nlog = (void**)realloc(g_gc_autopin_log, ncap * sizeof(void*));
+        if (!nlog) return;  /* нет нативной памяти: объект останется unpinned */
+        g_gc_autopin_log = nlog;
+        g_gc_autopin_cap = ncap;
+    }
+    g_gc_autopin_log[g_gc_autopin_len++] = obj;
+}
+
+void gc_autopin_release(size_t base) {
+    if (base > g_gc_autopin_len) base = g_gc_autopin_len;
+    for (size_t i = base; i < g_gc_autopin_len; i++) {
+        void* o = g_gc_autopin_log[i];
+        if (o && is_heap_ptr(o)) {
+            GCObjectHeader* h = (GCObjectHeader*)o - 1;
+            if (h->magic == GC_HEADER_MAGIC) h->pinned = 0;
+        }
+    }
+    g_gc_autopin_len = base;
+}
+
+/* v34.59 TLAB: общая инициализация выделенного блока — memset (Java
+ * zero-init!) + все поля GCObjectHeader + ObjectHeader-оверлей для
+ * объектных типов. Точная копия хвоста heap_alloc_ex (v34.58), вынесена
+ * для TLAB fast path / carve. Возвращает пользовательский указатель.
+ * Определена ЗДЕСЬ (после auto-pin TLS) из-за зависимости от
+ * g_gc_in_native / gc_autopin_note. */
+static inline void* heap_init_block(GCObjectHeader* header, size_t total,
+                                    JavaClass* clazz, ObjectType type) {
+    /* v34.71 DIAG (heap-overlap forensics): NOJME_ALLOC_TRACE=LO-HI (hex,
+     * no 0x) prints every allocation whose header falls in [LO, HI).
+     * Ungated on purpose: used exactly when the heap is already suspect.
+     * One line per hit; parse-once via a benign race (idempotent result). */
+    {
+        static uintptr_t tr_lo = 0, tr_hi = 0;
+        if (tr_hi == 0 && tr_lo == 0) {
+            const char* e = getenv("NOJME_ALLOC_TRACE");
+            if (e && e[0]) {
+                uintptr_t lo = strtoul(e, (char**)&e, 16);
+                if (*e == '-' || *e == ':') {
+                    uintptr_t hi = strtoul(e + 1, NULL, 16);
+                    if (hi > lo) { tr_lo = lo; tr_hi = hi; }
+                }
+            }
+            if (tr_hi == 0) tr_lo = tr_hi = 1;  /* parsed, no range */
+        }
+        if (tr_hi > 1 && (uintptr_t)header >= tr_lo && (uintptr_t)header < tr_hi) {
+            j2me_log_ungated("[ALLOC-TRACE] hdr=%p total=%zu clazz=%s type=%d tid_in_native=%d\n",
+                             (void*)header, total,
+                             clazz ? (clazz->class_name ? clazz->class_name : "?") : "NULL",
+                             (int)type, g_gc_in_native);
+        }
+    }
+    /* v34.71 DIAG 2: NOJME_ALLOC_LOG=path — append every allocation with its
+     * class; gc_collect() appends epoch markers. Offline analysis finds two
+     * LIVE allocations with overlapping [hdr, hdr+total) inside one epoch =
+     * the overlapping-allocation bug (Nescube heap corruption forensics). */
+    {
+        FILE* alloc_log = heap_diag_alloc_log();
+        if (alloc_log) {
+            extern JavaThread* thread_current(JVM*);
+            JavaThread* jt = thread_current(NULL);
+            fprintf(alloc_log, "A %p %zu %s %d %d\n", (void*)header, total,
+                    clazz ? (clazz->class_name ? clazz->class_name : "?") : "NULL",
+                    (int)type, jt ? jt->id : 0);
+        }
+    }
+    memset(header, 0, total);
+    /* header->next / marked / reserved / _align_pad / _magic_pad —
+     * нулевые после memset (как в оригинальном пути) */
+    header->clazz = clazz;
+    header->size = (uint32_t)total;
+    header->type = (uint8_t)type;
+    /* v34.14: объект, рождённый внутри натива, пиннится (auto-pin) */
+    header->pinned = g_gc_in_native ? 1 : 0;
+    if (header->pinned) gc_autopin_note(header + 1);
+    header->magic = GC_HEADER_MAGIC;
+    if (clazz && (type == OBJ_TYPE_OBJECT || type == OBJ_TYPE_STRING || type == OBJ_TYPE_ARRAY)) {
+        ObjectHeader* obj_header = (ObjectHeader*)(header + 1);
+        obj_header->clazz = clazz;
+        obj_header->hashcode = (jint)(intptr_t)(header + 1);
+        /* gc_mark / reserved уже нулевые из memset */
+    }
+    return (void*)(header + 1);
 }
 
 /* Инициализация кучи */
+/* v35.12: stage diagnostics reach the device trace log even from the core
+ * (weak link — headless/libretro builds without switch_trace.c just skip). */
+#include <stddef.h>
+#include <stdarg.h>
+static void heap_stage_trace(const char* fmt, ...) {
+    extern void sw_trace_force(const char* fmt, ...) __attribute__((weak));
+    if (&sw_trace_force && sw_trace_force) {
+        va_list ap;
+        va_start(ap, fmt);
+        char buf[160];
+        vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+        sw_trace_force("%s", buf);
+    }
+}
+
 int heap_init(JVM* jvm, size_t initial_size, size_t max_size) {
     (void)jvm; (void)max_size;
+    
+    /* v19: the underlying buffer also holds the emergency reserve.
+     * heap.end stays at start+initial_size (normal/GC watermarks unchanged);
+     * heap.hard_end marks the true end of the buffer. */
+    size_t buffer_size = initial_size + HEAP_EMERGENCY_RESERVE;
     
     /* Выравниваем начальный адрес кучи */
 #if defined(_WIN32) || defined(_WIN64)
     /* Windows: использование _aligned_malloc */
-    heap.start = (uint8_t*)_aligned_malloc(initial_size, OBJECT_ALIGNMENT);
-    if (!heap.start) return JNI_ERR;
+    heap.start = (uint8_t*)_aligned_malloc(buffer_size, OBJECT_ALIGNMENT);
+    if (!heap.start) {
+        /* v35.12: the device-side "relaunch fails to load" always landed
+         * here — make the OOM visible (requested size + the fact that the
+         * PROCESS is out of memory, usually a leaked VM from an earlier
+         * session whose teardown found a busy thread). */
+        heap_stage_trace("init: heap FAILED — %u KB unavailable (process OOM; "
+                         "check earlier [JVM-DESTROY] leak lines)",
+                         (unsigned)(buffer_size / 1024));
+        return JNI_ERR;
+    }
 #elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
     /* Unix-like: использование posix_memalign */
-    if (posix_memalign((void**)&heap.start, OBJECT_ALIGNMENT, initial_size) != 0) {
+    if (posix_memalign((void**)&heap.start, OBJECT_ALIGNMENT, buffer_size) != 0) {
         /* Пробуем обычный malloc как запасной вариант */
-        heap.start = (uint8_t*)malloc(initial_size);
-        if (!heap.start) return JNI_ERR;
+        heap.start = (uint8_t*)malloc(buffer_size);
+        if (!heap.start) {
+            heap_stage_trace("init: heap FAILED — %u KB unavailable (process OOM; "
+                             "check earlier [JVM-DESTROY] leak lines)",
+                             (unsigned)(buffer_size / 1024));
+            return JNI_ERR;
+        }
         
         /* Проверяем выравнивание */
         if (((uintptr_t)heap.start & (OBJECT_ALIGNMENT - 1)) != 0) {
@@ -355,8 +1025,12 @@ int heap_init(JVM* jvm, size_t initial_size, size_t max_size) {
     }
 #else
     /* Для других систем используем malloc и надеемся на лучшее */
-    heap.start = (uint8_t*)malloc(initial_size);
-    if (!heap.start) return JNI_ERR;
+    heap.start = (uint8_t*)malloc(buffer_size);
+    if (!heap.start) {
+        heap_stage_trace("init: heap FAILED — %u KB unavailable (process OOM)",
+                         (unsigned)(buffer_size / 1024));
+        return JNI_ERR;
+    }
     
     /* Проверяем выравнивание */
     if (((uintptr_t)heap.start & (OBJECT_ALIGNMENT - 1)) != 0) {
@@ -368,22 +1042,51 @@ int heap_init(JVM* jvm, size_t initial_size, size_t max_size) {
         return JNI_ERR;
     }
 #endif
-    
+
+    /* v36.13 ZERO-FILL ("хип просто заполнять нулями"): the pool used to be
+     * left with whatever malloc returned — typically the PREVIOUS session's
+     * heap image, byte for byte (same pool size -> same address on HOS).
+     * Any stale pointer a process-global cache had kept then aliased a
+     * plausible-looking corpse of session N-1 instead of obviously-dead
+     * memory. Fresh sessions now start from deterministic ZERO pool: a
+     * stale pointer reads hdr_type=0 / NULL fields and fails validation
+     * loudly (is_heap_ptr range + type checks + the [STR-CHARS-NULL]
+     * trace), never masquerades as a live object of the past session.
+     * Cost: one 32 MB memset per session (~5-10 ms on HOS) — noise next
+     * to the session start budget. */
+    memset(heap.start, 0, buffer_size);
+
     heap.current = heap.start;
     heap.end = heap.start + initial_size;
+    heap.hard_end = heap.start + buffer_size;
     heap.size = initial_size;
     heap.allocated = 0;
+    /* v35.04 PERIODIC GC: rebase the allocation budget with the fresh heap
+     * (the static snapshot would otherwise carry the previous session's
+     * watermark and delay the first periodic collection). */
+    g_gc_alloc_at_last_gc = 0;
+    g_gc_periodic_last_ms = 0;
     heap.freed = 0;
-    heap.free_list = NULL;
+    /* v34.58: size-class LUT + чистые бакеты */
+    sc_build_lut();
+    for (int c = 0; c < SC_NUM_BUCKETS; c++) heap.free_lists[c] = NULL;
+    heap.large_free_list = NULL;
     heap.gc_cycles = 0;
     heap.gc_total_freed = 0;
     
-    /* Set global heap bounds for validation */
+    /* Set global heap bounds for validation.
+     * v19: use hard_end (buffer end INCLUDING the emergency reserve) so
+     * exception objects allocated from the reserve still pass
+     * is_heap_ptr_check() when the MIDlet calls methods on a caught
+     * OutOfMemoryError (e.getMessage(), printStackTrace(), ...).
+     * Normal allocations still stop at heap.end — the reserve is only
+     * handed out by heap_alloc_emergency(). */
     g_heap_start = heap.start;
-    g_heap_end = heap.end;
+    g_heap_end = heap.hard_end;
     
     heap.roots = (void***)malloc(1024 * sizeof(void**));
     if (!heap.roots) {
+        heap_stage_trace("init: heap FAILED — roots table OOM");
         /* CRITICAL FIX: Use _aligned_free on Windows for memory allocated with _aligned_malloc!
          * Using free() on _aligned_malloc memory causes heap corruption and crashes. */
 #if defined(_WIN32) || defined(_WIN64)
@@ -391,6 +1094,13 @@ int heap_init(JVM* jvm, size_t initial_size, size_t max_size) {
 #else
         free(heap.start);
 #endif
+        /* v36.07: leave NO stale arena pointers behind — the jvm_init retry
+         * ladder (v36.07) may call heap_init again immediately, and
+         * g_heap_start/heap.start pointing at freed memory would let an
+         * is_heap_ptr_check() between the attempts validate garbage. */
+        heap.start = NULL;
+        g_heap_start = NULL;
+        g_heap_end = NULL;
         return JNI_ERR;
     }
     heap.root_capacity = 1024;
@@ -405,7 +1115,7 @@ static void gc_mark_stack_destroy(void);
 /* Уничтожение кучи */
 void heap_destroy(JVM* jvm) {
     (void)jvm;
-    
+
     /* CRITICAL FIX: Use _aligned_free on Windows for memory allocated with _aligned_malloc!
      * Using free() on _aligned_malloc memory causes heap corruption and crashes.
      * The _aligned_malloc functions use a special header to track alignment,
@@ -416,7 +1126,17 @@ void heap_destroy(JVM* jvm) {
         _aligned_free(heap.start);
     }
 #else
-    free(heap.start);
+    if (heap.start) {
+        /* v36.13 ZERO-FILL before free (the "хип нулями" half): (a) a
+         * zombie runner that ignored the kill and still writes through a
+         * heap pointer now writes into a visible zero field instead of
+         * silently corrupting whatever malloc reuses the block for;
+         * (b) the freed pool can never be fingerprinted as "last session's
+         * heap" by a stale pointer aliasing into the NEXT session's
+         * malloc — zeros fail every object-header validation. */
+        memset(heap.start, 0, (size_t)(heap.hard_end - heap.start));
+        free(heap.start);
+    }
 #endif
     
     free(heap.roots);
@@ -425,96 +1145,205 @@ void heap_destroy(JVM* jvm) {
     heap.start = NULL;
     heap.current = NULL;
     heap.end = NULL;
-    heap.free_list = NULL;
+    heap.hard_end = NULL;
+    for (int c = 0; c < SC_NUM_BUCKETS; c++) heap.free_lists[c] = NULL;  /* v34.58 */
+    heap.large_free_list = NULL;                                            /* v34.58 */
 }
 
-/* Попытка выделить память из списка свободных блоков (First Fit)
- * Возвращает указатель на блок и его реальный размер через actual_size
- */
-static void* try_alloc_from_free_list(size_t total_size, size_t* actual_size) {
-    FreeBlock** pp = &heap.free_list;
-    FreeBlock* prev = NULL;
-    
+/* [GC-DIAG2] forensics ring state (shared with heap_alloc) */
+static void* g_alloc_ring = NULL;
+static int g_alloc_ring_idx = 0;
+
+/* Попытка выделить память из size-class бакетов / large-списка.
+ * Возвращает указатель на блок и его реальный размер через actual_size.
+ *
+ * v34.58 PERF: поиск идет по возрастанию классов (свой бакет -> старше
+ * -> large), каждый бакет содержит блоки близких размеров, поэтому
+ * first-fit внутри бакета почти всегда решается на первом узле.
+ * БЫЛО: один линейный список — O(общее число свободных блоков) на
+ * каждый промах (стринг-churn игр = 100k+ блоков).
+ *
+ * Общий хелпер: вырезает блок из цепочки, при избытке отрезает хвост
+ * в бакет ЕГО размера (инвариант №2 из блока v34.58 выше). */
+static void* sc_try_chain(FreeBlock** head, size_t total_size, size_t* actual_size) {
+    FreeBlock** pp = head;
     while (*pp) {
         FreeBlock* block = *pp;
-        
         if (block->size >= total_size) {
-            /* Найден подходящий блок */
-            
-            /* Отсоединяем блок из списка */
-            if (prev) {
-                prev->next = block->next;
-            } else {
-                heap.free_list = block->next;
-            }
-            
-            /* Если блок больше запроса, дробим его
-             * CRITICAL FIX: Всегда создаём remainder если есть место для заголовка!
-             * Иначе образуются "дыры" в куче, которые вызывают corruption при GC sweep.
-             */
-            size_t remainder_size = block->size - total_size;
-            if (remainder_size >= sizeof(GCObjectHeader)) {
-                /* ВАЖНО: remainder должен начинаться с GCObjectHeader для корректного
-                   линейного прохода GC. FreeBlock использует те же поля что и 
-                   GCObjectHeader (size + next), поэтому это безопасно. */
+            /* Найден подходящий блок — отсоединяем из цепочки */
+            *pp = block->next;
+
+            size_t remainder_size = (size_t)block->size - total_size;
+            if (remainder_size >= sizeof(GCObjectHeader) + 8) {
+                /* Дробим: remainder должен начинаться с валидного
+                 * GCObjectHeader для корректного линейного прохода GC
+                 * (FreeBlock использует те же поля, что и GCObjectHeader:
+                 * size + next, поэтому overlay безопасен). v34.58: также
+                 * ставим magic — линейные обходы (presweep-валидация строк,
+                 * heap_validate) перестают 8-байтовым шагом сканировать
+                 * внутренности свободного блока и прыгают по size. */
                 GCObjectHeader* remainder = (GCObjectHeader*)((uint8_t*)block + total_size);
-                remainder->size = (uint32_t)remainder_size;
-                remainder->type = OBJ_TYPE_FREE;  /* Маркируем как свободный блок */
+                remainder->size  = (uint32_t)remainder_size;
+                remainder->type  = OBJ_TYPE_FREE;
                 remainder->marked = 0;
                 remainder->pinned = 0;
                 remainder->clazz = NULL;
-                remainder->next = NULL;
-                remainder->_align_pad[0] = 0;
-                remainder->_align_pad[1] = 0;
-                remainder->_align_pad[2] = 0;
-                remainder->_align_pad[3] = 0;
-                remainder->_align_pad[4] = 0;
-                remainder->_align_pad[5] = 0;
-                remainder->_align_pad[6] = 0;
-                remainder->_align_pad[7] = 0;
-                
-                /* Вставляем остаток обратно в список */
-                FreeBlock* fb = (FreeBlock*)remainder;
-                fb->next = heap.free_list;
-                heap.free_list = fb;
-                
-                /* Используем запрошенный размер */
+                remainder->next  = NULL;
+                remainder->magic = GC_HEADER_MAGIC;
+                remainder->_magic_pad = 0;
+
+                /* Хвост — в бакет СВОЕГО размера (не в голову общего списка) */
+                sc_push_free((FreeBlock*)remainder);
+
                 *actual_size = total_size;
             } else {
-                /* CRITICAL FIX: Нет места для remainder - используем ВЕСЬ блок!
-                 * Иначе образуется "дыра" которая вызовет corruption при sweep.
-                 */
+                /* Нет места для remainder - используем ВЕСЬ блок
+                 * (иначе образуется "дыра", ломающая линейный sweep). */
                 *actual_size = block->size;
             }
-            
+
             return block;
         }
-        
-        prev = block;
-        pp = &block->next;
+        pp = &block->next;  /* блок меньше запроса — дальше по цепочке */
     }
-    
     return NULL;
 }
 
+static void* try_alloc_from_free_list(size_t total_size, size_t* actual_size) {
+    if (total_size <= SC_SMALL_MAX) {
+        /* 1. Мелкий запрос: свой бакет, затем старшие мелкие бакеты */
+        int cls = sc_lut[total_size >> 3];
+        for (int c = cls; c < SC_NUM_BUCKETS; c++) {
+            void* p = sc_try_chain(&heap.free_lists[c], total_size, actual_size);
+            if (p) return p;
+        }
+    }
+    /* 2. Крупный запрос (или мелкие бакеты пусты): large-список */
+    return sc_try_chain(&heap.large_free_list, total_size, actual_size);
+}
+
+/* ============================================================
+ * v34.71 CRITICAL FIX: TLAB MAIN-THREAD GATE.
+ *
+ * DIAGNOSED DEFECT (Nescube "corrupted magic 0x00610063" + user crashes
+ * on settings-Cancel; reproduced deterministically, see NOJME_ALLOC_LOG
+ * forensics): the main Java thread runs on the frontend/headless OS
+ * thread. Between driver exec-windows (g_jvm_main_thread_executing == 0)
+ * it executes pure native C code (M3G scene setup, form render, RMS,
+ * media...) and NEVER polls GC safefoints. The GC census counts it only
+ * while a window is open, so a collection triggered by a game thread
+ * proceeds while the main thread keeps allocating — and if that thread
+ * holds an open TLAB chunk, the sweep's linear walk runs into the
+ * chunk's UNFLUSHED tail (bump allocations leave no header beyond top):
+ * stale object bytes get read as a GCObjectHeader -> "corrupted magic" ->
+ * the recovery resync desynced the walk and pushed free regions over
+ * LIVE objects -> overlapping allocations -> SIGSEGV minutes later.
+ *
+ * FIX: between windows the main OS thread must not use TLAB at all — its
+ * allocations take the slow path, whose heap_lock ticket spin parks it at
+ * any GC request (and the park flushes the chunk). Runner threads are
+ * safe either way: the census counts them (they park, flushing, or the
+ * collection times out and aborts without sweeping).
+ * ============================================================ */
+static int tlab_main_thread_blocked(void) {
+    extern volatile int g_jvm_main_thread_executing;   /* execute.c */
+    if (g_jvm_main_thread_executing) return 0;         /* counted; parks at polls */
+    return jvm_os_thread_is_main_java();               /* invisible between windows */
+}
+
 /* Базовое выделение памяти */
+/* v19: internal allocator with emergency flag. Emergency allocations may
+ * consume the reserve area beyond heap.end (see HEAP_EMERGENCY_RESERVE) and
+ * are ONLY used for exception objects so that Throwable delivery works even
+ * on a completely full heap. */
+static void* heap_alloc_ex(JVM* jvm, size_t size, JavaClass* clazz, ObjectType type,
+                           int emergency);
+
 void* heap_alloc(JVM* jvm, size_t size, JavaClass* clazz, ObjectType type) {
+    return heap_alloc_ex(jvm, size, clazz, type, 0);
+}
+
+/* v19: emergency allocator for exception objects (OutOfMemoryError et al). */
+void* heap_alloc_emergency(JVM* jvm, size_t size, JavaClass* clazz, ObjectType type) {
+    return heap_alloc_ex(jvm, size, clazz, type, 1);
+}
+
+static void* heap_alloc_ex(JVM* jvm, size_t size, JavaClass* clazz, ObjectType type,
+                           int emergency) {
     (void)jvm;
-    
+
+    /* v35.04 PERIODIC GC: the exhaustion-only trigger lets garbage pile up
+     * to the 64 MB heap top on long sessions (v35.03 field trace: gc=0 for
+     * a whole race, 150 KB/s). Run a normal collection once the allocation
+     * budget is reached — the pause is single-digit ms over a small live
+     * set, and gc_in_progress makes concurrent racers no-op. Emergency
+     * allocations (exception objects on a full heap) never trigger. */
+    if (__builtin_expect(!emergency && jvm && gc_periodic_due(), 0)) {
+        /* v36.03 GC-DEFER-IN-NATIVE: an inline gc_collect() while the VM
+         * thread is inside a NATIVE (g_gc_in_native > 0) corrupts the heap
+         * and the class loader — the field Data Abort (nojme_switch
+         * native_vector_toString / newlib float formatting, 0xd7cf9088+8)
+         * and a host segv in class_hash_lookup both reproduce exactly this
+         * shape. The v34.14 auto-pin protects objects allocated INSIDE the
+         * native, and the v36.03 NATIVE-ARGS-ROOTED mark scan protects the
+         * caller's graph — but the safest policy is to not collect at all
+         * until the native returns: skip silently (the budget check re-fires
+         * on the first interpreter-context allocation). */
+        extern __thread int g_gc_in_native;
+        if (g_gc_in_native == 0) {
+            static volatile int periodic_n = 0;
+            int n = __sync_add_and_fetch(&periodic_n, 1);
+            LOG_SAFE("[GC-PERIODIC] #%d allocation budget reached (used=%zu KB, heap top=%zu KB) — collecting\n",
+                     n, (size_t)(heap.allocated >> 10),
+                     (size_t)((heap.current - heap.start) >> 10));
+            gc_collect(jvm);
+        }
+    }
+
+    /* ==== v34.59 TLAB FAST PATH (без блокировок) ====
+     * Мелкие аллокации 3D-churn'а бампаются в потоковом чанке.
+     * Проверки по возрастанию стоимости: TLS-чанк есть -> GC не
+     * запросил мир -> не диагностический режим -> размер мелкий ->
+     * влезает (объект + 40-байтовый хвостовой заголовок).
+     * v34.71: main-thread gate — см. tlab_main_thread_blocked(). */
+#if !DEBUG_HEAP_CORRUPTION
+    if (__builtin_expect(!emergency && tlab.limit != NULL &&
+                         !tlab_main_thread_blocked() &&
+                         !g_gc_safepoint_request &&
+                         !gc_debug_enabled(), 1)) {
+        size_t fsize = (size + OBJECT_ALIGNMENT - 1) & ~(size_t)(OBJECT_ALIGNMENT - 1);
+        size_t total = sizeof(GCObjectHeader) + fsize;
+        if (total <= TLAB_MAX_TOTAL) {
+            uint8_t* top = tlab.top;
+            if (top + total + sizeof(GCObjectHeader) <= tlab.limit) {
+                GCObjectHeader* header = (GCObjectHeader*)top;
+                tlab.top = top + total;
+                __sync_add_and_fetch(&heap.allocated, total);
+                g_tlab_fast_allocs++;   /* racy — диагностика */
+                return heap_init_block(header, total, clazz, type);
+            }
+            /* Чанк исчерпан: медленный путь ниже закроет хвост
+             * (возврат остатка в бакет) и вырежет новый чанк. */
+        }
+    }
+#endif
+
     /* CRITICAL: Acquire heap lock BEFORE any heap operations */
     /* This is a RECURSIVE mutex, so calling gc_collect() inside is safe */
     heap_lock();
     
-    /* sanity check: reject obviously invalid sizes 
-     * 67108956 = 0x03FFFFFF is suspicious - might be -1 interpreted as unsigned
-     * Max reasonable allocation is 1MB for J2ME */
-    if (size > 1024 * 1024) {
-        ERROR_LOG("CRITICAL: Suspicious allocation request: %zu bytes (0x%zX) for class=%s type=%d",
-                size, size, 
+    /* FIX (audit G-1, v18): removed the unconditional 1 MB per-object cap — it
+     * ran BEFORE any free-space/GC logic and deterministically rejected
+     * legitimate game buffers (int[512*512], multi-MB resource blocks) on a
+     * half-empty heap. Negative sizes are already guarded as unsigned here; we
+     * only reject sizes larger than the entire heap, which no real object can
+     * satisfy and which reliably indicates corrupted length math. */
+    if (heap.start && heap.end > heap.start &&
+        size > (size_t)(heap.end - heap.start)) {
+        ERROR_LOG("CRITICAL: Oversized allocation request: %zu bytes for class=%s type=%d",
+                size,
                 clazz ? (clazz->class_name ? clazz->class_name : "?") : "NULL",
                 type);
-        ERROR_LOG("  This might be a bug - negative value interpreted as unsigned?");
-        ERROR_LOG("  Rejecting allocation to prevent OOM");
         heap_unlock();
         return NULL;
     }
@@ -529,10 +1358,83 @@ void* heap_alloc(JVM* jvm, size_t size, JavaClass* clazz, ObjectType type) {
     
     /* Добавляем размер GC-заголовка */
     size_t total_size = sizeof(GCObjectHeader) + size;
-    
+
+#if !DEBUG_HEAP_CORRUPTION
+    /* ==== v34.59 TLAB REFILL (под heap_lock) ====
+     * Мелкий запрос, а чанк отсутствует/исчерпан: вырезаем НОВЫЙ чанк
+     * (16 КБ) — сперва из large-списка (переиспользование памяти,
+     * собранной GC — чанки умирающих young-объектов сливаются в большие
+     * регионы), затем с топа кучи. Текущий запрос обслуживается из
+     * начала чанка прямо здесь; последующие уйдут в fast path без
+     * блокировок. Один lock на ~350-500 мелких аллокаций.
+     *
+     * НЕ заходим сюда для больших запросов (> TLAB_MAX_TOTAL) и когда
+     * валидный чанк ещё вмещает запрос (мы в slow path из-за гонки с
+     * safepoint-запросом или большого размера — обычный путь ниже,
+     * чанк не трогаем). */
+    if (!emergency && total_size <= TLAB_MAX_TOTAL &&
+        !gc_debug_enabled() && tlab_enabled() &&
+        !tlab_main_thread_blocked()) {
+        int need_carve = (tlab.limit == NULL) ||
+                         (tlab.top + total_size + sizeof(GCObjectHeader) > tlab.limit);
+        if (need_carve) {
+            if (tlab.limit != NULL) {
+                /* Остаток старого чанка (>= 40 байт по инварианту №2) —
+                 * валидный свободный блок; немедленно возвращаем его в
+                 * бакет СВОЕГО размера, чтобы не ждать ближайшего sweep. */
+                if (tlab.top + sizeof(GCObjectHeader) <= tlab.limit) {
+                    tlab_write_tail(tlab.top, tlab.limit);
+                    sc_push_free((FreeBlock*)tlab.top);
+                }
+                tlab.base = tlab.top = tlab.limit = NULL;
+            }
+            {
+                size_t chunk_actual = 0;
+                void* chunk = sc_try_chain(&heap.large_free_list,
+                                           TLAB_CHUNK_SIZE, &chunk_actual);
+                if (!chunk && heap.current + TLAB_CHUNK_SIZE <= heap.end) {
+                    chunk = heap.current;
+                    chunk_actual = TLAB_CHUNK_SIZE;
+                    heap.current += TLAB_CHUNK_SIZE;
+                }
+                if (chunk) {
+                    tlab.base = (uint8_t*)chunk;
+                    tlab.limit = tlab.base + chunk_actual;
+                    tlab.top = tlab.base + total_size;   /* хвост — лениво */
+                    g_tlab_carves++;                    /* racy — диагностика */
+                    /* v34.71 DIAG 2: chunk carve event for the alloc log */
+                    {
+                        FILE* alloc_log = heap_diag_alloc_log();
+                        if (alloc_log) {
+                            extern JavaThread* thread_current(JVM*);
+                            JavaThread* jt = thread_current(NULL);
+                            fprintf(alloc_log, "C %p %zu %d\n", chunk, chunk_actual,
+                                    jt ? jt->id : 0);
+                        }
+                    }
+                    /* v34.59 FIX (race): АТОМАРНОЕ добавление — конкурентный
+                     * поток в это же время может бампать в своём чанке БЕЗ
+                     * heap_lock (fast path тоже атомарен). Обычный += здесь
+                     * терял обновления (стресс P8f: allocated уходил в минус
+                     * на ~сотни байт за прогон). */
+                    __sync_add_and_fetch(&heap.allocated, total_size);
+                    void* ptr = heap_init_block((GCObjectHeader*)chunk,
+                                                total_size, clazz, type);
+                    heap_unlock();
+                    return ptr;
+                }
+                /* Carve не удался (large пуст + топ мал) — обычный путь
+                 * ниже: free list -> GC -> OOM. TLAB деградирует до
+                 * поведения v34.58 до следующего успешного GC. */
+            }
+        }
+    }
+#endif
+
     /* 1. Пытаемся найти в Free List */
     size_t actual_alloc_size = total_size;  /* По умолчанию - запрошенный размер */
     int from_free_list = 1;
+    (void)from_free_list; /* retained for diagnostics */
     GCObjectHeader* header = (GCObjectHeader*)try_alloc_from_free_list(total_size, &actual_alloc_size);
     
     if (!header) {
@@ -541,27 +1443,94 @@ void* heap_alloc(JVM* jvm, size_t size, JavaClass* clazz, ObjectType type) {
             /* Не хватает места в конце кучи. Запускаем GC. */
             HEAP_CORRUPTION_LOG("ALLOC_GC: triggering GC, need=%zu, available=%zu",
                     total_size, (size_t)(heap.end - heap.current));
-            gc_collect(jvm);
-            
-            /* Пробуем снова в Free List после GC */
+            /* v34.15 DIAG (Galaxy on Fire): GC fired while the heap was only
+             * half full — only a single huge request can do that. Log the
+             * first few so the game-side caller can be identified. */
+            if (total_size >= (1 << 20)) {
+                static int huge_gc_trigger_count = 0;
+                if (huge_gc_trigger_count < 5) {
+                    huge_gc_trigger_count++;
+                    LOG_SAFE("[HEAP-HUGE] %zu bytes (class=%s type=%d) needs GC: current=%zu end=%zu\n",
+                            total_size,
+                            clazz ? (clazz->class_name ? clazz->class_name : "?") : "?",
+                            type,
+                            (size_t)(heap.current - heap.start),
+                            (size_t)(heap.end - heap.start));
+                }
+            }
+            /* v36.03 GC-DEFER-IN-NATIVE: same policy as the periodic trigger
+             * — never run an inline stop-the-world from inside a native.
+             * This allocation falls through to the free-list/emergency paths
+             * (a catchable OutOfMemoryError beats heap corruption); the next
+             * interpreter-context allocation retries the collection. */
+            extern __thread int g_gc_in_native;
+            if (g_gc_in_native == 0) {
+                gc_collect(jvm);
+            }
             header = (GCObjectHeader*)try_alloc_from_free_list(total_size, &actual_alloc_size);
             
             if (!header) {
                 /* Все еще нет места. Проверяем топ кучи (GC мог освободить место в середине, но не в конце) */
                 if (heap.current + total_size > heap.end) {
+                    /* v19: emergency allocations (exception objects) may dip into
+                     * the reserve beyond heap.end so the VM can still THROW a
+                     * catchable OutOfMemoryError / Throwable on a full heap. */
+                    if (emergency && heap.hard_end &&
+                        heap.current + total_size <= heap.hard_end) {
+                        HEAP_CORRUPTION_LOG("ALLOC_EMERGENCY: requested=%zu, reserve_left=%zu",
+                                total_size,
+                                (size_t)(heap.hard_end - heap.current - total_size));
+                        LOG_SAFE("[HEAP] EMERGENCY allocation: %zu bytes (reserve left: %zu)\n",
+                                total_size,
+                                (size_t)(heap.hard_end - heap.current - total_size));
+                        from_free_list = 0;
+                        header = (GCObjectHeader*)heap.current;
+                        heap.current += total_size;
+                        actual_alloc_size = total_size;
+                        /* Skip the normal bump-pointer path below by falling
+                         * through with header set. */
+                        goto emergency_allocated;
+                    }
                     ERROR_LOG("Out of memory! Requested: %zu, Available: %zu",
-                            total_size, (size_t)(heap.end - heap.current));
+                            total_size,
+                            (size_t)(heap.end > heap.current ? (heap.end - heap.current) : 0));
                     HEAP_CORRUPTION_LOG("ALLOC_OOM: requested=%zu, available=%zu",
-                            total_size, (size_t)(heap.end - heap.current));
+                            total_size,
+                            (size_t)(heap.end > heap.current ? (heap.end - heap.current) : 0));
                     
-                    /* Set error info for display in libretro mode */
-                    char oom_msg[256];
-                    snprintf(oom_msg, sizeof(oom_msg), 
-                            "Requested: %zu bytes, Available: %zu bytes",
-                            total_size, (size_t)(heap.end - heap.current));
-                    sdl_set_error_info("OutOfMemoryError", oom_msg, 
-                            "The Java heap is full. Try reducing memory usage or increasing heap size.");
-                    
+                    /* v34 FIX: remember sizes for the OutOfMemoryError
+                     * detailMessage (native_throw_oome). Do NOT touch the
+                     * error-screen state here: a failed allocation is a
+                     * catchable condition, not a VM-fatal one. */
+                    g_last_oom_requested = total_size;
+                    g_last_oom_available = (heap.end > heap.current)
+                                           ? (size_t)(heap.end - heap.current) : 0;
+                    /* v34.5 DIAG: one-line live-set summary at OOM */
+                    {
+                        static int oom_diag_count = 0;
+                        if (oom_diag_count < 3) {
+                            oom_diag_count++;
+                            LOG_SAFE("[HEAP-OOM] live=%zu bytes, gc_cycles=%zu, total_freed=%zu, req=%zu\n",
+                                     heap.allocated, heap.gc_cycles, heap.gc_total_freed,
+                                     total_size);
+                            /* v36.08: mirror into the trace file — stderr is
+                             * invisible on Switch, and a JVM-heap OOM inside a
+                             * native (GC-DEFER-IN-NATIVE skips the collection)
+                             * is exactly the silent-null class the field logs
+                             * must explain. */
+                            {
+                                extern void sw_trace_force(const char* fmt, ...)
+                                    __attribute__((weak));
+                                if (&sw_trace_force && sw_trace_force) {
+                                    sw_trace_force("[HEAP-OOM] live=%zuK gc=%zu req=%zu avail=%zu%s",
+                                                   heap.allocated >> 10, heap.gc_cycles,
+                                                   total_size,
+                                                   (size_t)(heap.end > heap.current ? (heap.end - heap.current) : 0),
+                                                   g_gc_in_native != 0 ? " (in-native: GC deferred!)" : "");
+                                }
+                            }
+                        }
+                    }
                     heap_unlock();  /* Release lock before returning */
                     return NULL;
                 }
@@ -582,13 +1551,53 @@ void* heap_alloc(JVM* jvm, size_t size, JavaClass* clazz, ObjectType type) {
     } else {
         HEAP_CORRUPTION_LOG("ALLOC_FREELIST: found block at %p, size=%zu", header, actual_alloc_size);
     }
+
+emergency_allocated:;
     
-    heap.allocated += actual_alloc_size;
+    /* v34.59 FIX (race): атомарно — см. комментарий в TLAB-carve: */
+    /* конкурентный fast-path поток не берёт heap_lock. */
+    __sync_add_and_fetch(&heap.allocated, actual_alloc_size);
     
-    /* Zero-initialize: only needed for free-list reuse.
-     * Bump-pointer memory is either fresh from OS (zeroed) or never written. */
-    if (from_free_list) {
-        memset(header, 0, actual_alloc_size);
+    /* v34.5 DIAG: track big allocations + live-set growth to diagnose
+     * full-heap OOMs (Doom RPG [Rus] new-game path). First 40 hits. */
+    {
+        static int big_alloc_count = 0;
+        if (actual_alloc_size >= 32768 && big_alloc_count < 40) {
+            big_alloc_count++;
+            LOG_SAFE("[HEAP-BIG] alloc #%d: %zu bytes, class=%s type=%d, live=%zu\n",
+                     big_alloc_count, actual_alloc_size,
+                     clazz ? (clazz->class_name ? clazz->class_name : "?") : "?",
+                     type, heap.allocated);
+        }
+    }
+    
+    /* FIX-19n: ALWAYS zero the allocated block. The old assumption
+     * ("bump-pointer memory is fresh/never written") is wrong since
+     * gc_collect() rewinds heap.current into freed space (top
+     * defragmentation), so a reused bump region contains stale object
+     * bytes. JVMS requires new arrays to be zero-filled. */
+    memset(header, 0, actual_alloc_size);
+
+    /* v34.71 DIAG: same range trace as heap_init_block (see there). */
+    {
+        static uintptr_t tr_lo = 0, tr_hi = 0;
+        if (tr_hi == 0 && tr_lo == 0) {
+            const char* e = getenv("NOJME_ALLOC_TRACE");
+            if (e && e[0]) {
+                uintptr_t lo = strtoul(e, (char**)&e, 16);
+                if (*e == '-' || *e == ':') {
+                    uintptr_t hi = strtoul(e + 1, NULL, 16);
+                    if (hi > lo) { tr_lo = lo; tr_hi = hi; }
+                }
+            }
+            if (tr_hi == 0) tr_lo = tr_hi = 1;
+        }
+        if (tr_hi > 1 && (uintptr_t)header >= tr_lo && (uintptr_t)header < tr_hi) {
+            j2me_log_ungated("[ALLOC-TRACE] hdr=%p total=%zu actual=%zu clazz=%s type=%d tid_in_native=%d\n",
+                             (void*)header, total_size, actual_alloc_size,
+                             clazz ? (clazz->class_name ? clazz->class_name : "?") : "NULL",
+                             (int)type, g_gc_in_native);
+        }
     }
     
     /* Инициализация заголовка */
@@ -599,10 +1608,38 @@ void* heap_alloc(JVM* jvm, size_t size, JavaClass* clazz, ObjectType type) {
     header->size = (uint32_t)actual_alloc_size;  /* CRITICAL FIX: используем РАЛЬНЫЙ размер! */
     header->type = (uint8_t)type;
     header->marked = 0;
-    header->pinned = 0;
+    /* v34.14: объект, рождённый внутри исполняющегося натива, пиннится
+     * сразу (C-локалы натива невидимы для GC mark-фазы) и регистрируется
+     * в per-thread auto-pin журнале; pin снимется при выходе из натива. */
+    header->pinned = g_gc_in_native ? 1 : 0;
+    if (header->pinned) gc_autopin_note(header + 1);
     /* reserved[0..1], _align_pad[0..7] already zeroed by memset above */
     header->magic = GC_HEADER_MAGIC;  /* Magic number for corruption detection */
     header->_magic_pad = 0;  /* Padding for 8-byte alignment */
+
+    /* [GC-DIAG2] record allocation in a ring for corruption forensics */
+    {
+        static struct { void* addr; uint32_t size; int type; const char* name; } alloc_ring[512];
+        static int ring_idx = 0;
+        alloc_ring[ring_idx].addr = (void*)header;
+        alloc_ring[ring_idx].size = (uint32_t)actual_alloc_size;
+        alloc_ring[ring_idx].type = (int)type;
+        alloc_ring[ring_idx].name = (clazz && clazz->class_name) ? clazz->class_name : "?";
+        ring_idx = (ring_idx + 1) % 512;
+        g_alloc_ring = (void*)alloc_ring;
+        g_alloc_ring_idx = ring_idx;
+    }
+    /* v34.71 DIAG 2: full allocation log (see heap_init_block for rationale) */
+    {
+        FILE* alloc_log = heap_diag_alloc_log();
+        if (alloc_log) {
+            extern JavaThread* thread_current(JVM*);
+            JavaThread* jt = thread_current(NULL);
+            fprintf(alloc_log, "A %p %zu %s %d %d\n", (void*)header, actual_alloc_size,
+                    clazz ? (clazz->class_name ? clazz->class_name : "?") : "NULL",
+                    (int)type, jt ? jt->id : 0);
+        }
+    }
     
     /* Вычисляем указатель на пользовательские данные (сразу после заголовка) */
     void* ptr = (void*)(header + 1);
@@ -676,6 +1713,60 @@ JavaObject* heap_alloc_object(JVM* jvm, JavaClass* clazz) {
     return obj;
 }
 
+/* v19: emergency object allocation — uses the reserve area so exception
+ * objects can be created even when the heap is completely full. Mirrors
+ * heap_alloc_object but never logs the regular "heap_alloc failed" error
+ * (the caller decides whether a NULL result is fatal). */
+JavaObject* heap_alloc_object_emergency(JVM* jvm, JavaClass* clazz) {
+    if (!clazz) {
+        return NULL;
+    }
+
+    size_t size = clazz->instance_size;
+    if (size < sizeof(JavaObject)) {
+        size = sizeof(JavaObject);
+    }
+
+    size = (size + OBJECT_ALIGNMENT - 1) & ~(OBJECT_ALIGNMENT - 1);
+
+    JavaObject* obj = (JavaObject*)heap_alloc_emergency(jvm, size, clazz, OBJ_TYPE_OBJECT);
+    if (obj) {
+        obj->header.clazz = clazz;
+        obj->header.hashcode = (jint)(intptr_t)obj;
+    }
+
+    return obj;
+}
+
+/* v34.58 PERF: кэшированный поиск горячих встроенных классов.
+ * Прежний линейный скан проходил ВЕСЬ массив классов (у игр это
+ * 500-2000+ strcmp) на КАЖДУЮ аллокацию массива/строки — при
+ * стринг-churn'е это доминирующая константа на аллокацию.
+ * Классы в этой VM никогда не выгружаются, поэтому позитивный
+ * результат кэшируется навсегда. Негативный НЕ кэшируется
+ * (класс может быть загружен позже — ранний запуск, JAR). */
+static JavaClass* heap_cached_class(JVM* jvm, const char* name, JavaClass** cache_slot) {
+    if (*cache_slot) return *cache_slot;
+    for (size_t i = 0; i < jvm->class_loader.count; i++) {
+        JavaClass* c = jvm->class_loader.classes[i];
+        if (c->class_name && strcmp(c->class_name, name) == 0) {
+            *cache_slot = c;
+            return c;
+        }
+    }
+    return NULL;
+}
+static JavaClass* s_heap_class_object = NULL;  /* java/lang/Object */
+static JavaClass* s_heap_class_string = NULL;  /* java/lang/String */
+
+/* v34.91 MULTI-SESSION FIX: same pattern as jvm.c's s_string_class_cache —
+ * these caches survive jvm_destroy and would dangle into the next game
+ * session (Switch frontend). Called from jvm_destroy. */
+void heap_class_cache_reset(void) {
+    s_heap_class_object = NULL;
+    s_heap_class_string = NULL;
+}
+
 /* Выделение массива */
 JavaArray* heap_alloc_array(JVM* jvm, uint8_t element_type, jsize length, JavaClass* element_class) {
     /* Verify JavaArray structure size at runtime */
@@ -718,15 +1809,8 @@ JavaArray* heap_alloc_array(JVM* jvm, uint8_t element_type, jsize length, JavaCl
     size_t data_size = elem_size * length;
     size_t total_size = sizeof(JavaArray) + data_size;
     
-    /* Поиск класса java/lang/Object для массива. */
-    JavaClass* array_class = NULL;
-    for (size_t i = 0; i < jvm->class_loader.count; i++) {
-        JavaClass* c = jvm->class_loader.classes[i];
-        if (c->class_name && strcmp(c->class_name, "java/lang/Object") == 0) {
-            array_class = c;
-            break;
-        }
-    }
+    /* Поиск класса java/lang/Object для массива (v34.58: через кэш). */
+    JavaClass* array_class = heap_cached_class(jvm, "java/lang/Object", &s_heap_class_object);
     
     if (!array_class && jvm->class_loader.count > 0) {
         array_class = jvm->class_loader.classes[0]; /* Fallback */
@@ -768,15 +1852,8 @@ JavaArray* heap_alloc_array(JVM* jvm, uint8_t element_type, jsize length, JavaCl
  * Это нативная строка для внутреннего использования (например, до загрузки классов).
  */
 JavaString* heap_alloc_string(JVM* jvm, jsize length) {
-    /* Найти класс java/lang/String */
-    JavaClass* str_class = NULL;
-    for (size_t i = 0; i < jvm->class_loader.count; i++) {
-        JavaClass* c = jvm->class_loader.classes[i];
-        if (c->class_name && strcmp(c->class_name, "java/lang/String") == 0) {
-            str_class = c;
-            break;
-        }
-    }
+    /* Найти класс java/lang/String (v34.58: через кэш) */
+    JavaClass* str_class = heap_cached_class(jvm, "java/lang/String", &s_heap_class_string);
     
     /* Если класс java/lang/String найден, создаем как OBJ_TYPE_OBJECT!
      * Это КРИТИЧЕСКИ важно для правильной работы GC.
@@ -907,10 +1984,240 @@ static bool is_valid_gc_object(void* ptr) {
     return true;
 }
 
+/* v15: Exported liveness probe for JavaObject* held by native code.
+ * See heap.h comment. Same checks as is_valid_gc_object(). */
+bool heap_java_object_valid(void* ptr) {
+    return is_valid_gc_object(ptr);
+}
+
+/* ============================================================
+ * v34.59 PERF: ПЕР-КЛАССОВЫЙ КЭШ РАЗМЕТКИ GC (mark/sweep)
+ * ============================================================
+ * Проблема: gc_mark_object() для КАЖДОГО помечаемого OBJ_TYPE_OBJECT
+ * строил массив hierarchy[64], обходил ВСЕ классы иерархии и ВСЕ их
+ * поля (проверка access_flags, разыменование descriptor, strcmp
+ * "nativePeer", арифметика слотов J/D). Для 3D-игр с большими живыми
+ * графами (сцены M3G: Node/Transform/Group/Mesh + Vector/Object[]-
+ * контейнеры, сотни тысяч объектов) это была доминирующая константа
+ * mark-фазы: 150-400 тактов НА ОБЪЕКТ только на «понять, какие слоты
+ * поля — ссылки», при том что разметка класса НЕИЗМЕННА после загрузки.
+ *
+ * Решение: считаем разметку ОДИН раз на класс и кладём в JavaClass:
+ *   - gc_ref_slots[]: индексы слотов полей-ссылок (в порядке иерархии,
+ *     nativePeer исключён) — mark-фаза сводится к циклу по готовым
+ *     индексам (~15-30 тактов на объект вместо 150-400);
+ *   - gc_kind: биты семейств классов (String / Hashtable / Vector /
+ *     Entry) — strcmp имён классов выполняется один раз на класс
+ *     вместо одного-двух на каждый объект в mark и sweep.
+ *
+ * Когда строится: ЛЕНИВО, при первой встрече объекта класса в
+ * gc_mark_object / sweep / presweep. Все эти места выполняются под
+ * heap_lock с остановленным миром (единственный поток-мутатор GC),
+ * поэтому гонок на ленивую инициализацию нет. Классы в рантайме не
+ * выгружаются (см. v34.58 note), кэш валиден до shutdown.
+ *
+ * Отказ malloc'а массива слотов НЕ фатален: LAYOUT_READY не
+ * выставляется, mark-фаза уходит в резервный медленный проход
+ * (gc_mark_fields_slow) — поведение деградирует до v34.58, но не
+ * ломается. Биты gc_kind выставляются ДО попытки malloc, поэтому
+ * sweep/presweep-пути (нуждающиеся только в битах) работают всегда.
+ * ============================================================ */
+#define GC_KIND_READY  0x01u   /* gc_ref_slots построен и валиден */
+#define GC_KIND_STRING 0x02u   /* имя == "java/lang/String" */
+#define GC_KIND_HT     0x04u   /* имя == java/util/Hashtable|HashMap */
+#define GC_KIND_VEC    0x08u   /* имя == java/util/Vector|ArrayList */
+#define GC_KIND_ENTRY  0x10u   /* имя СОДЕРЖИТ "Hashtable$Entry"/"HashMap$Entry" */
+
+/* gc_mark_fields_slow вызывается до определения gc_push_mark ниже */
+static bool gc_push_mark(void* ptr);
+
+/* Резервный (медленный) проход по полям — точная копия логики
+ * v34.58: иерархия 64 уровня, static-пропуск, 'L'/'[' дескрипторы,
+ * nativePeer-пропуск, 2 слота у J/D. Используется пока разметка
+ * класса не построена (или malloc массива слотов не удался). */
+static void gc_mark_fields_slow(JavaObject* obj, JavaClass* clazz) {
+    JavaClass* hierarchy[64];
+    int depth = 0;
+    JavaClass* c = clazz;
+    while (c && depth < 64) {
+        hierarchy[depth++] = c;
+        c = c->super_class;
+    }
+
+    int slot = 0;
+    for (int h = depth - 1; h >= 0; h--) {
+        JavaClass* current = hierarchy[h];
+        if (!current->fields) continue;
+
+        for (int i = 0; i < current->fields_count; i++) {
+            JavaField* field = &current->fields[i];
+
+            /* Skip static fields */
+            if (field->access_flags & ACC_STATIC) continue;
+
+            if (field->descriptor) {
+                char desc = field->descriptor[0];
+                if (desc == 'L' || desc == '[') {
+                    void* ref = obj->fields[slot].ref;
+                    if (ref) {
+                        /* nativePeer — нативный указатель, НЕ Java-ссылка */
+                        if (field->name && strcmp(field->name, "nativePeer") == 0) {
+                            /* skip */
+                        } else {
+                            gc_push_mark(ref);
+                        }
+                    }
+                }
+            }
+
+            /* Advance slot; long/double занимают 2 слота */
+            slot++;
+            if (field->descriptor &&
+                (field->descriptor[0] == 'J' || field->descriptor[0] == 'D')) {
+                slot++;
+            }
+        }
+    }
+}
+
+/* Построить (если ещё не построена) разметку класса и вернуть биты
+ * GC_KIND_*. Вызывается ТОЛЬКО из GC-контекста (мир остановлен).
+ * Идемпотентно; потокобезопасность обеспечивается остановкой мира. */
+static uint8_t gc_class_kind(JavaClass* clazz) {
+    if (!clazz) return 0;
+    /* v34.80: defense in depth for the recycled-header crash (see the
+     * gc_mark_object OBJ_TYPE_OBJECT guard) — real classes are malloc'd,
+     * never GC-heap residents; nothing real lives below the mmap floor. */
+    if (is_heap_ptr((void*)clazz) || (uintptr_t)clazz < 0x10000u) return 0;
+    if (clazz->gc_kind & GC_KIND_READY) return clazz->gc_kind;
+
+    /* 1) Биты семейств — strcmp по имени ОДИН раз на класс.
+     *    Порядок проверок повторяет прежний код mark/sweep (strcmp
+     *    точных имён + strstr для Entry-семейства). */
+    uint8_t kind = 0;
+    const char* cn = clazz->class_name;
+    /* v34.80: real class names are malloc'd constant-pool bytes, strdup'd
+     * stub names or .rodata literals — none of them live inside the GC
+     * heap or below the mmap floor; both shapes were observed in the
+     * recycled-header garbage (0x19 / 0x65). */
+    if (cn && !is_heap_ptr((void*)cn) && (uintptr_t)cn >= 0x10000u) {
+        if (strcmp(cn, "java/lang/String") == 0) {
+            kind |= GC_KIND_STRING;
+        }
+        if (strcmp(cn, "java/util/Hashtable") == 0 ||
+            strcmp(cn, "java/util/HashMap") == 0) {
+            kind |= GC_KIND_HT;
+        }
+        if (strcmp(cn, "java/util/Vector") == 0 ||
+            strcmp(cn, "java/util/ArrayList") == 0) {
+            kind |= GC_KIND_VEC;
+        }
+        if (strstr(cn, "Hashtable$Entry") != NULL ||
+            strstr(cn, "HashMap$Entry") != NULL) {
+            kind |= GC_KIND_ENTRY;
+        }
+    }
+    clazz->gc_kind = (uint8_t)(clazz->gc_kind | kind);
+
+    /* 2) Слоты полей-ссылок (та же арифметика слотов, что в
+     *    gc_mark_fields_slow, чтобы индексы совпадали байт-в-байт). */
+    JavaClass* hierarchy[64];
+    int depth = 0;
+    JavaClass* c = clazz;
+    while (c && depth < 64) {
+        /* v34.80: guard every hop — the entry checks validated clazz
+         * itself, but a wild clazz that points at recycled C memory can
+         * still carry garbage in super_class (observed under qemu-arm:
+         * super_class = 0x11, fault at 0x11+offsetof(super_class)=0x65).
+         * Real classes are malloc'd, never GC-heap residents, and nothing
+         * real lives below the mmap floor — same invariants as above.
+         * Truncating the hierarchy only narrows the slot set; the walk
+         * below then reads fields of validated classes only. */
+        if (is_heap_ptr((void*)c) || (uintptr_t)c < 0x10000u) break;
+        hierarchy[depth++] = c;
+        c = c->super_class;
+    }
+
+    /* Проход 1: посчитать ссылочные слоты */
+    int nslots = 0;
+    {
+        int slot = 0;
+        for (int h = depth - 1; h >= 0; h--) {
+            JavaClass* cur = hierarchy[h];
+            if (!cur->fields) continue;
+            for (int i = 0; i < cur->fields_count; i++) {
+                JavaField* field = &cur->fields[i];
+                if (field->access_flags & ACC_STATIC) continue;
+                if (field->descriptor) {
+                    char desc = field->descriptor[0];
+                    if (desc == 'L' || desc == '[') {
+                        if (!(field->name &&
+                              strcmp(field->name, "nativePeer") == 0)) {
+                            nslots++;
+                        }
+                    }
+                }
+                slot++;
+                if (field->descriptor &&
+                    (field->descriptor[0] == 'J' || field->descriptor[0] == 'D')) {
+                    slot++;
+                }
+            }
+        }
+    }
+
+    /* Проход 2: собрать индексы. Максимум полей у J2ME-классов мал
+     * (сотни), uint16_t слота хватает с запасом (инвариант: полей
+     * < 65536 — Java-ограничение classfile-формата u2). */
+    if (nslots > 0) {
+        uint16_t* slots = (uint16_t*)malloc((size_t)nslots * sizeof(uint16_t));
+        if (slots) {
+            int slot = 0;
+            int out = 0;
+            for (int h = depth - 1; h >= 0; h--) {
+                JavaClass* cur = hierarchy[h];
+                if (!cur->fields) continue;
+                for (int i = 0; i < cur->fields_count; i++) {
+                    JavaField* field = &cur->fields[i];
+                    if (field->access_flags & ACC_STATIC) continue;
+                    if (field->descriptor) {
+                        char desc = field->descriptor[0];
+                        if (desc == 'L' || desc == '[') {
+                            if (!(field->name &&
+                                  strcmp(field->name, "nativePeer") == 0) &&
+                                out < nslots) {
+                                slots[out++] = (uint16_t)slot;
+                            }
+                        }
+                    }
+                    slot++;
+                    if (field->descriptor &&
+                        (field->descriptor[0] == 'J' || field->descriptor[0] == 'D')) {
+                        slot++;
+                    }
+                }
+            }
+            clazz->gc_ref_slots = slots;
+            clazz->gc_ref_slot_count = (uint16_t)out;
+            kind |= GC_KIND_READY;
+        }
+        /* malloc не удался: READY не ставим — mark уйдёт в slow-path */
+    } else {
+        /* Ссылочных полей нет — разметка "пуста", но ГОТОВА */
+        clazz->gc_ref_slots = NULL;
+        clazz->gc_ref_slot_count = 0;
+        kind |= GC_KIND_READY;
+    }
+
+    clazz->gc_kind = (uint8_t)(clazz->gc_kind | kind);
+    return clazz->gc_kind;
+}
+
+
 /* ИСПРАВЛЕНО: Push с проверкой и расширением стека */
 static bool gc_push_mark(void* ptr) {
     if (!ptr) return true;
-    
+
     /* CRITICAL FIX: Validate that this is actually a GC-managed object.
      * This prevents primitive values (ints, floats) that happen to look like
      * heap pointers from being treated as references. */
@@ -938,6 +2245,16 @@ static bool gc_push_mark(void* ptr) {
     GCObjectHeader* header = (GCObjectHeader*)ptr - 1;
     GC_DEBUG("[GC_PUSH] VALID ptr=%p, header=%p, size=%u, type=%d, marked=%d",
             ptr, header, header->size, header->type, header->marked);
+
+    /* v34.59 PERF: объект уже помечен — не кладём на стек вовсе.
+     * Прежний порядок (push -> pop -> gc_mark_object -> «уже помечен»)
+     * тратил push/pop/разыменования на КАЖДУЮ повторную ссылку, а их
+     * в живых графах 3D-игр большинство (Object[]/Vector/Entry-цепочки
+     * ссылаются на одни и те же объекты по много раз). Семантика не
+     * меняется: marked проверялся в gc_mark_object ДО обработки полей,
+     * т.е. повторный pop ничего не делал, кроме этой проверки. Мир
+     * остановлен — чтение marked безопасно. */
+    if (header->marked) return true;
     
     /* Проверка на переполнение и расширение */
     if (gc_mark_stack_top >= gc_mark_stack_capacity) {
@@ -994,14 +2311,38 @@ static void gc_mark_object(void* ptr) {
         case OBJ_TYPE_OBJECT: {
             JavaObject* obj = (JavaObject*)ptr;
             JavaClass* clazz = obj->header.clazz;
-            
+
+            /* v34.80 ARMv7 crash fix (reproduced under qemu-arm, Stalker,
+             * ~40-60% of runs): a recycled heap block whose stale header
+             * still parses as OBJ_TYPE_OBJECT with a plausible size walks
+             * into gc_class_kind() with header->clazz pointing at garbage
+             * (observed: pointers into the recycled GC-heap block holding
+             * small ints 0x19/0x65; then strcmp(clazz->class_name,
+             * "java/lang/String") faults in libc). Real JavaClass structs
+             * live in C memory — malloc'd by classfile.c/jvm.c (stubs) —
+             * and are NEVER allocated inside the GC heap, and no real
+             * pointer can be below the mmap floor. Validate the class
+             * pointer with exactly those two invariants and treat a
+             * failing object as opaque: keep the mark (conservative — the
+             * block survives this cycle), skip all class-specific walking.
+             * Same philosophy as the String value_ref guard below. */
             if (!clazz) break;
+            if (is_heap_ptr((void*)clazz) || (uintptr_t)clazz < 0x10000u) {
+                gc_recycled_headers_skipped++;
+                break;
+            }
+
+            /* v34.59 PERF: разметка класса (слоты ссылочных полей + биты
+             * семейств) — строится ОДИН раз на класс. Прежний код делал
+             * все strcmp/strstr по имени класса и построение массива
+             * hierarchy[64] НА КАЖДЫЙ объект. */
+            uint8_t kind = gc_class_kind(clazz);
             
             /* CRITICAL FIX: Special handling for java/lang/String objects.
              * String objects have a 'value' field that points to a char[].
              * We must validate and mark this array FIRST to prevent use-after-free.
              */
-            if (clazz->class_name && strcmp(clazz->class_name, "java/lang/String") == 0) {
+            if (kind & GC_KIND_STRING) {
                 GC_LOG("[GC_STRING_OBJ] Marking java/lang/String object at %p\n", ptr);
                 
                 /* Get the value slot for the char array */
@@ -1047,11 +2388,9 @@ static void gc_mark_object(void* ptr) {
              * java/util/Vector: elementData field -> Object[]
              * java/util/ArrayList: elementData field -> Object[]
              */
-            if (clazz->class_name) {
-                const char* cn = clazz->class_name;
-                
+            {
                 /* java/util/Hashtable$Entry - has key, value, next fields */
-                if (strstr(cn, "Hashtable$Entry") != NULL || strstr(cn, "HashMap$Entry") != NULL) {
+                if (kind & GC_KIND_ENTRY) {
                     /* Entry objects have key (Object), value (Object), next (Entry) fields
                      * Layout: typically key=slot 0, value=slot 1, next=slot 2
                      * We need to mark all three */
@@ -1067,8 +2406,8 @@ static void gc_mark_object(void* ptr) {
                 }
                 
                 /* java/util/Hashtable - scan table array and ALL reference fields */
-                if (strcmp(cn, "java/util/Hashtable") == 0 || strcmp(cn, "java/util/HashMap") == 0) {
-                    GC_LOG("[GC_HASHTABLE] Special handling for %s at %p, size=%u\n", cn, ptr, header->size);
+                if (kind & GC_KIND_HT) {
+                    GC_LOG("[GC_HASHTABLE] Special handling for %s at %p, size=%u\n", clazz->class_name ? clazz->class_name : "?", ptr, header->size);
                     
                     int num_slots = (int)(header->size / sizeof(JavaValue));
                     GC_LOG("[GC_HASHTABLE]   Scanning %d field slots...\n", num_slots);
@@ -1100,77 +2439,53 @@ static void gc_mark_object(void* ptr) {
                     }
                     /* Continue to normal field processing as well for completeness */
                 }
-                
-                /* java/util/Vector, java/util/ArrayList */
-                if (strcmp(cn, "java/util/Vector") == 0 || strcmp(cn, "java/util/ArrayList") == 0) {
-                    GC_LOG("[GC_COLLECTION] Special handling for %s at %p, size=%u\n", cn, ptr, header->size);
-                    
-                    int num_slots = (int)(header->size / sizeof(JavaValue));
-                    GC_LOG("[GC_COLLECTION]   Scanning %d field slots...\n", num_slots);
-                    
-                    /* CRITICAL FIX: Scan ALL reference fields, not just arrays */
-                    for (int s = 0; s < num_slots; s++) {
+            }
+            
+            /* v34.59 PERF: маркировка полей по кэшированной разметке класса.
+             * БЫЛО (v34.58): построение hierarchy[64] + проход по всем полям
+             * всех классов иерархии с разыменованием descriptor и strcmp
+             * nativePeer НА КАЖДЫЙ объект. СТАЛО: цикл по готовому массиву
+             * ссылочных слотов. Семантика идентична (см. gc_class_kind). */
+            if (kind & GC_KIND_READY) {
+                const uint16_t* slots = clazz->gc_ref_slots;
+                int nslots = clazz->gc_ref_slot_count;
+                for (int i = 0; i < nslots; i++) {
+                    void* ref = obj->fields[slots[i]].ref;
+                    if (ref) gc_push_mark(ref);
+                }
+            } else {
+                /* Резервный медленный проход (разметка не построена:
+                 * malloc слотов не удался — ретрай на следующем GC). */
+                gc_mark_fields_slow(obj, clazz);
+            }
+
+            /* CRITICAL FIX (v15): conservative scan for STUB objects.
+             * Stub classes created by the emulator often have NO declared
+             * fields, yet native code stores live Java references in their
+             * raw fields[] slots (RecordEnumerationImpl holds the ids
+             * int[], M3G/LCDUI stubs hold peer objects). Without this scan
+             * those references are invisible to the mark phase and the
+             * referenced objects get freed while still in use
+             * (use-after-free on the next native access). */
+            if (clazz->fields_count == 0) {
+                GCObjectHeader* obj_hdr = (GCObjectHeader*)ptr - 1;
+                if (obj_hdr->magic == GC_HEADER_MAGIC &&
+                    obj_hdr->size > sizeof(GCObjectHeader) + sizeof(JavaObject)) {
+                    int stub_slots = (int)((obj_hdr->size - sizeof(GCObjectHeader)
+                                            - sizeof(JavaObject)) / sizeof(JavaValue));
+                    if (stub_slots > 16) stub_slots = 16;  /* sanity cap */
+                    for (int s = 0; s < stub_slots; s++) {
                         void* ref = obj->fields[s].ref;
                         if (ref && is_heap_ptr(ref)) {
                             GCObjectHeader* ref_hdr = (GCObjectHeader*)ref - 1;
-                            if (ref_hdr->magic == GC_HEADER_MAGIC) {
-                                GC_LOG("[GC_COLLECTION]   field[%d] = %p, type=%d, size=%u\n",
-                                        s, ref, ref_hdr->type, ref_hdr->size);
+                            if (ref_hdr->magic == GC_HEADER_MAGIC &&
+                                ref_hdr->type != OBJ_TYPE_FREE) {
+                                GC_LOG("[GC_STUB] %s@%p field[%d] -> %p (type=%d) marked conservatively\n",
+                                       clazz->class_name ? clazz->class_name : "?",
+                                       ptr, s, ref, ref_hdr->type);
                                 gc_push_mark(ref);
                             }
                         }
-                    }
-                }
-            }
-            
-            /* Build hierarchy and calculate field slots properly */
-            JavaClass* hierarchy[64];
-            int depth = 0;
-            JavaClass* c = clazz;
-            while (c && depth < 64) {
-                hierarchy[depth++] = c;
-                c = c->super_class;
-            }
-            
-            /* Process fields from Object down to actual class */
-            int slot = 0;
-            for (int h = depth - 1; h >= 0; h--) {
-                JavaClass* current = hierarchy[h];
-                if (!current->fields) continue;
-                
-                for (int i = 0; i < current->fields_count; i++) {
-                    JavaField* field = &current->fields[i];
-                    
-                    /* Skip static fields */
-                    if (field->access_flags & ACC_STATIC) continue;
-                    
-                    /* Check if this is a reference field */
-                    if (field->descriptor) {
-                        char desc = field->descriptor[0];
-                        if (desc == 'L' || desc == '[') {
-                            void* ref = obj->fields[slot].ref;
-                            if (ref) {
-                                /* CRITICAL FIX: Skip nativePeer fields!
-                                 * nativePeer contains native pointers (MidpFont*, MidpGraphics*, MidpImage*)
-                                 * which are malloc'd, NOT heap objects. If we try to mark them as heap
-                                 * objects, we may corrupt memory if the pointer happens to fall within
-                                 * heap address range. */
-                                if (field->name && strcmp(field->name, "nativePeer") == 0) {
-                                    /* Skip native pointer - not a GC-managed reference */
-                                    GC_DEBUG("[GC] Skipping nativePeer field at slot %d (value=%p)", slot, ref);
-                                } else {
-                                    gc_push_mark(ref);
-                                }
-                            }
-                        }
-                    }
-                    
-                    /* Advance slot */
-                    slot++;
-                    /* Long and double take 2 slots */
-                    if (field->descriptor && 
-                        (field->descriptor[0] == 'J' || field->descriptor[0] == 'D')) {
-                        slot++;
                     }
                 }
             }
@@ -1335,6 +2650,9 @@ static void gc_mark_object(void* ptr) {
             (void)str;  /* Suppress unused variable warning */
             break;
         }
+        case OBJ_TYPE_FREE:
+            /* Free block: never live, nothing to mark */
+            break;
     }
 }
 
@@ -1346,9 +2664,173 @@ static void gc_process_mark_stack(void) {
 }
 
 /* Запуск сборщика мусора с Линейным Sweep и Коалесцингом */
+
+/* [GC-DIAG] Walk the heap from start and dump each valid header until a
+ * failing address, to identify which object's size field broke the linear
+ * scan (one-shot, throttled). */
+static void gc_diag_dump_alloc_ring(uint8_t* bad_ptr) {
+    if (!g_alloc_ring) return;
+    typedef struct { void* addr; uint32_t size; int type; const char* name; } RingEnt;
+    RingEnt* ring = (RingEnt*)(void*)g_alloc_ring;
+    ERROR_LOG("[GC-DIAG2] allocations adjacent to bad ptr %p (full ring scan):", (void*)bad_ptr);
+    for (int k = 0; k < 512; k++) {
+        RingEnt* e = &ring[k];
+        if (!e->addr) continue;
+        if (bad_ptr && (uint8_t*)e->addr < bad_ptr && (uint8_t*)e->addr + e->size + 128 > bad_ptr) {
+            ERROR_LOG("[GC-DIAG2]   NEAR alloc %p size=%u type=%d clazz=%s (ends 0x%zx)",
+                      e->addr, e->size, e->type, e->name,
+                      (size_t)((uint8_t*)e->addr) + e->size);
+        }
+    }
+    ERROR_LOG("[GC-DIAG2] layout: sizeof(GCHeader)=%zu size@%zu type@%zu clazz@%zu magic@%zu | sizeof(JavaArray)=%zu sizeof(JavaObject)=%zu sizeof(ObjectHeader)=%zu",
+              sizeof(GCObjectHeader),
+              (size_t)((uint8_t*)&((GCObjectHeader*)0)->size - (uint8_t*)0),
+              (size_t)((uint8_t*)&((GCObjectHeader*)0)->type - (uint8_t*)0),
+              (size_t)((uint8_t*)&((GCObjectHeader*)0)->clazz - (uint8_t*)0),
+              (size_t)((uint8_t*)&((GCObjectHeader*)0)->magic - (uint8_t*)0),
+              sizeof(JavaArray), sizeof(JavaObject), sizeof(ObjectHeader));
+}
+
+static void gc_diag_dump_heap_walk(uint8_t* bad_ptr) {
+    static int diag_done = 0;
+    if (diag_done) return;
+    diag_done = 1;
+    ERROR_LOG("[GC-DIAG] ===== heap walk dump until %p (heap.start=%p, current=%p) =====",
+              (void*)bad_ptr, (void*)heap.start, (void*)heap.current);
+    uint8_t* p = heap.start;
+
+    /* circular buffer of the last N walked positions */
+    uint8_t* last_pos[24];
+    uint32_t last_size[24];
+    int last_type[24];
+    uint32_t last_magic[24];
+    const char* last_name[24];
+    int ring = 0;
+    int total = 0;
+    while (p < heap.current && total < 200000) {
+        GCObjectHeader* h = (GCObjectHeader*)p;
+        if (h->magic == GC_HEADER_MAGIC || h->type == OBJ_TYPE_FREE) {
+            const char* cname = (h->clazz && h->clazz->class_name) ? h->clazz->class_name : "?";
+            last_pos[ring] = p;
+            last_size[ring] = h->size;
+            last_type[ring] = h->type;
+            last_magic[ring] = h->magic;
+            last_name[ring] = cname;
+            ring = (ring + 1) % 24;
+            total++;
+            p += h->size;
+        } else {
+            ERROR_LOG("[GC-DIAG] BAD HEADER while walking: @%p magic=0x%08X size=%u type=%d (objects walked OK: %d)",
+                      (void*)p, h->magic, h->size, h->type, total);
+            break;
+        }
+    }
+    /* print the last 24 walked objects, in order */
+    int idx = ring;
+    ERROR_LOG("[GC-DIAG] last %d objects walked before failure:", (total < 24) ? total : 24);
+    for (int i = 0; i < 24 && i < total; i++) {
+        idx = (idx + 1) % 24;
+        ERROR_LOG("[GC-DIAG]   obj[-%d] @%p size=%u type=%d magic=0x%08X clazz=%s",
+                  (total < 24 ? total : 24) - i,
+                  (void*)last_pos[idx], last_size[idx], last_type[idx],
+                  last_magic[idx], last_name[idx]);
+    }
+    ERROR_LOG("[GC-DIAG] walk stopped at %p; bad scan_ptr was %p", (void*)p, (void*)bad_ptr);
+    /* hexdump 64 bytes at the stop position */
+    uint8_t* dump = p;
+    for (int row = 0; row < 4; row++) {
+        char line[130]; int pos = 0;
+        pos += snprintf(line + pos, sizeof(line) - pos, "[GC-DIAG]   %p:", (void*)(dump + row*16));
+        for (int b = 0; b < 16; b++) {
+            pos += snprintf(line + pos, sizeof(line) - pos, " %02X", dump[row*16 + b]);
+        }
+        ERROR_LOG("%s", line);
+    }
+    ERROR_LOG("[GC-DIAG] ===== end heap walk dump =====");
+}
+
+static volatile int gc_diag_active = 0;
+static int gc_diag_expected = 0;
+static void jvm_gc_safepoint_release_local(void) {
+    extern void jvm_gc_safepoint_release(void);
+    jvm_gc_safepoint_release();
+}
+
+/* v41 PERF-DIAG: NOJME_GCSTAMP=1 — one line per GC with pause duration and
+ * bytes freed. Cheap (no frames walked, no heap dump) — safe to keep on in
+ * stutter profiling runs where full NOJME_LOG distorts the timings. */
+static int gc_stamp_on(void) {
+    static int env_cache = -1;
+    if (env_cache < 0) {
+        const char* e = getenv("NOJME_GCSTAMP");
+        env_cache = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return env_cache;
+}
+
 void gc_collect(JVM* jvm) {
     if (!jvm) return;
-    
+    /* v34.95 SAFEPOINT-BACKOFF entry gate: skip collections inside the
+     * post-abort window (see the comment at g_gc_backoff_until_ms). */
+    {
+        struct timespec bk_ts;
+        clock_gettime(CLOCK_MONOTONIC, &bk_ts);
+        jlong bk_now = (jlong)bk_ts.tv_sec * 1000 + bk_ts.tv_nsec / 1000000;
+        if (bk_now < g_gc_backoff_until_ms) {
+            static int bk_log_n = 0;
+            if (bk_log_n < 10 || (bk_log_n % 200) == 0) {
+                bk_log_n++;
+                LOG_SAFE("[GC-BACKOFF] collection skipped (%lld ms left in window)\n",
+                         (long long)(g_gc_backoff_until_ms - bk_now));
+            }
+            return;
+        }
+    }
+    /* v34.71 DIAG 2: epoch marker for the full allocation log (see
+     * heap_init_block). Everything allocated after this point coexists
+     * with the post-GC survivors — overlaps inside one epoch are bugs. */
+    {
+        FILE* alloc_log = heap_diag_alloc_log();
+        if (alloc_log) fprintf(alloc_log, "G\n");
+    }
+    /* v34.59 TLAB: закрыть СВОЙ чанк ДО остановки мира — mark/sweep
+     * должны видеть только закрытые чанки (хвост — валидный свободный
+     * блок, инвариант №3). TLS-операция, лок не нужен; идемпотентно
+     * (парковка потока могла закрыть чанк чуть раньше). */
+    heap_tlab_flush_self();
+    struct timespec gc_stamp_t0;
+    int gc_stamp = gc_stamp_on();
+    /* v35.03: t0 captured ALWAYS — the pause accounting feeds the diag
+     * fields gms=/gxm= and the [GC-SLOW] watchdog, not just NOJME_GCSTAMP. */
+    clock_gettime(CLOCK_MONOTONIC, &gc_stamp_t0);
+    /* v34.43 PERF-DIAG: global GC collection counter (read racily by the
+     * headless SLOWFRAME telemetry — a plain increment is fine). */
+    g_gc_collections++;
+    {
+        /* v34.9 GC-STALL diag */
+        static volatile int gc_diag_n = 0;
+        int n = ++gc_diag_n;
+        if (n <= 60 || (n % 100) == 0) {
+            extern JavaThread* thread_current(JVM*);
+            JavaThread* t = thread_current(jvm);
+            LOG_SAFE("[GCDIAG] enter gc_collect tid=%d n=%d\n", t ? t->id : -1, n);
+            if (t) {
+                /* v34.9: walk the CALLER'S OWN frames (safe) */
+                JavaFrame* f = t->current_frame;
+                int d = 0;
+                while (f && d < 6) {
+                    LOG_SAFE("[GCDIAG]   [%d] %s.%s pc=%u\n", d,
+                             f->clazz && f->clazz->class_name ? f->clazz->class_name : "?",
+                             f->method && f->method->name ? f->method->name : "?",
+                             (unsigned)f->pc);
+                    f = f->prev; d++;
+                }
+            }
+        }
+        __sync_fetch_and_add(&gc_diag_active, 1);
+    }
+    LOG_SAFE("[GCDIAG] pre-lock: heap owner_valid=%d owner_tid=%d serving=%d next=%d\n",
+             g_heap_owner_valid, g_heap_owner_tid, heap_ticket_serving, heap_ticket_next);
     /* UNCONDITIONAL LOG: Always log GC start for debugging */
     GC_LOG("[GC_TRIGGER] gc_collect() called! heap.current=%p, heap.end=%p, used=%zu bytes\n",
             (void*)heap.current, heap.end, (size_t)(heap.current - heap.start));
@@ -1364,13 +2846,143 @@ void gc_collect(JVM* jvm) {
     GC_DEBUG("heap.allocated=%zu, heap.size=%zu", heap.allocated, heap.size);
     
     /* ИСПРАВЛЕНО: Защита от повторного входа в GC */
-    static bool gc_in_progress = false;
+    static bool gc_in_progress = false; jvm_gc_safepoint_release_local();
     if (gc_in_progress) {
         WARN_LOG("GC already in progress, skipping recursive collection");
         heap_unlock();  /* Release lock before returning */
+        gc_pause_account(&gc_stamp_t0);
         return;
     }
     gc_in_progress = true;
+
+    /* v34.9 SAFEPPOINT: stop the (pthread) world before walking the heap.
+     * Other VM threads park at their next safepoint poll (interpreter loop,
+     * monitor wait/enter, heap_lock wait). Bounded wait: a thread stuck in
+     * a long native cannot hang the GC. */
+    {
+        extern volatile int g_gc_safepoint_request;
+        extern int jvm_gc_safepoint_arrived(void);
+        extern void jvm_gc_safepoint_release(void);
+        extern int jvm_live_vm_thread_count(void);
+        extern int jvm_current_os_thread_is_vm_runner(void);
+        extern int jvm_gc_safepoint_wait_arrivals(int expected, int timeout_ms);
+        /* v34.26 CENSUS FIX: `live - 1` assumed the GC caller is one of the
+         * pthread runners. When gc_collect() runs on the FRONTEND thread
+         * (libretro retro_run drives the main Java thread via execute_frame
+         * on the host's thread), the caller is NOT a runner — every live
+         * runner must park, and live-1 let one mutator keep running through
+         * the sweep (torn-heap risk). Subtract one ONLY if the caller is
+         * actually a registered runner. */
+        int expected = jvm_live_vm_thread_count();
+        if (jvm_current_os_thread_is_vm_runner()) expected -= 1;  /* self */
+        /* v41 CRITICAL (torn-heap fix, see execute.c): the MAIN Java thread
+         * runs on the frontend/headless OS thread and is NOT in the pthread
+         * registry — runner-triggered collections never counted it, so the
+         * mark/sweep ran while the main mutator kept interpreting (freed
+         * live objects => random SIGSEGV / black / corrupted rendering on
+         * weakly-ordered armv7). Count it whenever a driver window is
+         * actively executing it (it parks at the 64-instruction safepoint
+         * poll); skip when it is the CALLER (System.gc() from the MIDlet
+         * itself — thread_current() resolves to main_thread there) or is
+         * quiescent between frontend frames. */
+        {
+            extern JavaThread* thread_current(JVM* jvm);
+            extern volatile int g_jvm_main_thread_executing;
+            if (g_jvm_main_thread_executing &&
+                jvm->main_thread && jvm->main_thread->current_frame &&
+                thread_current(jvm) != jvm->main_thread) {
+                expected += 1;
+            }
+        }
+        gc_diag_expected = expected;
+        if (expected > 0) {
+            g_gc_safepoint_request = 1;
+            /* v34.59 PERF: разбудить СПЯЩИХ (Thread.sleep / кусочные ожидания)
+             * МГНОВЕННО — раньше поток в 50-мс куске nanosleep'а проверял
+             * флаг только на границе куска, и каждый System.gc() 3D-игры
+             * с циклом sleep+gc ждал «застреддера» до 50 мс (fmx: ~40 мс
+             * sp_wait на каждый вызов — половина кадрового бюджета). */
+            {
+                extern void jvm_gc_safepoint_wake_sleepers(void);
+                jvm_gc_safepoint_wake_sleepers();
+                /* v34.65: wake MONITOR waiters too (Object.wait chunks on
+                 * mon->wait_cond) — same rationale as the sleepers above,
+                 * but these were only noticed at chunk boundaries: up to
+                 * 50ms of pause padding per waiting thread on every
+                 * collection in v34.61 (longer with the v34.65 default
+                 * 250ms chunk — which is why this wake is mandatory). */
+                extern void jvm_gc_safepoint_wake_monitors(void);
+                jvm_gc_safepoint_wake_monitors();
+            }
+            /* v34.11 SAFEPOINT-INTEGRITY FIX.
+             * The old code waited only 300ms for the world to stop and then
+             * ran the mark-sweep ANYWAY while stragglers (a thread inside a
+             * long native: Image.createImage/PNG decode, Thread.sleep,
+             * Thread.join, RMS/media I/O — none of which used to poll the
+             * safepoint) were still mutating JVM frames and the heap.
+             * The sweep then freed objects those threads still referenced
+             * -> use-after-free -> the "random hangs in random places"
+             * reported on the Windows build (and occasionally on POSIX).
+             *
+             * New policy: wait up to 2s (generous; stragglers now poll from
+             * sleep/join too), then ABORT this collection instead of
+             * corrupting the heap. The allocation that triggered the GC
+             * simply re-runs it on the next failure once the straggler
+             * reaches a poll — worst case a fully-starved heap throws the
+             * spec-mandated (and catchable) OutOfMemoryError.
+             *
+             * v34.26 PERF (armv7 stutter): the wait itself was a 5ms
+             * nanosleep poll loop — EVERY GC paused >= 5ms even when all
+             * mutators parked in microseconds (30% of a 60fps frame budget
+             * burnt on sleep granularity = the periodic stutter / frame
+             * drops). Now waits on the safepoint condition variable: park()
+             * broadcasts on each arrival, so the collector wakes the instant
+             * the last mutator parks. */
+            int arrived = jvm_gc_safepoint_wait_arrivals(expected, 2000);
+            if (gc_stamp) {
+                /* v50 DIAG (Asphalt 3 3D stall): split the GC pause into
+                 * "waiting for the world to park" vs actual mark/sweep — a
+                 * long sp_wait means one mutator is stuck inside a native
+                 * (M3G render / image decode / I/O) while everyone else is
+                 * already parked; surfaced via [GCSTAMP] sp_wait. */
+                struct timespec spw_t1;
+                clock_gettime(CLOCK_MONOTONIC, &spw_t1);
+                g_gc_last_sp_wait_ms =
+                    (spw_t1.tv_sec - gc_stamp_t0.tv_sec) * 1000.0 +
+                    (spw_t1.tv_nsec - gc_stamp_t0.tv_nsec) / 1e6;
+            }
+            if (arrived < expected) {
+                /* SAFE ABORT: never sweep with live mutators. */
+                LOG_SAFE("[GC-SAFEPOINT-TIMEOUT] only %d/%d VM threads reached "
+                         "the safepoint after 2000ms — GC ABORTED (no sweep, "
+                         "heap untouched; the allocation will retry).\n",
+                         arrived, expected);
+                /* v34.95: arm the backoff window so the immediate retry
+                 * storm cannot turn every allocation into a 2 s stop-the-
+                 * world livelock while the straggler sits in its native. */
+                {
+                    struct timespec ab_ts;
+                    clock_gettime(CLOCK_MONOTONIC, &ab_ts);
+                    jlong ab_now = (jlong)ab_ts.tv_sec * 1000 + ab_ts.tv_nsec / 1000000;
+                    g_gc_backoff_until_ms = ab_now + 400;
+                }
+                /* v34.11: name the stragglers via the last-native tracker */
+                {
+                    extern void jvm_dump_all_threads(void);
+                    jvm_dump_all_threads();
+                }
+                gc_in_progress = false;
+                jvm_gc_safepoint_release_local();
+                heap_unlock();
+                {
+                    int n2 = __sync_fetch_and_add(&gc_diag_active, -1);
+                    (void)n2;
+                }
+                gc_pause_account(&gc_stamp_t0);
+                return;
+            }
+        }
+    }
     
     /* Reset string fix counter for this GC cycle */
     gc_strings_fixed_this_cycle = 0;
@@ -1379,18 +2991,19 @@ void gc_collect(JVM* jvm) {
     if (!gc_mark_stack) {
         if (!gc_mark_stack_init()) {
             ERROR_LOG("Failed to initialize mark stack");
-            gc_in_progress = false;
+            gc_in_progress = false; jvm_gc_safepoint_release_local();
             heap_unlock();  /* Release lock before returning */
+            gc_pause_account(&gc_stamp_t0);
             return;
         }
     }
     
-    size_t start_allocated = heap.allocated;
     gc_mark_stack_top = 0;
     
     GC_DEBUG("root_count=%zu, thread_count=%d, class_count=%zu",
             heap.root_count, jvm->thread_count, jvm->class_loader.count);
     
+    LOG_SAFE("[GCSTAGE] n=%d pre-mark heap_used=%zu\n", __sync_fetch_and_add(&gc_diag_active, 0), (size_t)(heap.current - heap.start));
     /* 1. Mark Phase */
     /* Mark from Roots */
     int roots_pushed = 0;
@@ -1420,6 +3033,11 @@ void gc_collect(JVM* jvm) {
         }
         if (thread->thread_object) {
             if (gc_push_mark(thread->thread_object)) stack_refs_pushed++;
+        }
+        /* FIX (audit S-9, v18): thread_group was never marked and could be
+         * collected out from under live threads */
+        if (thread->thread_group) {
+            if (gc_push_mark(thread->thread_group)) stack_refs_pushed++;
         }
         
         JavaFrame* frame = thread->current_frame;
@@ -1467,6 +3085,29 @@ void gc_collect(JVM* jvm) {
             }
             frame = frame->prev;
             frame_num++;
+        }
+
+        /* v36.03 NATIVE-ARGS-ROOTED: mark the receiver+args of every native
+         * call currently in progress on this thread. The invoke wrappers
+         * popped those slots from the java frame before dispatching, so the
+         * frame scan above cannot see them; without this a GC triggered
+         * INSIDE a native (bytecode toString, jvm_new_string, jvm_new_array,
+         * ...) could sweep the receiver's whole object graph while the
+         * native still walks it through C locals. gc_push_mark validates
+         * every slot against the heap range, so primitive arguments
+         * (ints/floats sharing the JavaValue union) are skipped safely. */
+        for (int d = 0; d < thread->native_arg_depth; d++) {
+            if (d >= NATIVE_ARG_FRAMES_MAX) break;
+            JavaValue* nargs = thread->native_arg_frames[d].args;
+            int ncnt = thread->native_arg_frames[d].count;
+            if (!nargs || ncnt <= 0) continue;
+            for (int k = 0; k < ncnt; k++) {
+                if (nargs[k].ref) {
+                    if (gc_push_mark(nargs[k].ref)) {
+                        stack_refs_pushed++;
+                    }
+                }
+            }
         }
     }
     
@@ -1635,6 +3276,40 @@ void gc_collect(JVM* jvm) {
         }
     }
     GC_LOG("[GC_M3G] Marked %d M3G registry references\n", m3g_refs);
+
+    /* v34.18: extra native M3G GC roots — the pending-render queue
+     * (nodes/transforms captured before bindTarget), the bound camera and
+     * target image, the cached last World and the active Light objects.
+     * These are raw JavaObject* slots in C globals the GC previously could
+     * not see; a collection turned them into dangling pointers (the v15
+     * heap_java_object_valid() guards only caught the symptoms). Mark the
+     * real roots now and clear slots that point at dead objects. */
+    {
+        int extra_n = 0;
+        JavaObject*** extra_slots = m3g_gc_extra_roots(&extra_n);
+        int extra_marked = 0;
+        int extra_cleared = 0;
+        for (int i = 0; i < extra_n; i++) {
+            JavaObject* obj = *(extra_slots[i]);
+            if (obj && is_heap_ptr(obj)) {
+                GCObjectHeader* header = (GCObjectHeader*)((uint8_t*)obj - sizeof(GCObjectHeader));
+                if (header->magic == GC_HEADER_MAGIC && header->type != OBJ_TYPE_FREE) {
+                    if (gc_push_mark(obj)) {
+                        extra_marked++;
+                        GC_LOG("[GC_M3G]   marked native root slot[%d] = %p\n", i, (void*)obj);
+                    }
+                } else {
+                    *extra_slots[i] = NULL;
+                    extra_cleared++;
+                }
+            } else if (obj) {
+                *extra_slots[i] = NULL;
+                extra_cleared++;
+            }
+        }
+        GC_LOG("[GC_M3G] Marked %d extra native roots (cleared %d dead)\n",
+               extra_marked, extra_cleared);
+    }
     
     GC_DEBUG("Mark phase: roots_pushed=%d, stack_refs=%d, static_refs=%d, native_ht_refs=%d, intern_refs=%d, m3g_refs=%d, total_on_stack=%d",
             roots_pushed, stack_refs_pushed, static_refs_pushed, native_ht_refs, intern_refs, m3g_refs, gc_mark_stack_top);
@@ -1653,11 +3328,28 @@ void gc_collect(JVM* jvm) {
     /* 1.5 PRE-SWEEP VALIDATION: Check all live String objects have marked char arrays.
      * This catches use-after-free bugs where the char array was freed before the String.
      * If we find an unmarked array, we must mark it to prevent crashes.
+     *
+     * v34.59 PERF (АДАПТИВНЫЙ ЗАПУСК): это ПОЛНЫЙ ВТОРОЙ обход кучи
+     * (одна кэш-линия на каждый объект) — на 64МБ-куче Asphalt-профиля
+     * с ~800k объектов это добавляло ~50% к стоимости sweep. Начиная
+     * с v34.x mark-фаза САМА помечает value-массив живой строки
+     * (gc_mark_object: GC_KIND_STRING-блок пушит value_ref до обхода
+     * остальных полей), поэтому «живая строка с непомеченным массивом»
+     * в текущей архитектуре невозможно — оба обхода идут под одним
+     * heap_lock с остановленным миром, между ними ничего не меняется.
+     * Политика: первые 3 GC и каждый 8-й — полный аудит (страховка от
+     * регрессий и непредвиденных путей); любая найденная проблема
+     * возвращает ежецикловый режим. Остальные GC пропускают обход.
      */
-    GC_LOG("[GC_PRESWEEP] Validating String objects...\n");
+    static uint32_t presweep_clean_streak = 0;
+    static uint32_t presweep_serial = 0;
     int strings_fixed = 0;
+    int presweep_skipped = 0;
+    presweep_serial++;
+    if (presweep_clean_streak < 3 || (presweep_serial & 7u) == 0u) {
+    GC_LOG("[GC_PRESWEEP] Validating String objects...\n");
     uint8_t* validate_ptr = heap.start;
-    while (validate_ptr < heap.current) {
+    while (validate_ptr < (heap.end < heap.current ? heap.end : heap.current)) {
         GCObjectHeader* header = (GCObjectHeader*)validate_ptr;
         
         /* Skip invalid/corrupted headers */
@@ -1666,10 +3358,12 @@ void gc_collect(JVM* jvm) {
             continue;
         }
         
-        /* Only check live (marked) objects that might be Strings */
+        /* Only check live (marked) objects that might be Strings.
+         * v34.59: бит GC_KIND_STRING вместо strcmp на каждый объект.
+         * (живой объект помечен => gc_mark_object => разметка класса
+         * гарантированно построена). */
         if (header->marked && (header->type == OBJ_TYPE_OBJECT || header->type == OBJ_TYPE_STRING)) {
-            if (header->clazz && header->clazz->class_name &&
-                strcmp(header->clazz->class_name, "java/lang/String") == 0) {
+            if (header->clazz && (gc_class_kind(header->clazz) & GC_KIND_STRING)) {
                 
                 JavaObject* str_obj = (JavaObject*)(header + 1);
                 int value_slot = native_get_string_value_slot(g_jvm_for_instanceof);
@@ -1725,6 +3419,9 @@ void gc_collect(JVM* jvm) {
         
         validate_ptr += header->size;
     }
+    } else {
+        presweep_skipped = 1;
+    }
     
     /* Process any new objects pushed onto mark stack */
     if (gc_mark_stack_top > 0) {
@@ -1732,78 +3429,135 @@ void gc_collect(JVM* jvm) {
         gc_process_mark_stack();
     }
     
-    GC_LOG("[GC_PRESWEEP] Validation complete: fixed %d String objects\n", strings_fixed);
+    if (presweep_skipped) {
+        presweep_clean_streak++;   /* пропуск = доверяем mark-фазе */
+        GC_LOG("[GC_PRESWEEP] SKIPPED full pass (streak=%u)\n", presweep_clean_streak);
+    } else {
+        presweep_clean_streak = (strings_fixed > 0) ? 0 : presweep_clean_streak + 1;
+    }
+    GC_LOG("[GC_PRESWEEP] Validation complete: fixed %d String objects (streak=%u)\n",
+           strings_fixed, presweep_clean_streak);
     
+    LOG_SAFE("[GCSTAGE] pre-sweep\n");
     /* 2. Sweep Phase (Linear Scan + Coalescing) */
     size_t freed_this_cycle = 0;
     size_t objects_freed = 0;
     
-    /* Очищаем старый список свободных блоков, чтобы построить новый упорядоченный */
-    heap.free_list = NULL; 
+    /* v34.58 PERF/FIX: чистим ВСЕ size-class бакеты и large-список —
+     * sweep rebuild'ит их с нуля (инвариант №3). ВАЖНОЕ исправление
+     * старого дефекта: прежний код блоки, УЖЕ свободные к моменту GC
+     * (type==OBJ_TYPE_FREE), просто пропускал — но список-то он к этому
+     * моменту уже обнулил. Такие блоки навсегда выпадали из учёта: память
+     * в середине кучи становилась недоступной, ёмкость деградировала от
+     * GC к GC (маскировалось top-rewind'ом). Теперь старые свободные
+     * блоки вместе с новыми мёртвыми объектами попадают в новые
+     * бакеты, соседние — coalesce'ятся на лету (адреса растут). */
+    for (int c = 0; c < SC_NUM_BUCKETS; c++) heap.free_lists[c] = NULL;
+    heap.large_free_list = NULL;
     
     uint8_t* scan_ptr = heap.start;
     
-    /* Временный список свободных блоков для построения в порядке адреса
-       (используем простой подход: добавляем в конец, но т.к. у нас нет tail, 
-       будем вставлять так, чтобы список был отсортирован, или просто собираем 
-       свободные куски в отдельный список и потом мержим) */
+    /* v34 FIX (VmTest heap death after OOM stress): objects allocated from the
+     * v19 EMERGENCY RESERVE legitimately live beyond heap.end (up to
+     * heap.hard_end) - e.g. the pre-allocated OutOfMemoryError thrown by the
+     * memory tests. The old sweep flagged any object crossing heap.end as
+     * corruption, FAILED TO RECOVER (its recovery scan also refused objects
+     * past heap.end) and ABORTED the whole sweep, leaving heap.current stuck
+     * beyond heap.end forever: the next allocation computed
+     * "Available: (size_t)-1024" and the VM was dead (every ldc/alloc failed).
+     *
+     * Sweep bounds: walk ONLY [heap.start, heap.end). Objects in the reserve
+     * are emergency exception allocations - tiny, bounded by the reserve size,
+     * and reclaimed nowhere (by design: they must stay valid while the heap is
+     * saturated; the pre-allocated OOM singleton covers exhaustion). Walking
+     * the reserve is NOT possible anyway: the linear header chain breaks at
+     * every emergency free/alloc cycle, so any walk past heap.end eventually
+     * reads a zeroed/garbage header ("corrupted magic 0x00000000"). A LIVE
+     * object crossing heap.end is visited (mark bit cleared) and then the
+     * loop stops cleanly at the boundary. */
+    uint8_t* sweep_limit = (heap.end < heap.current) ? heap.end : heap.current;
     
-    /* Для простоты реализации на C без лишних аллокаций:
-       Пройдемся линейно. Свободные блоки будем добавлять в free_list "в конец" 
-       эмулируя это вставкой перед головой, если адрес меньше головы (сортировка по возрастанию).
-       Это позволит легко слить соседние блоки. */
+    /* Absolute object bound for the size sanity check: a crossing emergency
+     * object must fit into the real buffer. */
+    uint8_t* gc_abs_end = (heap.hard_end && heap.hard_end > heap.end)
+                          ? heap.hard_end : heap.end;
     
-    FreeBlock* sorted_free_list = NULL;
+    /* v34.15 FIX (Galaxy on Fire eternal freeze at ~16 MB heap):
+       the old code inserted every freed block into a SORTED list by walking
+       it from the head (O(n) per insert). With a heap full of small dead
+       objects (string churn: ~150k blocks at 16 MB) that is O(n^2) ~ 10^10
+       pointer chases — the sweep "never" returns and the whole VM freezes
+       mid-GC with no log output (THREADDUMP: running, native age growing).
+       v34.58: region-логика — свободные блоки объединяются в регионы
+       на лету (одним проходом, без второй фазы coalescing), каждый
+       закрытый регион O(1) пушится в свой size-class бакет. */
+    FreeBlock* region = NULL;        /* первый блок текущего свободного региона */
+    size_t region_size = 0;          /* накопленный размер региона */
+    FreeBlock* last_pushed = NULL;   /* последний ЗАКРЫТЫЙ регион (для top-rewind) */
+    int last_pushed_cls = -1;
     
-    while (scan_ptr < heap.current) {
+    while (scan_ptr < sweep_limit) {
         GCObjectHeader* header = (GCObjectHeader*)scan_ptr;
-        
-        /* DEBUG: Log every object GC sees (only in debug mode) */
-        GC_DEBUG("[GC_SWEEP] scan_ptr=%p, size=%u, type=%d, marked=%d",
-                (void*)scan_ptr, header->size, header->type, header->marked);
         
         /* Проверка magic number для обнаружения corruption */
         if (header->magic != GC_HEADER_MAGIC && header->type != OBJ_TYPE_FREE) {
+            /* v34.2 FIX (VmTest OOM-loop log spam): under an exhausted heap the
+             * repaint timer re-enters paint() every 250 ms, every failed alloc
+             * triggers a GC, and every GC walked into the same recovered
+             * zeroed-header region - dumping the FULL forensics ring each time
+             * (hundreds of [GC-DIAG2] lines per second, the log grows without
+             * bound). The corruption report itself is one-shot information:
+             * keep the single-line warning for EVERY occurrence, but emit the
+             * heavy heap-walk + alloc-ring dumps only for the first 3. */
+            static int gc_diag_dump_budget = 3;
             ERROR_LOG("GC: Object at %p has corrupted magic: expected 0x%08X, got 0x%08X",
                      (void*)scan_ptr, GC_HEADER_MAGIC, header->magic);
             ERROR_LOG("  header->size=%u, type=%d, marked=%d", 
                      header->size, header->type, header->marked);
+            if (gc_diag_dump_budget > 0) {
+                gc_diag_dump_budget--;
+                gc_diag_dump_heap_walk(scan_ptr);
+                gc_diag_dump_alloc_ring(scan_ptr);
+            } else if (gc_diag_dump_budget == 0) {
+                gc_diag_dump_budget--;
+                ERROR_LOG("[GC-DIAG2] further corruption dumps suppressed (forensics budget spent)");
+            }
             
             HEAP_CORRUPTION_LOG("CORRUPTION_MAGIC: addr=%p, expected=0x%08X, got=0x%08X, size=%u, type=%d",
                     (void*)scan_ptr, GC_HEADER_MAGIC, header->magic, header->size, header->type);
-            
-            /* Пробуем восстановиться - ищем следующий валидный объект */
-            uint8_t* recovery_ptr = scan_ptr + 8;
-            bool found_valid = false;
-            
-            while (recovery_ptr < heap.current - sizeof(GCObjectHeader)) {
-                GCObjectHeader* test_header = (GCObjectHeader*)recovery_ptr;
-                
-                if (test_header->magic == GC_HEADER_MAGIC &&
-                    test_header->size > sizeof(GCObjectHeader) && 
-                    test_header->size <= heap.size &&
-                    test_header->type <= OBJ_TYPE_CLASS) {
-                    
-                    ERROR_LOG("  Found valid object at %p, continuing from there", recovery_ptr);
-                    HEAP_CORRUPTION_LOG("CORRUPTION_RECOVERY: found valid at %p, skipped %ld bytes",
-                            (void*)recovery_ptr, (long)(recovery_ptr - scan_ptr));
-                    scan_ptr = recovery_ptr;
-                    found_valid = true;
-                    break;
-                }
-                recovery_ptr += 8;
+
+            /* v34.71 CRITICAL FIX: SAFE ABORT instead of the recovery resync.
+             *
+             * The old "resync forward to the next valid-looking header" was
+             * fundamentally unsound: after a desync the walk no longer knows
+             * the block boundaries, so every free region it pushed afterwards
+             * could cover LIVE objects. Empirically (Nescube, NOJME_ALLOC_LOG
+             * forensics) that produced overlapping allocations — real objects
+             * carved over live ones — and SIGSEGVs minutes later (the
+             * user-reported settings-Cancel crash). Aborting is safe: the
+             * regions pushed SO FAR are exact (chains of verified-dead
+             * blocks); everything beyond the corruption point keeps its state
+             * and is reclaimed by the next collection (which re-marks and
+             * re-walks). The worst case is a bounded capacity leak, never a
+             * structural corruption. */
+            ERROR_LOG("  [GC] sweep SAFE-ABORT at corruption (no resync; "
+                     "remainder reclaimed next collection)");
+            if (region) {
+                region->size = (uint32_t)region_size;
+                region->next = NULL;
+                last_pushed_cls = sc_push_free(region);
+                last_pushed = region;
+                region = NULL;
+                region_size = 0;
             }
-            
-            if (!found_valid) {
-                ERROR_LOG("  Could not recover, aborting GC sweep");
-                HEAP_CORRUPTION_LOG("CORRUPTION_FATAL: cannot recover, sweep aborted");
-                break;
-            }
-            continue;
+            break;
         }
         
         /* Защита от порчи памяти в куче */
-        if (header->size == 0 || header->size > heap.size || scan_ptr + header->size > heap.end) {
+        /* v34: объекты из emergency-резерва могут выходить за heap.end - это
+         * НЕ corruption, если они укладываются в hard_end (см. комментарий выше). */
+        if (header->size == 0 || header->size > heap.size ||
+            scan_ptr + header->size > gc_abs_end) {
             ERROR_LOG("Corruption detected at %p, attempting recovery", scan_ptr);
             ERROR_LOG("  header->size=%u, heap.size=%zu", header->size, heap.size);
             ERROR_LOG("  scan_ptr=%p, heap.end=%p", scan_ptr, heap.end);
@@ -1835,64 +3589,56 @@ void gc_collect(JVM* jvm) {
                 HEAP_CORRUPTION_LOG("CORRUPTION_GAP: prev_end=%p, gap=%ld bytes",
                         (void*)prev_obj_end, (long)(scan_ptr - prev_obj_end));
             }
-            
-            /* ИСПРАВЛЕНИЕ: Пытаемся восстановиться, пропуская повреждённый регион.
-             * Сканируем память побайтово в поисках следующего валидного заголовка.
-             * Валидный заголовок должен иметь:
-             * - size > 0 и size < heap.size
-             * - type в диапазоне 0..OBJ_TYPE_CLASS
-             * - clazz указывает на валидный JavaClass (проверяем что class_name не NULL)
-             */
-            ERROR_LOG("  Attempting to find next valid object...");
-            uint8_t* recovery_ptr = scan_ptr + 8;  /* Начинаем со следующего выровненного адреса */
-            bool found_valid = false;
-            
-            while (recovery_ptr < heap.current - sizeof(GCObjectHeader)) {
-                GCObjectHeader* test_header = (GCObjectHeader*)recovery_ptr;
-                
-                /* Проверяем, выглядит ли это как валидный заголовок */
-                if (test_header->size > sizeof(GCObjectHeader) && 
-                    test_header->size <= heap.size &&
-                    test_header->type <= OBJ_TYPE_CLASS &&
-                    recovery_ptr + test_header->size <= heap.end) {
-                    
-                    /* Дополнительная проверка: clazz должен указывать на что-то разумное */
-                    if (test_header->clazz == NULL || 
-                        (test_header->clazz->class_name != NULL && 
-                         (uintptr_t)test_header->clazz > 0x10000)) {
-                        ERROR_LOG("  Found potential valid object at %p (size=%u, type=%d)",
-                                 (void*)recovery_ptr, test_header->size, test_header->type);
-                        HEAP_CORRUPTION_LOG("CORRUPTION_RECOVERY: found valid at %p, skipped %ld bytes",
-                                (void*)recovery_ptr, (long)(recovery_ptr - scan_ptr));
-                        scan_ptr = recovery_ptr;
-                        found_valid = true;
-                        break;
-                    }
-                }
-                recovery_ptr += 8;  /* Продвигаемся с шагом выравнивания */
+
+            /* v34.71: SAFE ABORT — same rationale as the magic-corruption path
+             * above (the resync could push free regions over live objects).
+             * Close the open region (exact, verified-dead blocks only) and
+             * stop sweeping; the remainder is reclaimed next collection. */
+            ERROR_LOG("  [GC] sweep SAFE-ABORT at size corruption (no resync)");
+            if (region) {
+                region->size = (uint32_t)region_size;
+                region->next = NULL;
+                last_pushed_cls = sc_push_free(region);
+                last_pushed = region;
+                region = NULL;
+                region_size = 0;
             }
-            
-            if (!found_valid) {
-                ERROR_LOG("  Could not find valid object, aborting sweep");
-                HEAP_CORRUPTION_LOG("CORRUPTION_FATAL: cannot recover from size corruption, sweep aborted");
-                break;
-            }
-            
-            /* Продолжаем sweep с найденной позиции */
-            continue;
+            break;
         }
         
-        /* Пропускаем свободные блоки (они уже в free list) */
+        /* v34.58: блок, уже свободный ДО этого GC, тоже попадает в новые
+         * бакеты (раньше выпадал из учёта навсегда — см. комментарий в
+         * начале sweep). Он может слиться с текущим свободным регионом. */
         if (header->type == OBJ_TYPE_FREE) {
-            /* Этот блок уже свободен, пропускаем его при sweep */
-            /* Он будет добавлен в sorted_free_list ниже как часть коалесцинга */
+            if (scan_ptr + header->size <= heap.end) {
+                if (region && (uint8_t*)region + region_size == scan_ptr) {
+                    region_size += header->size;   /* слияние на лету */
+                } else {
+                    if (region) {
+                        region->size = (uint32_t)region_size;
+                        region->next = NULL;
+                        last_pushed_cls = sc_push_free(region);
+                        last_pushed = region;
+                    }
+                    region = (FreeBlock*)header;
+                    region_size = header->size;
+                }
+            }
             scan_ptr += header->size;
             continue;
         }
         
         if (header->marked || header->pinned) {
-            /* Объект жив */
+            /* Объект жив: сброс метки + закрыть свободный регион */
             header->marked = 0; /* Сброс метки */
+            if (region) {
+                region->size = (uint32_t)region_size;
+                region->next = NULL;
+                last_pushed_cls = sc_push_free(region);
+                last_pushed = region;
+                region = NULL;
+                region_size = 0;
+            }
         } else {
             /* Объект мертв - логируем для отладки */
             GC_LOG("[GC_SWEEP] FREEING object at %p (header=%p): size=%u, type=%d, clazz=%s\n",
@@ -1916,85 +3662,110 @@ void gc_collect(JVM* jvm) {
              * native peer (g_hashtables entry) to prevent:
              * 1. Memory leak of native entries array
              * 2. Use-after-free when GC scans freed native memory (deadbeef pattern)
-             */
-            if (header->clazz && header->clazz->class_name &&
-                strcmp(header->clazz->class_name, "java/util/Hashtable") == 0) {
+             *
+             * v34.59 PERF: бит GC_KIND_HT (strcmp имени класса — ОДИН раз
+             * на класс при первой встрече) вместо strcmp НА КАЖДЫЙ мёртвый
+             * объект: на churn-профилях умирают сотни тысяч объектов за GC.
+             * gc_class_kind() здесь безопасен: sweep идёт под heap_lock с
+             * остановленным миром; для класса без слотов это только
+             * установка битов. */
+            if (header->clazz && (gc_class_kind(header->clazz) & GC_KIND_HT)) {
                 
                 JavaObject* ht = (JavaObject*)(header + 1);
                 
-                /* Get the peer index from the threshold field */
-                JavaValue peer_val = native_get_field_value(ht, "threshold");
-                jint peer_idx = peer_val.i;
-                
-                if (peer_idx >= 0 && peer_idx < GC_HASHTABLE_MAX_HASHTABLES && g_hashtable_peer_alive[peer_idx]) {
-                    GC_LOG("[GC_SWEEP] Freeing native Hashtable peer for idx %d\n", peer_idx);
-                    
-                    /* Use the helper function to free the peer */
-                    hashtable_free_peer(peer_idx);
+                /* v36.33 [HT-PEER-SWEEP]: free the peer OWNED by this object
+                 * (ht_obj pointer match). The old code read the object's
+                 * "threshold" field as a peer index — but "threshold" is a
+                 * live Java field the class itself may set (initialCapacity
+                 * semantics), so a random value freed ANOTHER live
+                 * hashtable's peer (entries NULLed mid-flight, its future
+                 * put/get silently dataless) while THIS object's own peer
+                 * survived with dangling keys into the swept arena. */
+                for (int pi = 0; pi < g_hashtable_count && pi < GC_HASHTABLE_MAX_HASHTABLES; pi++) {
+                    if (g_hashtable_peer_alive[pi] && g_hashtables[pi].ht_obj == ht) {
+                        GC_LOG("[GC_SWEEP] Freeing native Hashtable peer idx %d (pointer match)\n", pi);
+                        hashtable_free_peer(pi);
+                        break;
+                    }
                 }
             }
             
             /* Помечаем как свободный */
             header->type = OBJ_TYPE_FREE;
+            /* v34.58: валидный magic у свободного блока — линейные обходы
+             * (presweep-валидация String, heap_validate, heap_check_magic)
+             * прыгают по size целыми регионами, а не сканируют внутренности
+             * 8-байтовым шагом. Recovery-сканы отличают свободные блоки по
+             * type > OBJ_TYPE_CLASS, так что они не путают их с живыми. */
+            header->magic = GC_HEADER_MAGIC;
             
-            /* Добавляем в сортированный список свободных блоков */
-            FreeBlock* block = (FreeBlock*)header;
-            block->size = header->size;
-            
-            /* Вставка в сортированный список (по возрастанию адреса) */
-            FreeBlock** curr = &sorted_free_list;
-            while (*curr && (uint8_t*)(*curr) < (uint8_t*)block) {
-                curr = &((*curr)->next);
+            /* v34: блоки, уходящие за heap.end (пересечение с emergency-
+             * резервом), в free list НЕ добавляются - обычные аллокации
+             * должны жить строго ниже heap.end (см. комментарий к sweep_limit). */
+            if (scan_ptr + header->size <= heap.end) {
+                if (region && (uint8_t*)region + region_size == scan_ptr) {
+                    region_size += header->size;   /* слияние с предыдущим свободным */
+                } else {
+                    if (region) {
+                        region->size = (uint32_t)region_size;
+                        region->next = NULL;
+                        last_pushed_cls = sc_push_free(region);
+                        last_pushed = region;
+                    }
+                    region = (FreeBlock*)header;
+                    region_size = header->size;
+                }
             }
-            block->next = *curr;
-            *curr = block;
         }
         
         scan_ptr += header->size;
     }
     
-    /* 3. Coalescing (Слияние соседних блоков) */
-    FreeBlock* fb = sorted_free_list;
-    while (fb && fb->next) {
-        /* Проверяем, лежит ли следующий блок сразу за текущим */
-        if ((uint8_t*)fb + fb->size == (uint8_t*)fb->next) {
-            /* Сливаем */
-            fb->size += fb->next->size;
-            fb->next = fb->next->next;
-            /* Не продвигаем fb, так как новый блок может теперь merger'ся со следующим */
-        } else {
-            fb = fb->next;
-        }
+    /* v34.58: закрываем хвостовой свободный регион (если остался) */
+    if (region) {
+        region->size = (uint32_t)region_size;
+        region->next = NULL;
+        last_pushed_cls = sc_push_free(region);
+        last_pushed = region;
+        region = NULL;
     }
     
-    heap.free_list = sorted_free_list;
+    /* 3. Coalescing — НЕ нужен отдельным проходом: v34.58 сливает соседние
+     * свободные блоки на лету прямо в sweep-цикле (регионы). Все бакеты
+     * уже заполнены sc_push_free(). */
     
-    /* Статистика */
-    heap.allocated -= freed_this_cycle;
-    heap.freed += freed_this_cycle;
+    /* Статистика. v34.59 FIX (race): вычитание атомарно для симметрии —
+     * во время sweep мир остановлен (конкурентных fast-path добавлений
+     * нет), но атомарность здесь дешёвая и страхует будущие изменения. */
+    __sync_sub_and_fetch(&heap.allocated, freed_this_cycle);
+    __sync_add_and_fetch(&heap.freed, freed_this_cycle);
     heap.gc_cycles++;
     heap.gc_total_freed += freed_this_cycle;
     
-    /* Если мы освободили блок в конце кучи, можем подвинуть current назад (Defragmentation of top) */
-    if (heap.free_list) {
-        /* Найдем самый большой свободный блок. Если он в конце кучи, уменьшим current. */
-        FreeBlock* last = heap.free_list;
-        FreeBlock* last_prev = NULL;
-        while (last->next) {
-            last_prev = last;
-            last = last->next;
-        }
-        
-        if ((uint8_t*)last + last->size == heap.current) {
-            /* Этот блок в самом конце кучи */
-            heap.current = (uint8_t*)last;
-            if (last_prev) {
-                last_prev->next = NULL;
-            } else {
-                heap.free_list = NULL;
+    /* Если мы освободили блок в конце кучи, можем подвинуть current назад
+     * (Defragmentation of top).
+     * v34.58: последний закрытый регион — самый высокий по адресу
+     * (walk восходящий, он был запушен последним => голова своего
+     * бакета), поэтому никакого хождения до хвоста списка не нужно:
+     * просто проверяем, кончается ли он ровно на heap.current. */
+    if (last_pushed && last_pushed_cls >= 0 &&
+        (uint8_t*)last_pushed + last_pushed->size == heap.current) {
+        int popped = 0;
+        if (last_pushed_cls == SC_LARGE_IDX) {
+            if (heap.large_free_list == last_pushed) {
+                heap.large_free_list = last_pushed->next;
+                popped = 1;
             }
-            /* Память возвращена системе (bump pointer уменьшен) */
+        } else if (heap.free_lists[last_pushed_cls] == last_pushed) {
+            heap.free_lists[last_pushed_cls] = last_pushed->next;
+            popped = 1;
         }
+        if (popped) {
+            /* Память возвращена bump-области (указатель current уменьшен) */
+            heap.current = (uint8_t*)last_pushed;
+        }
+        /* Если голова бакета не совпала (не должно случаться — пуш был
+         * последним) — оставляем блок в бакете, rewind не делаем. */
     }
 
     if (freed_this_cycle > 0) {
@@ -2010,11 +3781,39 @@ void gc_collect(JVM* jvm) {
     native_gc_notify();
     
     GC_DEBUG("========== gc_collect() END ==========");
-    
+
     /* Сброс флага GC */
-    gc_in_progress = false;
+    gc_in_progress = false; jvm_gc_safepoint_release_local();
+    /* v34.11: the counter was decremented twice here (once in the diag block
+     * and once after heap_unlock), driving it negative over time. Decrement
+     * exactly once and keep the single diagnostic line. */
+    {
+        int n = __sync_fetch_and_add(&gc_diag_active, -1);
+        extern JavaThread* thread_current(JVM*);
+        JavaThread* t2 = thread_current(jvm);
+        LOG_SAFE("[GCDIAG] exit  gc_collect tid=%d n=%d\n", t2 ? t2->id : -1, n);
+        if (gc_stamp) {
+            struct timespec gc_stamp_t1;
+            clock_gettime(CLOCK_MONOTONIC, &gc_stamp_t1);
+            long dur_us = (gc_stamp_t1.tv_sec - gc_stamp_t0.tv_sec) * 1000000L +
+                          (gc_stamp_t1.tv_nsec - gc_stamp_t0.tv_nsec) / 1000;
+            char line[160];
+            int ln = snprintf(line, sizeof(line),
+                    "[GCSTAMP] dur=%.1fms sp_wait=%.1fms used=%zukb freed=%zukb cycles=%zu heap=%zukb\n",
+                    dur_us / 1000.0, g_gc_last_sp_wait_ms,
+                    (size_t)(heap.current - heap.start) / 1024,
+                    freed_this_cycle / 1024, heap.gc_cycles,
+                    (size_t)(heap.end - heap.start) / 1024);
+            if (ln > 0) fwrite(line, 1, (size_t)ln, stderr);
+        }
+    }
     
     /* CRITICAL: Release heap lock after GC completes */
+    /* v35.04 PERIODIC GC: rebase the allocation budget on the post-GC
+     * watermark. Only the MAIN successful path rebases; the backoff /
+     * recursive-skip early returns must not (they collected nothing). */
+    g_gc_alloc_at_last_gc = heap.allocated;
+    gc_pause_account(&gc_stamp_t0);
     heap_unlock();
 }
 
@@ -2027,6 +3826,18 @@ void gc_add_root(JVM* jvm, void** root) {
      * Without this, concurrent GC could read the roots array while
      * we're reallocating it, causing memory corruption. */
     heap_lock();
+    
+    /* v35.08: idempotent registration - the same slot registered twice
+     * within one heap lifetime must not create two entries (marking twice
+     * is harmless, but callers relied on "registered" flags instead, which
+     * broke re-registration after the per-session roots reset). Linear scan
+     * is fine: the live root list is small (dozens, rarely hundreds). */
+    for (size_t i = 0; i < heap.root_count; i++) {
+        if (heap.roots[i] == root) {
+            heap_unlock();
+            return;
+        }
+    }
     
     if (heap.root_count >= heap.root_capacity) {
         /* ИСПРАВЛЕНО: Проверка успешности realloc */
@@ -2060,6 +3871,24 @@ void gc_remove_root(JVM* jvm, void** root) {
             return;
         }
     }
+    
+    heap_unlock();
+}
+
+/* v35.08 MULTI-SESSION: see include/heap.h for the contract. NULLs every
+ * registered root slot (all of them live in static storage - see the
+ * header comment for why that is safe), then empties the list. The roots
+ * ARRAY itself stays allocated (heap_destroy frees it; heap_init
+ * re-creates it on the next session). */
+void gc_roots_reset_all(void) {
+    heap_lock();
+    
+    for (size_t i = 0; i < heap.root_count; i++) {
+        if (heap.roots[i]) {
+            *heap.roots[i] = NULL;
+        }
+    }
+    heap.root_count = 0;
     
     heap_unlock();
 }
@@ -2218,11 +4047,28 @@ bool object_instance_of(void* object, JavaClass* clazz) {
                     if (array->element_class && array->element_class->class_name) {
                         /* Build expected array class name from element class using static buffer
                          * CRITICAL FIX: No malloc - use static buffer instead */
-                        size_t elem_name_len = strlen(array->element_class->class_name);
-                        if (elem_name_len + 4 <= INSTANCEOF_BUFFER_SIZE) {
+                        const char* elem_name = array->element_class->class_name;
+                        size_t elem_name_len = strlen(elem_name);
+                        /* v24 FIX (Brick Breaker load hang): when the element is
+                         * ITSELF an array, element_class->class_name is already a
+                         * descriptor ("[I", "[Ljava/lang/String;", ...). The
+                         * enclosing array's type name is "[" + elem_name ("[[I"),
+                         * NOT "[L" + elem_name + ";" (which produced the nonsense
+                         * "[L[I;" and failed every checkcast/instanceof on
+                         * int[][]/String[][] walls -> infinite exception cascade
+                         * that killed the game's loader ~1/3 through). */
+                        if (elem_name[0] == '[') {
+                            if (elem_name_len + 2 <= INSTANCEOF_BUFFER_SIZE) {
+                                instanceof_buffer[0] = '[';
+                                memcpy(instanceof_buffer + 1, elem_name, elem_name_len + 1);
+                                if (strcmp(clazz->class_name, instanceof_buffer) == 0) {
+                                    return true;
+                                }
+                            }
+                        } else if (elem_name_len + 4 <= INSTANCEOF_BUFFER_SIZE) {
                             instanceof_buffer[0] = '[';
                             instanceof_buffer[1] = 'L';
-                            memcpy(instanceof_buffer + 2, array->element_class->class_name, elem_name_len);
+                            memcpy(instanceof_buffer + 2, elem_name, elem_name_len);
                             instanceof_buffer[elem_name_len + 2] = ';';
                             instanceof_buffer[elem_name_len + 3] = '\0';
                             
@@ -2508,11 +4354,36 @@ jsize string_length(JavaString* str) {
     return 0;
 }
 
+/* v36.09: every NULL this function hands out is a real field bug — stale
+ * pointer, freed block, broken value field. This is the class of failure
+ * that became the silent Doom RPG [Rus] "null.str" corruption (substring
+ * -> NULL -> concat -> bogus resource name -> readFully spin). Name the
+ * poison in the device trace (rate-limited: first 8 hits verbatim). */
+static void string_chars_null_trace(const JavaString* str, const char* why) {
+    static int n = 0;
+    if (n >= 8) return;
+    n++;
+    {
+        extern void sw_trace_force(const char* fmt, ...) __attribute__((weak));
+        if (&sw_trace_force && sw_trace_force) {
+            int in_heap = str ? (int)is_heap_ptr((const void*)str) : -1;
+            int hdr_type = -1;
+            if (in_heap == 1) {
+                GCObjectHeader* h = ((GCObjectHeader*)str) - 1;
+                hdr_type = (int)h->type;
+            }
+            sw_trace_force("[STR-CHARS-NULL] #%d str=%p why=%s in_heap=%d hdr_type=%d",
+                           n, (const void*)str, why, in_heap, hdr_type);
+        }
+    }
+}
+
 const jchar* string_chars(JavaString* str) {
     if (!str) return NULL;
     
     /* CRITICAL: First check if this is a valid object (not freed) */
     if (!is_heap_ptr(str)) {
+        string_chars_null_trace(str, "not-heap-ptr");
         return NULL;
     }
     
@@ -2520,6 +4391,7 @@ const jchar* string_chars(JavaString* str) {
     
     /* CRITICAL: Check if object was freed by GC */
     if (gc_header->type == OBJ_TYPE_FREE) {
+        string_chars_null_trace(str, "freed-block");
         return NULL;
     }
     
@@ -2535,13 +4407,31 @@ const jchar* string_chars(JavaString* str) {
             int value_slot = native_get_string_value_slot(g_jvm_for_instanceof);
             if (value_slot >= 0 && value_slot < (int)(gc_header->size / sizeof(JavaValue))) {
                 JavaArray* char_array = (JavaArray*)obj->fields[value_slot].ref;
-                if (char_array) {
-                    return (const jchar*)array_data(char_array);
+                /* v34.80 ARMv7 crash fix (reproduced under qemu-arm, Stalker,
+                 * ~60% of runs, SIGSEGV in libc with r0=0x65): a STALE str
+                 * pointer (object moved/reused by a GC that ran while this
+                 * C frame held the raw pointer) sails through the is_heap_ptr
+                 * + non-FREE checks above, and fields[value_slot].ref then
+                 * reads whatever now lives in that slot — observed 0x45,
+                 * returned as (jchar*)(0x45 + 32) = 0x65 and dereferenced
+                 * by the caller's libc string call. str itself is already
+                 * validity-checked above; extend the SAME discipline to the
+                 * char array before handing out array_data(): heap range,
+                 * live non-FREE block, array type, T_CHAR elements. Valid
+                 * strings take the same path as before; garbage now yields
+                 * NULL, which every caller already handles ("if (!chars ...)"). */
+                if (char_array && is_heap_ptr(char_array)) {
+                    GCObjectHeader* arr_hdr = (GCObjectHeader*)char_array - 1;
+                    if (arr_hdr->type == OBJ_TYPE_ARRAY &&
+                        char_array->element_type == T_CHAR) {
+                        return (const jchar*)array_data(char_array);
+                    }
                 }
             }
         }
     }
     
+    string_chars_null_trace(str, "value-field-invalid");
     return NULL;
 }
 
@@ -2561,9 +4451,20 @@ const jchar* string_chars(JavaString* str) {
  *   Use this when you need to store the string for later use.
  */
 
-/* Thread-local buffer for string_utf8 — each thread gets its own buffer */
-static __thread char* string_utf8_tls_buffer = NULL;
-static __thread size_t string_utf8_tls_buffer_size = 0;
+/* Thread-local buffer for string_utf8 — each thread gets its own buffer.
+ * v34.29 FIX (JBenchmark 3D "text drawn twice"): the single reusable TLS
+ * buffer made every returned pointer alias the PREVIOUS call's result.
+ * Real MIDP renderers legitimately hold several strings at once — e.g.
+ * render_stringitem reads Item label and Item text back-to-back and drew
+ * the TEXT twice (label draw used the clobbered buffer). A ring of four
+ * buffers keeps the documented "valid until next call" contract for
+ * single-use callers while making the common label+text / title+text /
+ * old+insert patterns safe. Callers that need a pointer to outlive four
+ * further conversions must still use string_utf8_copy(). */
+#define STRING_UTF8_TLS_SLOTS 4
+static __thread char* string_utf8_tls_buffers[STRING_UTF8_TLS_SLOTS];
+static __thread size_t string_utf8_tls_buffer_sizes[STRING_UTF8_TLS_SLOTS];
+static __thread unsigned string_utf8_tls_ring = 0;
 
 const char* string_utf8(JVM* jvm, JavaString* str) {
     (void)jvm;
@@ -2605,18 +4506,22 @@ const char* string_utf8(JVM* jvm, JavaString* str) {
         return result;
     }
     
-    /* For Java objects, use thread-local buffer (reused, NOT thread-safe) */
-    if (string_utf8_tls_buffer_size < required_size) {
+    /* For Java objects, use a thread-local ring buffer: the returned
+     * pointer stays valid until FOUR more string_utf8 calls on this
+     * thread (see the block comment above for why more than one is
+     * needed). */
+    unsigned slot = (string_utf8_tls_ring++) % STRING_UTF8_TLS_SLOTS;
+    if (string_utf8_tls_buffer_sizes[slot] < required_size) {
         /* Grow the buffer */
         size_t new_size = required_size * 2;
         if (new_size < 256) new_size = 256;
-        char* new_buffer = (char*)realloc(string_utf8_tls_buffer, new_size);
+        char* new_buffer = (char*)realloc(string_utf8_tls_buffers[slot], new_size);
         if (!new_buffer) return NULL;
-        string_utf8_tls_buffer = new_buffer;
-        string_utf8_tls_buffer_size = new_size;
+        string_utf8_tls_buffers[slot] = new_buffer;
+        string_utf8_tls_buffer_sizes[slot] = new_size;
     }
     
-    char* p = string_utf8_tls_buffer;
+    char* p = string_utf8_tls_buffers[slot];
     for (jsize i = 0; i < len; i++) {
         jchar c = chars[i];
         if (c < 0x80) {
@@ -2632,7 +4537,7 @@ const char* string_utf8(JVM* jvm, JavaString* str) {
     }
     *p = '\0';
     
-    return string_utf8_tls_buffer;
+    return string_utf8_tls_buffers[slot];
 }
 
 /* 
@@ -2645,12 +4550,15 @@ char* string_utf8_copy(JVM* jvm, JavaString* str) {
     return strdup(cached);
 }
 
-/* Cleanup thread-local buffer (call at JVM shutdown) */
+/* Cleanup thread-local buffers (call at JVM shutdown) */
 void string_utf8_cleanup(void) {
-    /* Only clean current thread's buffer */
-    free(string_utf8_tls_buffer);
-    string_utf8_tls_buffer = NULL;
-    string_utf8_tls_buffer_size = 0;
+    /* Only clean current thread's buffers */
+    for (int i = 0; i < STRING_UTF8_TLS_SLOTS; i++) {
+        free(string_utf8_tls_buffers[i]);
+        string_utf8_tls_buffers[i] = NULL;
+        string_utf8_tls_buffer_sizes[i] = 0;
+    }
+    string_utf8_tls_ring = 0;
 }
 
 bool string_equals(JavaString* a, JavaString* b) {
@@ -2690,10 +4598,14 @@ jint string_hash(JavaString* str) {
     const jchar* chars = string_chars(str);
     if (!chars) return 0;
     
-    jint hash = 0;
+    /* Java String.hashCode(): int overflow is INTENTIONAL (spec wraps).
+     * Compute in uint32_t to avoid C signed-overflow UB (gcc-15 -O2 can
+     * miscompile the signed version — observed crash on MinGW). */
+    uint32_t hash32 = 0;
     for (jsize i = 0; i < len; i++) {
-        hash = 31 * hash + chars[i];
+        hash32 = 31u * hash32 + chars[i];
     }
+    jint hash = (jint)hash32;
     
     /* Cache hash for native strings */
     if (is_native_string(str)) {
@@ -2705,16 +4617,27 @@ jint string_hash(JavaString* str) {
 
 void heap_dump(JVM* jvm) {
     (void)jvm;
-    printf("=== Heap Dump ===\n");
-    printf("Total: %zu bytes\n", heap.size);
-    printf("Used: %zu bytes\n", heap.allocated);
-    printf("Free List Blocks: ");
+    /* v34.30: route through the fprintf intercept (gate + gnu_printf
+     * checking) — the raw printf() call bypassed both and warned on MinGW
+     * (ms_printf header decl rejects %zu) and printed wrong values on
+     * msvcrt at runtime. stdout passes the gate unconditionally. */
+    fprintf(stdout, "=== Heap Dump ===\n");
+    fprintf(stdout, "Total: %zu bytes\n", heap.size);
+    fprintf(stdout, "Used: %zu bytes\n", heap.allocated);
+    fprintf(stdout, "Free List Blocks: ");
     
+    /* v34.58: перебираем size-class бакеты + large-список */
     int count = 0;
-    FreeBlock* fb = heap.free_list;
-    while(fb && count < 10) {
+    for (int c = 0; c < SC_NUM_BUCKETS && count < 10; c++) {
+        FreeBlock* fb = heap.free_lists[c];
+        while (fb && count < 10) {
+            printf("[%p:%u] ", fb, (unsigned int)fb->size);
+            fb = fb->next;
+            count++;
+        }
+    }
+    for (FreeBlock* fb = heap.large_free_list; fb && count < 10; fb = fb->next) {
         printf("[%p:%u] ", fb, (unsigned int)fb->size);
-        fb = fb->next;
         count++;
     }
     printf("\n");
@@ -2741,7 +4664,15 @@ void heap_validate(JVM* jvm) {
     size_t computed_allocated = 0;
     size_t object_count = 0;
     uint8_t* ptr = heap.start;
-    
+
+    /* v34.59 TLAB: линейный обход требует ЗАКРЫТЫХ чанков. Свой чанк
+     * закрываем здесь (TLAB-остаток — валидный свободный блок, но НЕ в
+     * списках, поэтому computed_allocated его не считает — корректно:
+     * он и не прибавлялся). Чанки ДРУГИХ потоков видны только под
+     * stop-the-world — вызывайте heap_validate из GC-контекста или с
+     * NOJME_TLAB=0. */
+    heap_tlab_flush_self();
+
     while (ptr < heap.current) {
         GCObjectHeader* h = (GCObjectHeader*)ptr;
         if (h->size == 0 || h->size > heap.size || ptr + h->size > heap.end) {
@@ -2771,7 +4702,11 @@ int heap_check_magic(JVM* jvm) {
     (void)jvm;
     int corrupt_count = 0;
     uint8_t* ptr = heap.start;
-    
+
+    /* v34.59 TLAB: аналогично heap_validate — только закрытые чанки
+     * (см. комментарий там). */
+    heap_tlab_flush_self();
+
     while (ptr < heap.current) {
         GCObjectHeader* h = (GCObjectHeader*)ptr;
         

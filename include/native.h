@@ -41,6 +41,14 @@ int native_register_methods(JVM* jvm, const NativeMethodEntry* methods, int coun
 NativeMethod native_find(JVM* jvm, const char* class_name,
                          const char* method_name, const char* descriptor);
 
+/* v34.76: descriptor-relaxed fallback for legacy games compiled against
+ * non-standard API stubs (e.g. Roboros' void LayerManager.append).
+ * Tolerates return-type-only descriptor differences; the argument section
+ * must match byte-for-byte. Call only AFTER the exact native_find() chain
+ * missed, so exact superclass matches keep precedence. */
+NativeMethod native_find_relaxed(JVM* jvm, const char* class_name,
+                                 const char* method_name, const char* descriptor);
+
 /*
  * Standard Java native methods
  */
@@ -113,6 +121,9 @@ void native_throw_npe(JVM* jvm, JavaThread* thread);
 /* Throw ArrayIndexOutOfBoundsException */
 void native_throw_aioobe(JVM* jvm, JavaThread* thread, jint index);
 
+/* Throw StringIndexOutOfBoundsException (String/StringBuffer methods) */
+void native_throw_sioobe(JVM* jvm, JavaThread* thread, jint index);
+
 /* Throw ClassNotFoundException */
 void native_throw_cnfe(JVM* jvm, JavaThread* thread, const char* name);
 
@@ -130,6 +141,40 @@ void native_throw_array_store_exception(JVM* jvm, JavaThread* thread);
 
 /* Throw IOException */
 void native_throw_ioe(JVM* jvm, JavaThread* thread, const char* message);
+
+/* v18 (audit): Generic — throw exception by internal class name
+ * (e.g. "java/lang/IllegalMonitorStateException") */
+void native_throw_named_exception(JVM* jvm, JavaThread* thread, const char* class_name, const char* message);
+
+/* v18 (audit): Throw IllegalStateException */
+void native_throw_illegal_state(JVM* jvm, JavaThread* thread, const char* message);
+
+/* v18 (audit): Throw IllegalMonitorStateException */
+void native_throw_illegal_monitor_state(JVM* jvm, JavaThread* thread);
+
+/* v18 (audit T-1): deliver MIDlet.destroyApp(unconditional) on shutdown paths.
+ * Implemented in native.c; safe to call repeatedly / when no midlet runs. */
+void midlet_call_destroy_app(JVM* jvm, bool unconditional);
+
+/* v34.72: true after MIDlet.notifyDestroyed() — lets the host loop tell a
+ * deliberately finished VM from one that stopped spuriously. */
+bool midlet_is_destroyed(void);
+
+/* v36.32 [DIRECT-DESTROY-GUARD]: raise the same flag when the VM finishes
+ * naturally (last runnable thread gone). A midlet that ran destroyApp on
+ * ITSELF (direct Java call, invisible to the natives) is already destroyed
+ * — any later system-side delivery must be skipped, never executed on the
+ * dead session. Implemented in native.c; idempotent. */
+void midlet_mark_destroyed(void);
+
+/* v36.32 [SESSION-FLAG-RESET]: the destroyed/paused flags are PER-SESSION.
+ * midlet_reset_state() existed as dead code — the flag leaked across
+ * sessions (a notifyDestroyed in session 1 made every later session skip
+ * its exit destroyApp — silent save loss on every relaunch; a failed
+ * launch poisoned all later ones once the natural-death marker existed).
+ * Implemented in native.c; call from jvm_run_midlet before the midlet
+ * constructor runs. */
+void midlet_reset_state(void);
 
 /*
  * Call a native method
@@ -201,6 +246,11 @@ void native_cleanup_fallbacks(void);
  * MIDlet manifest support
  */
 
+/* v36.24: drop the process-global manifest/property set at a session
+ * boundary — a jar without META-INF/MANIFEST.MF (or a failed load) must
+ * not inherit the PREVIOUS game's getAppProperty() values. */
+void midlet_manifest_reset(void);
+
 /* Set manifest data for getAppProperty - call after loading JAR */
 void midlet_set_manifest(const char* manifest_data, size_t size);
 
@@ -225,5 +275,25 @@ JavaString* native_intern_string(JVM* jvm, JavaString* str);
 
 /* Look up an interned string by UTF-8 content — returns existing interned string or NULL */
 JavaString* native_intern_find_by_utf8(const char* utf8, jsize utf8_len);
+
+/* v36.25 [SYSPROPS]: значение системного свойства по умолчанию —
+ * динамические ключи (microedition.locale от языка Switch,
+ * java.heap.size/free, totalMemory/freeMemory) либо общая таблица
+ * g_sys_props (java.name/java.version/java.vm.name/device.vendor/
+ * device.imei/java.stack.size и подобные). NULL = ключ неизвестен.
+ * dynbuf/cap — куда скопировать динамическое значение (NULL/0 =
+ * внутренний thread-local буфер). Обслуживает ОБА пути:
+ * System.getProperty(String) и System.getProperties(). */
+const char* nojme_sysprop_lookup(JVM* jvm, const char* key,
+                                 char* dynbuf, size_t cap);
+
+/* v36.25 [LOCALE-COMPAT]: значение microedition.locale — код языка
+ * интерфейса Switch ("ru"/"en"; слабая линковка switch_locale_get, вне
+ * switchui — "en") с одной поправкой совместимости: если манифест/JAD
+ * текущего мидлета объявляет MIDlet-Languages и текущего кода в списке
+ * нет, возвращается "en" (или первый заявленный язык). Игра с ограниченным
+ * списком языков не должна получать неподерживаемую локаль — она
+ * пропускает собственную языковую инициализацию и виснет. */
+const char* nojme_sysprop_locale(void);
 
 #endif /* NATIVE_H */

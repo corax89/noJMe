@@ -300,6 +300,11 @@ int classfile_parse_methods(ClassFileReader* reader, JavaClass* clazz) {
         method->descriptor = (char*)classfile_get_utf8(clazz, method->descriptor_index);
         method->clazz = clazz;
         method->is_native = (method->access_flags & ACC_NATIVE) != 0;
+        /* FIX: calloc zeroes the cache; but 0 is a VALID arg count ("()V" etc).
+         * Sentinel convention is "-1 = not yet computed", so set it explicitly,
+         * otherwise jvm_invoke_virtual/special built full_args with argc=0 and
+         * every Java-level callback invoked from C lost its arguments. */
+        method->cached_arg_count = -1;
         
         uint16_t attr_count;
         if (classfile_read_u2(reader, &attr_count) != 0) return -1;
@@ -375,7 +380,7 @@ int classfile_parse_methods(ClassFileReader* reader, JavaClass* clazz) {
                 
                 for (uint16_t k = 0; k < code_attr_count; k++) {
                     uint16_t skip_name;
-                    uint32_t skip_len;
+                    uint32_t skip_len = 0;
                     classfile_read_u2(reader, &skip_name);
                     classfile_read_u4(reader, &skip_len);
                     classfile_skip(reader, skip_len);
@@ -418,7 +423,6 @@ int classfile_parse_methods(ClassFileReader* reader, JavaClass* clazz) {
                         int local_idx = -1;
                         /* Wide prefix */
                         if (op == 0xc4 && pc + 1 < code_len) {
-                            uint8_t wide_op = code[pc + 1];
                             if (pc + 3 < code_len) {
                                 local_idx = (code[pc + 2] << 8) | code[pc + 3];
                             }
@@ -478,8 +482,8 @@ int classfile_parse_methods(ClassFileReader* reader, JavaClass* clazz) {
                                     int pad = (4 - ((pc + 1) % 4)) % 4;
                                     int base = pc + 1 + pad;
                                     if (base + 12 <= (int)code_len) {
-                                        int32_t low = (int32_t)((code[base+4] << 24) | (code[base+5] << 16) | (code[base+6] << 8) | code[base+7]);
-                                        int32_t high = (int32_t)((code[base+8] << 24) | (code[base+9] << 16) | (code[base+10] << 8) | code[base+11]);
+                                        int32_t low = (int32_t)(((uint32_t)(code[base+4]) <<  24) | (code[base+5] << 16) | (code[base+6] << 8) | code[base+7]);
+                                        int32_t high = (int32_t)(((uint32_t)(code[base+8]) <<  24) | (code[base+9] << 16) | (code[base+10] << 8) | code[base+11]);
                                         pc = base + 12 + (high - low + 1) * 4;
                                     } else {
                                         pc = code_len;
@@ -491,7 +495,7 @@ int classfile_parse_methods(ClassFileReader* reader, JavaClass* clazz) {
                                     int pad = (4 - ((pc + 1) % 4)) % 4;
                                     int base = pc + 1 + pad;
                                     if (base + 8 <= (int)code_len) {
-                                        int32_t npairs = (int32_t)((code[base+4] << 24) | (code[base+5] << 16) | (code[base+6] << 8) | code[base+7]);
+                                        int32_t npairs = (int32_t)(((uint32_t)(code[base+4]) <<  24) | (code[base+5] << 16) | (code[base+6] << 8) | code[base+7]);
                                         pc = base + 8 + npairs * 8;
                                     } else {
                                         pc = code_len;
@@ -548,6 +552,7 @@ int classfile_parse_methods(ClassFileReader* reader, JavaClass* clazz) {
 /* Parse attributes */
 int classfile_parse_attributes(ClassFileReader* reader, JavaClass* clazz,
                                AttributeInfo** attributes, uint16_t count) {
+    (void)clazz;
     if (count == 0) {
         *attributes = NULL;
         return 0;
@@ -662,6 +667,18 @@ JavaClass* classfile_parse(JVM* jvm, const uint8_t* data, size_t length) {
             for (size_t i = 0; i < jvm->class_loader.count; i++) {
                 JavaClass* super = jvm->class_loader.classes[i];
                 if (super->class_name && strcmp(super->class_name, clazz->super_class_name) == 0) {
+                    /* v34.49 FIX (3D Ferrari): THIS direct array hit used to
+                     * bind the BUILTIN stub as the superclass without the
+                     * JAR-override chance (only get_or_create_stub_class had
+                     * it). A MIDlet shipping its own platform shim
+                     * (com/nokia/mid/ui/FullCanvas extends FullCn) got its
+                     * subclass bound to the builtin FullCanvas (extends
+                     * plain Canvas) — every later checkcast against the
+                     * game's own hierarchy threw ClassCastException. */
+                    if (super->is_stub) {
+                        JavaClass* real = jvm_stub_jar_override_linear(jvm, clazz->super_class_name, super);
+                        if (real) super = real;
+                    }
                     clazz->super_class = super;
                     /* Наследуем размер экземпляра (уже включает ObjectHeader) */
                     clazz->instance_size = super->instance_size;
@@ -801,7 +818,23 @@ void classfile_free(JavaClass* clazz) {
     }
     
     /* Free static fields */
+    /* v36.12: static field name/descriptor are ALWAYS strdups when they
+     * exist (execute.c putstatic injection and stub_add_static_const both
+     * strdup; the classfile parser never populates this array) — the bare
+     * free(static_fields) leaked every strdup for the process lifetime. */
+    if (clazz->static_fields) {
+        for (int sf_i = 0; sf_i < clazz->static_fields_count; sf_i++) {
+            free(clazz->static_fields[sf_i].name);
+            free(clazz->static_fields[sf_i].descriptor);
+        }
+    }
     free(clazz->static_fields);
     
+        /* v34.35 PERF: CP inline caches */
+    free(clazz->field_cache);
+    free(clazz->invoke_cache);
+    free(clazz->static_field_cache);
+    /* v34.59 PERF: GC mark-layout cache */
+    free(clazz->gc_ref_slots);
     free(clazz);
 }

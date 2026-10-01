@@ -710,7 +710,7 @@ static inline const uint8_t* get_char_data(char c) {
         return get_char_data_unicode((unsigned char)c);
     }
     /* For extended Latin-1 characters (negative char values in signed char) */
-    if ((unsigned char)c >= 0xA0 && (unsigned char)c <= 0xFF) {
+    if ((unsigned char)c >= 0xA0) {
         return get_char_data_unicode((unsigned char)c);
     }
     /* Return space for unknown characters */

@@ -10,6 +10,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
+#include <time.h>       /* v34.6: clock_gettime in invoke tracer */
+#include "core_version.h"
+#include <limits.h>
 
 /* For Windows strdup compatibility */
 #ifdef _WIN32
@@ -19,6 +23,7 @@
 #endif
 
 #include "opcodes.h"
+#include "cp_caches.h"
 #include "jvm.h"
 
 /* M3G debug logging - disabled by default */
@@ -65,6 +70,19 @@ extern int count_args(const char* descriptor);
 /* External function from execute.c */
 extern int execute_method(JVM* jvm, JavaThread* thread, JavaMethod* method, 
                           JavaValue* args, JavaValue* result);
+
+/* ==================================================================
+ * v18 FIX (argument-marshalling desync): count_args() returns STACK
+ * SLOTS (J/D = 2 slots), while the execute_method binder and the
+ * native handlers consume a COMPACT args[] - exactly one JavaValue
+ * per Java argument, J/D included. op_invokespecial already builds
+ * the compact form; op_invokestatic/-virtual/-interface used to pop
+ * slot-wise, which SHIFTED every argument after the first long/double
+ * (e.g. Log.eqD(String,double,double,double) received `expected` as
+ * `actual` and `actual` as `eps`, making every comparison with a
+ * negative double fail). The helpers live BELOW the POP/PUSH macro
+ * definitions and centralize the compact form.
+ * ================================================================== */
 
 /* External functions from jvm.c */
 extern JavaFrame* create_frame(JVM* jvm, JavaThread* thread, JavaMethod* method, JavaValue* args);
@@ -380,6 +398,7 @@ static inline JavaValue safe_pop(JavaFrame* frame) {
 }
 
 #define POP(frame) safe_pop(frame)
+#define POP_VOID(frame) safe_pop(frame)   /* value still checked/validated */
 #define PEEK(frame) ((frame)->stack[(frame)->stack_top])
 
 static inline JavaValue* safe_local_ptr(JavaFrame* frame, uint16_t idx) {
@@ -412,12 +431,14 @@ static inline int store_local(JavaFrame* frame, uint16_t idx, JavaValue value) {
 }
 #else
 /* Release: no bounds checking for maximum performance */
-#define PUSH(frame, val) ((frame)->stack[++(frame)->stack_top] = (val))
+#define PUSH(frame, val) do { (frame)->stack[++(frame)->stack_top] = (val); } while(0)
 #define PUSH2(frame, val) do { \
     (frame)->stack[++(frame)->stack_top] = (val); \
     (frame)->stack[++(frame)->stack_top] = (val); \
 } while(0)
 #define POP(frame) ((frame)->stack[(frame)->stack_top--])
+/* Statement-only pop (value discarded) — avoids -Wunused-value on release build */
+#define POP_VOID(frame) do { (void)(frame)->stack[(frame)->stack_top]; (frame)->stack_top--; } while(0)
 #define PEEK(frame) ((frame)->stack[(frame)->stack_top])
 #define safe_pop(frame) POP(frame)
 #define safe_local_ptr(frame, idx) (&((frame)->locals[idx]))
@@ -425,14 +446,101 @@ static inline int store_local(JavaFrame* frame, uint16_t idx, JavaValue value) {
 #define store_local(frame, idx, value) ((frame)->locals[idx] = (value), 0)
 #endif
 
+/* v18 FIX: Number of Java-level arguments (J/D count as ONE). */
+static int count_java_args(const char* descriptor) {
+    if (!descriptor) return 0;
+    int count = 0;
+    const char* p = descriptor;
+    if (*p == '(') p++;
+    while (*p && *p != ')') {
+        switch (*p) {
+            case 'J': case 'D':
+                count++; p++;
+                break;
+            case 'L':
+                count++;
+                while (*p && *p != ';') p++;
+                if (*p == ';') p++;
+                break;
+            case '[':
+                count++;
+                while (*p == '[') p++;
+                if (*p == 'L') { while (*p && *p != ';') p++; if (*p == ';') p++; }
+                else if (*p) p++;
+                break;
+            default:
+                count++; p++;
+                break;
+        }
+    }
+    return count;
+}
+
+/* v18 FIX: Pop the argument slots for `descriptor` off the frame stack (the
+ * objectref first when include_this - it sits BELOW the arguments) and
+ * fill args[] COMPACTLY. args must have room for
+ * count_java_args(descriptor) + (include_this ? 1 : 0) entries.
+ * For J/D both stack slots hold the same full JavaValue (the push-twice
+ * 2-slot convention); the low slot becomes the single args[] entry.
+ * Returns the number of entries filled, or -1 on OOM. */
+static int pop_args_compact(JavaFrame* frame, const char* descriptor,
+                            int include_this, JavaValue* args) {
+    int stack_slots = count_args(descriptor);
+    JavaValue* sv = (JavaValue*)malloc((stack_slots > 0 ? stack_slots : 1)
+                                       * sizeof(JavaValue));
+    if (!sv) return -1;
+
+    for (int i = stack_slots - 1; i >= 0; i--) {
+        sv[i] = POP(frame);
+    }
+
+    int ai = 0;
+    if (include_this) {
+        args[ai++] = POP(frame);
+    }
+
+    const char* p = descriptor;
+    if (*p == '(') p++;
+    int si = 0;
+    while (*p && *p != ')') {
+        switch (*p) {
+            case 'J': case 'D':
+                args[ai++] = sv[si];
+                si += 2;
+                p++;
+                break;
+            case 'L':
+                args[ai++] = sv[si++];
+                while (*p && *p != ';') p++;
+                if (*p == ';') p++;
+                break;
+            case '[':
+                args[ai++] = sv[si++];
+                while (*p == '[') p++;
+                if (*p == 'L') { while (*p && *p != ';') p++; if (*p == ';') p++; }
+                else if (*p) p++;
+                break;
+            default:
+                args[ai++] = sv[si++];
+                p++;
+                break;
+        }
+    }
+
+    free(sv);
+    return ai;
+}
+
 /* Helper to calculate instance field slot index */
+__attribute__((unused))
 static int get_instance_field_slot(JavaClass* clazz, int field_index) {
     int slot = 0;
     
     /* Add superclass instance size offset */
     if (clazz->super_class) {
-        /* Assuming instance_size is in bytes, divide by sizeof(JavaValue) to get slots */
-        slot = clazz->super_class->instance_size / sizeof(JavaValue);
+        /* BUG FIX: instance_size includes ObjectHeader, must subtract it
+         * to get the actual number of field slots from the superclass. */
+        slot = (clazz->super_class->instance_size - sizeof(ObjectHeader)) / sizeof(JavaValue);
     }
     
     /* Count instance fields preceding the target field */
@@ -526,8 +634,13 @@ static FieldLookupResult find_field_in_hierarchy(JavaClass* obj_class,
     JavaClass* hierarchy[64];
     int depth = build_hierarchy(obj_class, hierarchy, 64);
     
-    /* Search for field in hierarchy (from Object to obj_class) */
-    for (int h = 0; h < depth; h++) {
+    /* Search the hierarchy (obj_class FIRST, then its superclasses).
+     * v18 FIX (JVMS 5.4.3.2): field resolution starts at the class being
+     * searched and walks UP the superclass chain. The old Object-first
+     * order made a shadowing field in a superclass win over the class's
+     * own field: putfield ClsDerived.fld (slot 1) overwrote the inherited
+     * ClsBase.fld (slot 0), corrupting both. */
+    for (int h = depth - 1; h >= 0; h--) {
         JavaClass* current_class = hierarchy[h];
         
         if (current_class->fields) {
@@ -698,7 +811,24 @@ int op_ldc(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             } else {
                 JavaString* new_str = jvm_new_string(jvm, str);
                 if (!new_str) {
-                    LOG_SAFE("[JVM] ERROR: ldc - failed to create String object\n");
+                    /* v34.2 FIX (VmTest: "OPCODE FAIL ... WITHOUT exception" +
+                     * endless repaint-timer OOM loop): when the heap is down to
+                     * its last bytes, jvm_new_string() fails and this path used
+                     * to plain return -1 - NO pending exception. execute_method
+                     * then treats it as a silent method abort: MemTests.run (and
+                     * every caller up the chain) died without a Throwable, the
+                     * test engine never advanced, and the ConsoleCanvas repaint
+                     * timer kept re-entering paint() -> ldc -> OOM forever
+                     * (plus a GC-DIAG2 dump per failure). JVMS: ldc of a
+                     * CONSTANT_String under memory exhaustion must throw
+                     * OutOfMemoryError - a CATCHABLE condition. Route the
+                     * failure through the standard OOM thrower: it allocates a
+                     * fresh OutOfMemoryError from the v19 emergency reserve and
+                     * falls back to the pre-allocated singleton when even the
+                     * reserve is gone. MemTests catches it and the suite
+                     * continues. */
+                    LOG_SAFE("[JVM] ERROR: ldc - failed to create String object (throwing OutOfMemoryError)\n");
+                    native_throw_oome(jvm, thread);
                     return -1;
                 }
                 v.ref = native_intern_string(jvm, new_str);
@@ -770,7 +900,10 @@ int op_ldc_w(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             } else {
                 JavaString* new_str = jvm_new_string(jvm, str);
                 if (!new_str) {
-                    LOG_SAFE("[JVM] ERROR: ldc_w - failed to create String object\n");
+                    /* v34.2 FIX: same as ldc - throw catchable OutOfMemoryError
+                     * instead of a silent -1 (see the ldc comment above). */
+                    LOG_SAFE("[JVM] ERROR: ldc_w - failed to create String object (throwing OutOfMemoryError)\n");
+                    native_throw_oome(jvm, thread);
                     return -1;
                 }
                 v.ref = native_intern_string(jvm, new_str);
@@ -799,6 +932,7 @@ int op_ldc_w(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 }
 
 int op_ldc2_w(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
+    (void)jvm;
     (void)thread;
     uint16_t index = FETCH_U2(frame);
     JavaClass* clazz = frame->clazz;
@@ -1034,6 +1168,24 @@ int op_array_load(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     }
     
     if (index < 0 || index >= array->length) {
+        /* v34.8 DIAG: index+len+caller for game debugging (throttled) */
+        {
+            static int aioobe_diag_count = 0;
+            if (aioobe_diag_count < 40) {
+                aioobe_diag_count++;
+                const char* cc = (frame && frame->clazz && frame->clazz->class_name)
+                    ? frame->clazz->class_name : "?";
+                const char* cm = (frame && frame->method && frame->method->name)
+                    ? frame->method->name : "?";
+                fprintf(stderr, "[AIOOBE-DIAG] LOAD op=%s index=%d len=%d at %s.%s PC=%d\n",
+                        (opcode == OPC_AALOAD) ? "aaload" : (opcode == OPC_BALOAD) ? "baload"
+                        : (opcode == OPC_IALOAD) ? "iaload" : (opcode == OPC_SALOAD) ? "saload"
+                        : (opcode == OPC_CALOAD) ? "caload" : (opcode == OPC_LALOAD) ? "laload"
+                        : (opcode == OPC_FALOAD) ? "faload" : "daload",
+                        index, array->length, cc, cm,
+                        frame ? (int)frame->throwing_pc : -1);
+            }
+        }
         native_throw_aioobe(jvm, thread, index);
         return -1;
     }
@@ -1194,7 +1346,7 @@ int op_array_store(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     /* Long and double need to pop 2 stack slots for the value */
     JavaValue value;
     if (opcode == OPC_LASTORE || opcode == OPC_DASTORE) {
-        POP(frame); /* discard high slot */
+        POP_VOID(frame); /* discard high slot */
         value = POP(frame);
     } else {
         value = POP(frame);
@@ -1202,7 +1354,7 @@ int op_array_store(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     
     jint index = POP(frame).i;
     JavaArray* array = (JavaArray*)POP(frame).ref;
-    
+
     /* Debug: log aastore for object arrays */
     if (opcode == OPC_AASTORE) {
         LOG_OPCODE("[AASTORE] array=%p, index=%d, value=%p, array_len=%d\n",
@@ -1217,17 +1369,44 @@ int op_array_store(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     }
     
     
-    if (!array) {
-        /* DRM bypass: silently ignore array store on null in DRM classes */
-        const char* caller_class = frame ? frame->clazz->class_name : NULL;
-        if (caller_class && drm_is_drm_class(caller_class)) {
-            return 0;
+    if (!array || !is_heap_ptr_check((void*)array)) {
+        /* v34.32 DIAG: garbage array ref on the operand stack (misaligned
+         * pops upstream) — report and throw NPE instead of crashing. */
+        if (!array) {
+            /* DRM bypass: silently ignore array store on null in DRM classes */
+            const char* caller_class = frame ? frame->clazz->class_name : NULL;
+            if (caller_class && drm_is_drm_class(caller_class)) {
+                return 0;
+            }
+        } else {
+            fprintf(stderr, "[AARRAY-DIAG] garbage array=%p (heap %p-%p) op=%02x at %s.%s PC=%d\n",
+                    (void*)array, g_heap_start, g_heap_end, opcode,
+                    frame&&frame->clazz&&frame->clazz->class_name?frame->clazz->class_name:"?",
+                    frame&&frame->method&&frame->method->name?frame->method->name:"?",
+                    (int)frame->pc);
         }
         native_throw_npe(jvm, thread);
         return -1;
     }
     
     if (index < 0 || index >= array->length) {
+        /* v34.8 DIAG: index+len+caller for game debugging (throttled) */
+        {
+            static int aioobe_store_diag_count = 0;
+            if (aioobe_store_diag_count < 40) {
+                aioobe_store_diag_count++;
+                const char* cc = (frame && frame->clazz && frame->clazz->class_name)
+                    ? frame->clazz->class_name : "?";
+                const char* cm = (frame && frame->method && frame->method->name)
+                    ? frame->method->name : "?";
+                fprintf(stderr, "[AIOOBE-DIAG] STORE op=%s index=%d len=%d at %s.%s PC=%d\n",
+                        (opcode == OPC_AASTORE) ? "aastore" : (opcode == OPC_BASTORE) ? "bastore"
+                        : (opcode == OPC_IASTORE) ? "iastore" : (opcode == OPC_SASTORE) ? "sastore"
+                        : (opcode == OPC_CASTORE) ? "castore" : "xxstore",
+                        index, array->length, cc, cm,
+                        frame ? (int)frame->throwing_pc : -1);
+            }
+        }
         native_throw_aioobe(jvm, thread, index);
         return -1;
     }
@@ -1242,8 +1421,21 @@ int op_array_store(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         JavaClass* element_class = array->element_class;
         
         if (element_class && element_class->class_name) {
+            /* v24 FIX (Brick Breaker): element type is itself an array
+             * (e.g. int[][], Object[][]) — the descriptor-based instanceof
+             * check cannot fully verify nested-array covariance (element_class
+             * is an array stub class, the stored value may come from a
+             * different-but-compatible construction path). Permissively skip
+             * the check for '['-typed element classes instead of throwing a
+             * spurious ArrayStoreException that cascaded into a load hang. */
+            if (element_class->class_name[0] == '[') {
+                /* skip check — nested array element, store permissively */
+            } else {
             JavaObject* obj = (JavaObject*)value.ref;
-            JavaClass* value_class = obj ? obj->header.clazz : NULL;
+            /* [ARGGUARD] v36.49: мусорное значение массива не deref-им:
+             * value_class=NULL -> перmissive store (как при потере класса) */
+            JavaClass* value_class =
+                (obj && !argguard_bad_ptr((uintptr_t)obj)) ? obj->header.clazz : NULL;
             
             /* Only check if both classes have valid names */
             if (value_class && value_class->class_name && object_instance_of(obj, element_class)) {
@@ -1258,9 +1450,17 @@ int op_array_store(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                 native_throw_array_store_exception(jvm, thread);
                 return -1;
             }
+            }
         }
     }
     
+    if (getenv("NOJME_TRACE_ARR")) {
+        fprintf(stderr, "[ARR] store op=%02x array=%p len=%d type=%d idx=%d at %s.%s PC~%d\n",
+                opcode, (void*)array, array->length, array->element_type, index,
+                frame&&frame->clazz?frame->clazz->class_name:"?",
+                frame&&frame->method?frame->method->name:"?",
+                (int)frame->pc);
+    }
     array_set(array, index, value);
     return 0;
 }
@@ -1268,14 +1468,14 @@ int op_array_store(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 /* Stack operations */
 int op_pop(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     (void)jvm; (void)thread;
-    POP(frame);
+    POP_VOID(frame);
     return 0;
 }
 
 int op_pop2(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     (void)jvm; (void)thread;
-    POP(frame);
-    POP(frame);
+    POP_VOID(frame);
+    POP_VOID(frame);
     return 0;
 }
 
@@ -1298,6 +1498,9 @@ int op_dup_x1(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 
 int op_dup_x2(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     (void)jvm; (void)thread;
+    /* JVM spec (JVMS 6.5 dup_x2): ..., v3, v2, v1 -> ..., v1, v3, v2, v1
+     * FIX: previously pushed v1,v2,v3,v1 which swapped v2/v3 and corrupted
+     * obfuscated code relying on correct operand-stack ordering. */
     JavaValue v1 = POP(frame);
     JavaValue v2 = POP(frame);
     JavaValue v3 = POP(frame);
@@ -1321,6 +1524,8 @@ int op_dup2(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 
 int op_dup2_x1(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     (void)jvm; (void)thread;
+    /* JVM spec (JVMS 6.5 dup2_x1): ..., v3, v2, v1 -> ..., v2, v1, v3, v2, v1
+     * FIX: was a complete misrotation (v1,v2,v3,v1,v2). */
     JavaValue v1 = POP(frame);
     JavaValue v2 = POP(frame);
     JavaValue v3 = POP(frame);
@@ -1334,6 +1539,9 @@ int op_dup2_x1(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 
 int op_dup2_x2(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     (void)jvm; (void)thread;
+    /* JVM spec (JVMS 6.5 dup2_x2):
+     * ..., v4, v3, v2, v1 -> ..., v2, v1, v4, v3, v2, v1
+     * FIX: previous push order produced a mirrored, invalid layout. */
     JavaValue v1 = POP(frame);
     JavaValue v2 = POP(frame);
     JavaValue v3 = POP(frame);
@@ -1373,9 +1581,9 @@ int op_add(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         case OPC_LADD: 
             /* ИСПРАВЛЕНО: Long хранится в одном JavaValue (union), но занимает 2 слота стека.
              * Сначала pop high slot (фиктивный), потом low slot с реальным значением */
-            POP(frame);  /* v2 high slot (фиктивный) */
+            POP_VOID(frame);  /* v2 high slot (фиктивный) */
             JavaValue v2_l = POP(frame);  /* v2 low slot с реальным jlong */
-            POP(frame);  /* v1 high slot (фиктивный) */
+            POP_VOID(frame);  /* v1 high slot (фиктивный) */
             JavaValue v1_l = POP(frame);  /* v1 low slot с реальным jlong */
             
             result.j = v1_l.j + v2_l.j;
@@ -1394,9 +1602,9 @@ int op_add(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             
         case OPC_DADD: 
             /* ИСПРАВЛЕНО: Double хранится в одном JavaValue (union), но занимает 2 слота стека */
-            POP(frame);  /* d2 high slot (фиктивный) */
+            POP_VOID(frame);  /* d2 high slot (фиктивный) */
             JavaValue d2_d = POP(frame);  /* d2 low slot с реальным jdouble */
-            POP(frame);  /* d1 high slot (фиктивный) */
+            POP_VOID(frame);  /* d1 high slot (фиктивный) */
             JavaValue d1_d = POP(frame);  /* d1 low slot с реальным jdouble */
             
             result.d = d1_d.d + d2_d.d;
@@ -1423,9 +1631,9 @@ int op_sub(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             break;
         case OPC_LSUB: 
             /* Pop 2 slots for each long */
-            POP(frame); /* v2 high */
+            POP_VOID(frame); /* v2 high */
             v2 = POP(frame);
-            POP(frame); /* v1 high */
+            POP_VOID(frame); /* v1 high */
             v1 = POP(frame);
             result.j = v1.j - v2.j;
             PUSH(frame, result);
@@ -1439,9 +1647,9 @@ int op_sub(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             break;
         case OPC_DSUB: 
             /* Pop 2 slots for each double */
-            POP(frame); /* v2 high */
+            POP_VOID(frame); /* v2 high */
             v2 = POP(frame);
-            POP(frame); /* v1 high */
+            POP_VOID(frame); /* v1 high */
             v1 = POP(frame);
             result.d = v1.d - v2.d;
             PUSH(frame, result);
@@ -1466,9 +1674,9 @@ int op_mul(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             break;
         case OPC_LMUL: 
             /* Pop 2 slots for each long */
-            POP(frame); /* v2 high */
+            POP_VOID(frame); /* v2 high */
             v2 = POP(frame);
-            POP(frame); /* v1 high */
+            POP_VOID(frame); /* v1 high */
             v1 = POP(frame);
             result.j = v1.j * v2.j;
             PUSH(frame, result);
@@ -1482,9 +1690,9 @@ int op_mul(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             break;
         case OPC_DMUL: 
             /* Pop 2 slots for each double */
-            POP(frame); /* v2 high */
+            POP_VOID(frame); /* v2 high */
             v2 = POP(frame);
-            POP(frame); /* v1 high */
+            POP_VOID(frame); /* v1 high */
             v1 = POP(frame);
             result.d = v1.d * v2.d;
             PUSH(frame, result);
@@ -1508,20 +1716,35 @@ int op_div(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                 jvm_throw_by_name(jvm, "java/lang/ArithmeticException", "/ by zero");
                 return -1;
             }
-            result.i = v1.i / v2.i; 
+            /* v20 FIX (JVMS §6.5 idiv): Integer.MIN_VALUE / -1 ==
+             * Integer.MIN_VALUE — the result overflows to itself and NO
+             * exception is thrown. The old code raised a spurious
+             * ArithmeticException on valid obfuscated bytecode. Mirrors the
+             * already-fixed IREM below. */
+            if (v1.i == INT32_MIN && v2.i == -1) {
+                result.i = INT32_MIN;
+            } else {
+                result.i = v1.i / v2.i; 
+            }
             PUSH(frame, result);
             break;
         case OPC_LDIV: 
             /* Pop 2 slots for each long */
-            POP(frame); /* v2 high */
+            POP_VOID(frame); /* v2 high */
             v2 = POP(frame);
-            POP(frame); /* v1 high */
+            POP_VOID(frame); /* v1 high */
             v1 = POP(frame);
             if (v2.j == 0LL) {
                 jvm_throw_by_name(jvm, "java/lang/ArithmeticException", "/ by zero");
                 return -1;
             }
-            result.j = v1.j / v2.j;
+            /* v20 FIX (JVMS §6.5 ldiv): Long.MIN_VALUE / -1 == Long.MIN_VALUE
+             * (overflow saturates to itself, no exception). */
+            if (v1.j == INT64_MIN && v2.j == -1LL) {
+                result.j = INT64_MIN;
+            } else {
+                result.j = v1.j / v2.j;
+            }
             PUSH(frame, result);
             PUSH(frame, result);
             break;
@@ -1534,9 +1757,9 @@ int op_div(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             break;
         case OPC_DDIV: 
             /* Pop 2 slots for each double */
-            POP(frame); /* v2 high */
+            POP_VOID(frame); /* v2 high */
             v2 = POP(frame);
-            POP(frame); /* v1 high */
+            POP_VOID(frame); /* v1 high */
             v1 = POP(frame);
             /* Double division by zero returns Infinity or NaN per IEEE 754 - no exception */
             result.d = v1.d / v2.d;
@@ -1561,20 +1784,30 @@ int op_rem(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                 jvm_throw_by_name(jvm, "java/lang/ArithmeticException", "/ by zero");
                 return -1;
             }
-            result.i = v1.i % v2.i; 
+            /* Java spec: MIN_VALUE % -1 = 0 (C behavior is undefined) */
+            if (v1.i == INT32_MIN && v2.i == -1) {
+                result.i = 0;
+            } else {
+                result.i = v1.i % v2.i; 
+            }
             PUSH(frame, result);
             break;
         case OPC_LREM: 
             /* Pop 2 slots for each long */
-            POP(frame); /* v2 high */
+            POP_VOID(frame); /* v2 high */
             v2 = POP(frame);
-            POP(frame); /* v1 high */
+            POP_VOID(frame); /* v1 high */
             v1 = POP(frame);
             if (v2.j == 0LL) {
                 jvm_throw_by_name(jvm, "java/lang/ArithmeticException", "/ by zero");
                 return -1;
             }
-            result.j = v1.j % v2.j;
+            /* Java spec: MIN_VALUE % -1 = 0 (C behavior is undefined) */
+            if (v1.j == INT64_MIN && v2.j == -1LL) {
+                result.j = 0LL;
+            } else {
+                result.j = v1.j % v2.j;
+            }
             PUSH(frame, result);
             PUSH(frame, result);
             break;
@@ -1587,9 +1820,9 @@ int op_rem(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             break;
         case OPC_DREM: 
             /* Pop 2 slots for each double */
-            POP(frame); /* v2 high */
+            POP_VOID(frame); /* v2 high */
             v2 = POP(frame);
-            POP(frame); /* v1 high */
+            POP_VOID(frame); /* v1 high */
             v1 = POP(frame);
             /* Double modulo by zero returns NaN per IEEE 754 - no exception */
             result.d = fmod(v1.d, v2.d);
@@ -1609,14 +1842,14 @@ int op_neg(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     switch (opcode) {
         case OPC_INEG: 
             v = POP(frame);
-            result.i = -v.i; 
+            result.i = (jint)(0u - (uint32_t)v.i); /* well-defined two's complement negation (v18) */
             PUSH(frame, result);
             break;
         case OPC_LNEG: 
             /* Pop 2 slots for long */
-            POP(frame); /* high */
+            POP_VOID(frame); /* high */
             v = POP(frame);
-            result.j = -v.j;
+            result.j = (jlong)(0ull - (uint64_t)v.j); /* well-defined two's complement negation (v18) */
             PUSH(frame, result);
             PUSH(frame, result);
             break;
@@ -1627,7 +1860,7 @@ int op_neg(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             break;
         case OPC_DNEG: 
             /* Pop 2 slots for double */
-            POP(frame); /* high */
+            POP_VOID(frame); /* high */
             v = POP(frame);
             result.d = -v.d;
             PUSH(frame, result);
@@ -1641,20 +1874,19 @@ int op_neg(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 int op_shl(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     (void)jvm; (void)thread;
     uint8_t opcode = frame->code[frame->pc - 1];
-    jint shift = POP(frame).i & 0x3F;
+    jint raw_shift = POP(frame).i;
     JavaValue v, result;
     
     switch (opcode) {
         case OPC_ISHL: 
             v = POP(frame);
-            result.i = v.i << shift; 
+            result.i = v.i << (raw_shift & 0x1F); 
             PUSH(frame, result);
             break;
         case OPC_LSHL: 
-            /* Pop 2 slots for long */
-            POP(frame); /* high */
+            POP_VOID(frame); /* high */
             v = POP(frame);
-            result.j = v.j << shift;
+            result.j = v.j << (raw_shift & 0x3F);
             PUSH(frame, result);
             PUSH(frame, result);
             break;
@@ -1666,20 +1898,19 @@ int op_shl(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 int op_shr(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     (void)jvm; (void)thread;
     uint8_t opcode = frame->code[frame->pc - 1];
-    jint shift = POP(frame).i & 0x3F;
+    jint raw_shift = POP(frame).i;
     JavaValue v, result;
     
     switch (opcode) {
         case OPC_ISHR: 
             v = POP(frame);
-            result.i = v.i >> shift; 
+            result.i = v.i >> (raw_shift & 0x1F); 
             PUSH(frame, result);
             break;
         case OPC_LSHR: 
-            /* Pop 2 slots for long */
-            POP(frame); /* high */
+            POP_VOID(frame); /* high */
             v = POP(frame);
-            result.j = v.j >> shift;
+            result.j = v.j >> (raw_shift & 0x3F);
             PUSH(frame, result);
             PUSH(frame, result);
             break;
@@ -1691,20 +1922,19 @@ int op_shr(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 int op_ushr(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     (void)jvm; (void)thread;
     uint8_t opcode = frame->code[frame->pc - 1];
-    jint shift = POP(frame).i & 0x3F;
+    jint raw_shift = POP(frame).i;
     JavaValue v, result;
     
     switch (opcode) {
         case OPC_IUSHR: 
             v = POP(frame);
-            result.i = ((juint)v.i) >> shift; 
+            result.i = ((juint)v.i) >> (raw_shift & 0x1F); 
             PUSH(frame, result);
             break;
         case OPC_LUSHR: 
-            /* Pop 2 slots for long */
-            POP(frame); /* high */
+            POP_VOID(frame); /* high */
             v = POP(frame);
-            result.j = ((julong)v.j) >> shift;
+            result.j = ((julong)v.j) >> (raw_shift & 0x3F);
             PUSH(frame, result);
             PUSH(frame, result);
             break;
@@ -1727,9 +1957,9 @@ int op_and(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             break;
         case OPC_LAND: 
             /* Pop 2 slots for each long */
-            POP(frame); /* v2 high */
+            POP_VOID(frame); /* v2 high */
             v2 = POP(frame);
-            POP(frame); /* v1 high */
+            POP_VOID(frame); /* v1 high */
             v1 = POP(frame);
             result.j = v1.j & v2.j;
             PUSH(frame, result);
@@ -1754,9 +1984,9 @@ int op_or(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             break;
         case OPC_LOR: 
             /* Pop 2 slots for each long */
-            POP(frame); /* v2 high */
+            POP_VOID(frame); /* v2 high */
             v2 = POP(frame);
-            POP(frame); /* v1 high */
+            POP_VOID(frame); /* v1 high */
             v1 = POP(frame);
             result.j = v1.j | v2.j;
             PUSH(frame, result);
@@ -1781,9 +2011,9 @@ int op_xor(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             break;
         case OPC_LXOR: 
             /* Pop 2 slots for each long */
-            POP(frame); /* v2 high */
+            POP_VOID(frame); /* v2 high */
             v2 = POP(frame);
-            POP(frame); /* v1 high */
+            POP_VOID(frame); /* v1 high */
             v1 = POP(frame);
             result.j = v1.j ^ v2.j;
             PUSH(frame, result);
@@ -1811,6 +2041,35 @@ int op_iinc(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     return 0;
 }
 
+/* FIX (audit J-2, v18): JVMS-compliant saturating float/double -> int/long
+ * conversions. NaN -> 0; values beyond the target range clamp to MIN/MAX of
+ * the target type; in-range values truncate toward zero. Avoids the UB of
+ * raw C casts (platform-dependent garbage physics on NaN/overflow). */
+static jint jvm_f2i(jfloat f) {
+    if (isnan(f)) return 0;
+    if (f >= 2147483647.0f) return INT32_MAX;   /* rounds up past max */
+    if (f <= -2147483648.0f) return INT32_MIN;
+    return (jint)f;
+}
+static jlong jvm_f2l(jfloat f) {
+    if (isnan(f)) return 0;
+    if (f >= 9223372036854775807.0f) return INT64_MAX;
+    if (f <= -9223372036854775808.0f) return INT64_MIN;
+    return (jlong)f;
+}
+static jint jvm_d2i(jdouble d) {
+    if (isnan(d)) return 0;
+    if (d >= 2147483647.0) return INT32_MAX;
+    if (d <= -2147483648.0) return INT32_MIN;
+    return (jint)d;
+}
+static jlong jvm_d2l(jdouble d) {
+    if (isnan(d)) return 0;
+    if (d >= 9223372036854775807.0) return INT64_MAX;
+    if (d <= -9223372036854775808.0) return INT64_MIN;
+    return (jlong)d;
+}
+
 /* Conversion operations */
 int op_convert(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     (void)jvm; (void)thread;
@@ -1833,7 +2092,7 @@ int op_convert(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             break;
         case OPC_F2L: 
             v = POP(frame);
-            result.j = (jlong)v.f; 
+            result.j = jvm_f2l(v.f); /* saturating per JVMS (J-2, v18) */ 
             PUSH(frame, result);
             PUSH(frame, result);
             break;
@@ -1852,19 +2111,19 @@ int op_convert(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             PUSH(frame, result);
             break;
         case OPC_L2F: 
-            POP(frame); /* discard high slot */
+            POP_VOID(frame); /* discard high slot */
             v = POP(frame);
             result.f = (jfloat)v.j; 
             PUSH(frame, result);
             break;
         case OPC_D2I: 
-            POP(frame); /* discard high slot */
+            POP_VOID(frame); /* discard high slot */
             v = POP(frame);
-            result.i = (jint)v.d; 
+            result.i = jvm_d2i(v.d); /* saturating per JVMS (J-2, v18) */ 
             PUSH(frame, result);
             break;
         case OPC_D2F: 
-            POP(frame); /* discard high slot */
+            POP_VOID(frame); /* discard high slot */
             v = POP(frame);
             result.f = (jfloat)v.d; 
             PUSH(frame, result);
@@ -1881,7 +2140,7 @@ int op_convert(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         case OPC_D2L: 
             v = POP(frame); /* high slot */
             result = POP(frame); /* low slot with the actual value */
-            result.j = (jlong)result.d; 
+            result.j = jvm_d2l(result.d); /* saturating per JVMS (J-2, v18) */ 
             PUSH(frame, result);
             PUSH(frame, result);
             break;
@@ -1894,7 +2153,7 @@ int op_convert(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             break;
         case OPC_F2I: 
             v = POP(frame);
-            result.i = (jint)v.f; 
+            result.i = jvm_f2i(v.f); /* saturating per JVMS (J-2, v18) */ 
             PUSH(frame, result);
             break;
         case OPC_I2B: 
@@ -1923,9 +2182,9 @@ int op_convert(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 int op_lcmp(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     (void)jvm; (void)thread;
     /* Pop 2 slots for each long value */
-    POP(frame); /* v2 high slot */
+    POP_VOID(frame); /* v2 high slot */
     jlong v2 = POP(frame).j;
-    POP(frame); /* v1 high slot */
+    POP_VOID(frame); /* v1 high slot */
     jlong v1 = POP(frame).j;
     JavaValue result;
     result.i = (v1 > v2) ? 1 : (v1 < v2) ? -1 : 0;
@@ -1958,9 +2217,9 @@ int op_fcmpg(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 int op_dcmpl(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     (void)jvm; (void)thread;
     /* Pop 2 slots for each double value */
-    POP(frame); /* v2 high slot */
+    POP_VOID(frame); /* v2 high slot */
     jdouble v2 = POP(frame).d;
-    POP(frame); /* v1 high slot */
+    POP_VOID(frame); /* v1 high slot */
     jdouble v1 = POP(frame).d;
     JavaValue result;
     if (isnan(v1) || isnan(v2)) result.i = -1;
@@ -1972,9 +2231,9 @@ int op_dcmpl(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 int op_dcmpg(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     (void)jvm; (void)thread;
     /* Pop 2 slots for each double value */
-    POP(frame); /* v2 high slot */
+    POP_VOID(frame); /* v2 high slot */
     jdouble v2 = POP(frame).d;
-    POP(frame); /* v1 high slot */
+    POP_VOID(frame); /* v1 high slot */
     jdouble v1 = POP(frame).d;
     JavaValue result;
     if (isnan(v1) || isnan(v2)) result.i = 1;
@@ -2165,6 +2424,26 @@ int op_return(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     return 1;  /* Signal return */
 }
 
+/* v36.04 NESTED-RETURN-CONTAINED companion: the result deposit onto the
+ * caller frame must ALWAYS fit (the caller was args-popped before the
+ * call). A trip here means operand-stack drift — the leak class fixed by
+ * execute_method_nested (execute.c). Fail loudly instead of silently
+ * corrupting the frame / neighbouring malloc heap. */
+static int return_deposit_ok(JavaFrame* prev, int slots) {
+    if (prev->stack_top + slots >= prev->max_stack) {
+        static int dep_violations = 0;
+        if (dep_violations < 8) {
+            dep_violations++;
+            LOG_SAFE("[EXEC] RETURN-DEPOSIT overflow: caller stack_top=%d max=%d slots=%d in %s.%s\n",
+                     (int)prev->stack_top, (int)prev->max_stack, slots,
+                     prev->clazz && prev->clazz->class_name ? prev->clazz->class_name : "?",
+                     prev->method && prev->method->name ? prev->method->name : "?");
+        }
+        return 0;
+    }
+    return 1;
+}
+
 int op_ireturn(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     (void)jvm; (void)thread;
     
@@ -2173,6 +2452,7 @@ int op_ireturn(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         LOG_SAFE("[EXEC] ERROR: op_ireturn with no caller frame!\n");
         return -1;
     }
+    if (!return_deposit_ok(frame->prev, 1)) return -1;
     
     JavaValue result = POP(frame);
     frame->prev->stack_top++;
@@ -2190,14 +2470,17 @@ int op_lreturn(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     }
     
     /* Pop 2 slots для long */
-    JavaValue high = POP(frame);
-    JavaValue result = POP(frame);
+    if (!return_deposit_ok(frame->prev, 2)) return -1;
+    (void)POP(frame);            /* high slot (копия/может быть устаревшей) */
+    JavaValue result = POP(frame); /* low slot — каноническое значение */
     
-    /* Push 2 slots в стек вызвавшего */
+    /* Push 2 slots в стек вызвавшего (обе копии результата: high-слот,
+     * снятый с стека calleе, мог быть устаревшим после быстрой long-
+     * арифметики — v36.38-BT2) */
     frame->prev->stack_top++;
     frame->prev->stack[frame->prev->stack_top] = result;
     frame->prev->stack_top++;
-    frame->prev->stack[frame->prev->stack_top] = high;
+    frame->prev->stack[frame->prev->stack_top] = result;
     return 1;
 }
 
@@ -2209,6 +2492,7 @@ int op_freturn(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         LOG_SAFE("[EXEC] ERROR: op_freturn with no caller frame!\n");
         return -1;
     }
+    if (!return_deposit_ok(frame->prev, 1)) return -1;
     
     JavaValue result = POP(frame);
     frame->prev->stack_top++;
@@ -2226,14 +2510,15 @@ int op_dreturn(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     }
     
     /* Pop 2 slots для double */
-    JavaValue high = POP(frame);
-    JavaValue result = POP(frame);
+    if (!return_deposit_ok(frame->prev, 2)) return -1;
+    (void)POP(frame);            /* high slot (копия/может быть устаревшей) */
+    JavaValue result = POP(frame); /* low slot — каноническое значение */
     
-    /* Push 2 slots в стек вызвавшего */
+    /* Push 2 слота (обе копии результата — см. v36.38-BT2 в op_lreturn) */
     frame->prev->stack_top++;
     frame->prev->stack[frame->prev->stack_top] = result;
     frame->prev->stack_top++;
-    frame->prev->stack[frame->prev->stack_top] = high;
+    frame->prev->stack[frame->prev->stack_top] = result;
     return 1;
 }
 
@@ -2245,6 +2530,7 @@ int op_areturn(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         LOG_SAFE("[EXEC] ERROR: op_areturn with no caller frame!\n");
         return -1;
     }
+    if (!return_deposit_ok(frame->prev, 1)) return -1;
 
     JavaValue result = POP(frame);
 
@@ -2254,8 +2540,67 @@ int op_areturn(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     return 1;
 }
 
+/* v34.42 PERF: getstatic/putstatic inline cache. Caches the OWNING class
+ * + slot index of the resolved JavaStaticField — the value itself is read
+ * fresh on every access (fields mutate constantly). Slots are append-only
+ * (never removed/reordered: created by the classfile parser up front or by
+ * putstatic/stub injection at the tail), and the owner's static_fields
+ * array pointer is re-dereferenced per access, so reallocs are safe.
+ * NOT filled while the field is unresolved (default-0 fallback) — the
+ * slot may appear later via stub injection. */
+StaticFieldRefCache* static_field_cache_entry(JavaFrame* frame, uint16_t index) {
+    /* v36.35 DIAG: NOJME_NO_STATIC_CACHE=1 disables the static-field inline
+     * cache (both get/put) for sandbox debugging of stale-slot reads. */
+    static int8_t disabled = -1;
+    if (disabled < 0) {
+        const char* e = getenv("NOJME_NO_STATIC_CACHE");
+        disabled = (e && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    if (disabled) return NULL;
+    JavaClass* clazz = frame->clazz;
+    if (!clazz || !clazz->constant_pool_count || index >= clazz->constant_pool_count) return NULL;
+    if (!clazz->static_field_cache) {
+        clazz->static_field_cache = (StaticFieldRefCache*)calloc(clazz->constant_pool_count, sizeof(StaticFieldRefCache));
+    }
+    return clazz->static_field_cache ? &clazz->static_field_cache[index] : NULL;
+}
+
+/* Memoize a successful static-field resolution (slot >= 0). */
+void static_field_cache_fill(JavaFrame* frame, uint16_t index,
+                                    JavaClass* owner, int slot, uint8_t wide) {
+    StaticFieldRefCache* sc = static_field_cache_entry(frame, index);
+    if (sc) {
+        sc->owner = owner;
+        sc->slot = slot;
+        sc->wide = wide;
+        sc->gen = g_vm_cache_gen;
+        sc->valid = (slot >= 0 && owner) ? 1 : 0;
+    }
+}
+
 /* Field access - simplified stubs */
 int op_getstatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
+    (void)thread;
+    /* v34.42 PERF: static-field inline cache — the getstatic twin of the
+     * v34.35 getfield cache. gprof (Asphalt 3 3D in-race): op_getstatic ran
+     * 21.4M times per 60 s, each access re-resolving class by NAME
+     * (jvm_load_class hash) + CP name/type + a strcmp walk over the
+     * superclass chain's static_fields. Contract: frame->pc enters at
+     * opcode+1; on miss fall through to the original slow path. */
+    {
+        StaticFieldRefCache* sc = static_field_cache_entry(frame,
+                (uint16_t)(((uint16_t)frame->code[frame->pc] << 8) | (uint16_t)frame->code[frame->pc + 1])  /* JVMS: big-endian u16 */);
+        if (sc && sc->valid && sc->gen == g_vm_cache_gen &&
+            sc->owner->static_fields && sc->slot < sc->owner->static_fields_count) {
+            JavaValue v = sc->owner->static_fields[sc->slot].value;
+            frame->pc += 2;   /* pc entered at opcode+1; getstatic is 3 bytes */
+            PUSH(frame, v);
+            if (sc->wide) {
+                PUSH(frame, v);
+            }
+            return 0;
+        }
+    }
     uint16_t index = FETCH_U2(frame);
     
     const char* class_name = NULL;
@@ -2308,22 +2653,37 @@ int op_getstatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         target_class->static_fields_capacity = 16;
     }
     
-    /* Search for field by name AND descriptor - MUST match both for obfuscated code */
-    /* CRITICAL: Fields with same name but different descriptors are DIFFERENT fields! */
+    /* v31 FIX: resolve static fields through the SUPERCLASS chain.
+     * Java inherits static fields: `MainCanvas.KEY_NUM6` must resolve to
+     * `Canvas.KEY_NUM6`. The old lookup searched only the named class, so
+     * any inherited constant read back 0 — e.g. M3GTest.keyPressed compared
+     * keyCode(54) with KEY_NUM6(0): LEFT/RIGHT/4/6 navigation never fired.
+     * Walk up (bounded, cycle-safe); first name+descriptor match wins. */
     JavaValue v = { .raw = 0 };
     bool found = false;
-    
-    for (int i = 0; i < target_class->static_fields_count; i++) {
-        if (target_class->static_fields[i].name && 
-            strcmp(target_class->static_fields[i].name, field_name) == 0) {
-            /* Must match descriptor exactly - fields can have same name but different types */
-            if (descriptor && target_class->static_fields[i].descriptor &&
-                strcmp(target_class->static_fields[i].descriptor, descriptor) == 0) {
-                v = target_class->static_fields[i].value;
-                found = true;
-                break;
+
+    {
+        int depth = 0;
+        for (JavaClass* sc = target_class; sc && !found && depth < 64; sc = sc->super_class, depth++) {
+            if (!sc->static_fields) continue;
+            for (int i = 0; i < sc->static_fields_count; i++) {
+                if (sc->static_fields[i].name &&
+                    strcmp(sc->static_fields[i].name, field_name) == 0) {
+                    /* Must match descriptor exactly - fields can have same name but different types */
+                    if (descriptor && sc->static_fields[i].descriptor &&
+                        strcmp(sc->static_fields[i].descriptor, descriptor) == 0) {
+                        v = sc->static_fields[i].value;
+                        found = true;
+                        /* v34.42 PERF: memoize the resolution (owner class +
+                         * slot); the VALUE is re-read on every fast-path
+                         * access so writes stay visible. */
+                        static_field_cache_fill(frame, index, sc, i,
+                                (uint8_t)(descriptor[0] == 'J' || descriptor[0] == 'D'));
+                        break;
+                    }
+                    /* No fallback - if descriptor doesn't match, this is a different field */
+                }
             }
-            /* No fallback - if descriptor doesn't match, this is a different field */
         }
     }
     
@@ -2347,6 +2707,27 @@ int op_getstatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 
 int op_putstatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     (void)thread;
+    /* v34.42 PERF: static-field inline cache (see op_getstatic). The value
+     * is popped FIRST in both paths — keep that order: a <clinit> triggered
+     * by the slow path's jvm_init_class may read the field we are about to
+     * write, and the pop must already have happened on our frame. */
+    {
+        StaticFieldRefCache* sc = static_field_cache_entry(frame,
+                (uint16_t)(((uint16_t)frame->code[frame->pc] << 8) | (uint16_t)frame->code[frame->pc + 1])  /* JVMS: big-endian u16 */);
+        if (sc && sc->valid && sc->gen == g_vm_cache_gen &&
+            sc->owner->static_fields && sc->slot < sc->owner->static_fields_count) {
+            JavaValue v;
+            if (sc->wide) {
+                POP_VOID(frame); /* high slot */
+                v = POP(frame);
+            } else {
+                v = POP(frame);
+            }
+            frame->pc += 2;   /* pc entered at opcode+1; putstatic is 3 bytes */
+            sc->owner->static_fields[sc->slot].value = v;
+            return 0;
+        }
+    }
     uint16_t index = FETCH_U2(frame);
     
     const char* class_name = NULL;
@@ -2367,7 +2748,7 @@ int op_putstatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     /* Pop value */
     JavaValue v;
     if (descriptor && (descriptor[0] == 'J' || descriptor[0] == 'D')) {
-        POP(frame); /* high slot */
+        POP_VOID(frame); /* high slot */
         v = POP(frame);
     } else {
         v = POP(frame);
@@ -2403,23 +2784,42 @@ int op_putstatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     
     /* Find or create slot - MUST match by name AND descriptor for obfuscated code */
     /* CRITICAL: Fields with same name but different descriptors are DIFFERENT fields! */
+    /* v31 FIX: resolve the DECLARING class through the superclass chain first
+     * (JVM spec: putstatic writes the inherited field, not a subclass shadow).
+     * Without this, `putstatic SubClass.FIELD` where FIELD is declared in a
+     * superclass created a SHADOW slot: reads via the superclass saw the old
+     * value, reads via the subclass the new one — divergent state. */
+    JavaClass* owner_class = target_class;
     int slot = -1;
-    for (int i = 0; i < target_class->static_fields_count; i++) {
-        if (target_class->static_fields[i].name && 
-            strcmp(target_class->static_fields[i].name, field_name) == 0) {
-            /* Must match descriptor exactly - fields can have same name but different types */
-            if (descriptor && target_class->static_fields[i].descriptor &&
-                strcmp(target_class->static_fields[i].descriptor, descriptor) == 0) {
-                slot = i;
-                break;
+    {
+        int depth = 0;
+        for (JavaClass* sc = target_class; sc && slot == -1 && depth < 64; sc = sc->super_class, depth++) {
+            if (!sc->static_fields) continue;
+            for (int i = 0; i < sc->static_fields_count; i++) {
+                if (sc->static_fields[i].name &&
+                    strcmp(sc->static_fields[i].name, field_name) == 0) {
+                    /* Must match descriptor exactly - fields can have same name but different types */
+                    if (descriptor && sc->static_fields[i].descriptor &&
+                        strcmp(sc->static_fields[i].descriptor, descriptor) == 0) {
+                        slot = i;
+                        owner_class = sc;
+                        break;
+                    }
+                    /* If no descriptor in request OR no descriptor stored - can't match safely */
+                    /* Don't use fallback - it causes corruption in obfuscated code */
+                }
             }
-            /* If no descriptor in request OR no descriptor stored - can't match safely */
-            /* Don't use fallback - it causes corruption in obfuscated code */
         }
     }
     
     if (slot == -1) {
-        /* Create new slot - always create for unseen name+descriptor combination */
+        /* Create new slot on the named class - always create for unseen name+descriptor combination */
+        owner_class = target_class;
+        if (!target_class->static_fields) {
+            target_class->static_fields = (JavaStaticField*)calloc(16, sizeof(JavaStaticField));
+            target_class->static_fields_count = 0;
+            target_class->static_fields_capacity = 16;
+        }
         if (target_class->static_fields_count >= target_class->static_fields_capacity) {
             int new_cap = target_class->static_fields_capacity + 16;
             JavaStaticField* new_fields = (JavaStaticField*)realloc(
@@ -2438,13 +2838,159 @@ int op_putstatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         LOG_OPCODE("[EXEC] putstatic: Created new slot %d for %s.%s %s\n", slot, class_name, field_name, descriptor ? descriptor : "");
     }
     
-    target_class->static_fields[slot].value = v;
-    LOG_OPCODE("[EXEC] putstatic: Stored %s.%s %s = %p (slot %d, count=%d)\n", 
-            class_name, field_name, descriptor ? descriptor : "", (void*)v.ref, slot, target_class->static_fields_count);
+    /* v31: write through the resolved owner (declares the field) */
+    owner_class->static_fields[slot].value = v;
+    /* v34.42 PERF: memoize the resolution (owner class + slot). */
+    static_field_cache_fill(frame, index, owner_class, slot,
+            (uint8_t)(descriptor && (descriptor[0] == 'J' || descriptor[0] == 'D')));
+    LOG_OPCODE("[EXEC] putstatic: Stored %s.%s %s = %p (slot %d, owner=%s, count=%d)\n", 
+            class_name, field_name, descriptor ? descriptor : "", (void*)v.ref, slot,
+            owner_class->class_name ? owner_class->class_name : "?",
+            owner_class->static_fields_count);
     return 0;
 }
 
+/* ============================================================
+ * v34.35 PERF: constant-pool inline caches (see JavaClass fields).
+ * getfield/putfield resolution used to walk the CP strings, call
+ * jvm_load_class (per access!) and strcmp-walk the field hierarchy on
+ * EVERY access. These caches memoize the resolution per CP index.
+ * ============================================================ */
+/* v34.35 FIX (stubs.c methods[] realloc / late field additions): bump this
+ * whenever any class's methods[] array is reallocated or instance field
+ * slots shift; inline caches record the generation they were built in and
+ * self-invalidate on mismatch. Mirrors the v18 method_cache_flush fix,
+ * which only covered the global hash cache. */
+uint16_t g_vm_cache_gen = 0;
+
+typedef struct InvokeRefCache {
+    JavaClass* target_class; /* virtual: receiver class this entry resolved
+                              * for (monomorphic site guard);
+                              * static/special: the resolved method's class */
+    JavaMethod* method;      /* resolved bytecode method (NULL => native/unresolved) */
+    void*       native_fn;   /* NativeMethod if resolved native */
+    const char* cls_name;    /* v34.42: CP-declared class name (native dispatch note) */
+    const char* mth_name;   /* v34.42: method name (native dispatch note) */
+    int16_t     java_argc;   /* compact arg count (J/D = 1), this INCLUDED for virtual */
+    uint16_t    gen;         /* g_vm_cache_gen at fill time (invalidation) */
+    uint8_t     arg_slots[12]; /* operand-stack slots per Java arg (1 or 2), 0-terminated */
+    uint8_t     kind;        /* 0=bytecode method, 1=native, 2=unresolved (never cached) */
+    uint8_t     ret_wide;    /* J/D return pushes 2 slots */
+    uint8_t     has_ret;     /* descriptor return != V */
+    uint8_t     valid;
+} InvokeRefCache;
+
+/* Fast subclass test: walk oc's super chain looking for `of`. */
+bool jvm_class_is_subclass_of(JavaClass* oc, JavaClass* of) {
+    while (oc) {
+        if (oc == of) return true;
+        oc = oc->super_class;
+    }
+    return false;
+}
+
+/* v34.35: lazily allocated arrays parallel to constant_pool. CP growth at
+ * runtime (stubs.c ensure_cp_capacity) FREES + NULLs these arrays (see the
+ * bump sites), so the element count always matches constant_pool_count. */
+FieldRefCache* field_cache_entry(JavaFrame* frame, uint16_t index) {
+    JavaClass* clazz = frame->clazz;
+    if (!clazz || !clazz->constant_pool_count || index >= clazz->constant_pool_count) return NULL;
+    if (!clazz->field_cache) {
+        clazz->field_cache = (FieldRefCache*)calloc(clazz->constant_pool_count, sizeof(FieldRefCache));
+    }
+    return clazz->field_cache ? &clazz->field_cache[index] : NULL;
+}
+
+static InvokeRefCache* invoke_cache_entry(JavaFrame* frame, uint16_t index) {
+    JavaClass* clazz = frame->clazz;
+    if (!clazz || !clazz->constant_pool_count || index >= clazz->constant_pool_count) return NULL;
+    if (!clazz->invoke_cache) {
+        clazz->invoke_cache = (InvokeRefCache*)calloc(clazz->constant_pool_count, sizeof(InvokeRefCache));
+    }
+    return clazz->invoke_cache ? &clazz->invoke_cache[index] : NULL;
+}
+
+/* v34.42 PERF: fill helper for the op_invokestatic inline cache.
+ * kind 0 = resolved bytecode method, kind 1 = registered native.
+ * Methods with >11 Java args (or unparsable descriptors) stay uncached. */
+static void invokestatic_cache_fill(JavaFrame* frame, uint16_t index,
+                                    JavaClass* target_class, JavaMethod* method,
+                                    void* native_fn,
+                                    const char* class_name, const char* method_name,
+                                    const char* descriptor) {
+    int jac = count_java_args(descriptor);
+    if (jac < 0 || jac > 11) return;
+    if (jac == 0 && native_fn == NULL) {
+        /* zero-arg bytecode call is fine; nothing to parse below */
+    }
+    InvokeRefCache* ic = invoke_cache_entry(frame, index);
+    if (!ic) return;
+    /* arg slot layout from the descriptor (J/D = 2 slots) */
+    const char* dp = descriptor;
+    if (*dp == '(') dp++;
+    int ai = 0, slots_ok = 1;
+    while (*dp && *dp != ')' && ai < jac) {
+        if (*dp == 'J' || *dp == 'D') { ic->arg_slots[ai++] = 2; dp++; }
+        else if (*dp == 'L') { ic->arg_slots[ai++] = 1; while (*dp && *dp != ';') dp++; if (*dp) dp++; }
+        else if (*dp == '[') { ic->arg_slots[ai] = 1; dp++; if (*dp == 'L') { while (*dp && *dp != ';') dp++; if (*dp) dp++; } else if (*dp) dp++; ai++; }
+        else { ic->arg_slots[ai++] = 1; dp++; }
+    }
+    if (ai != jac || (*dp != ')')) slots_ok = 0;
+    if (!slots_ok) return;
+    ic->target_class = target_class;
+    ic->method = method;
+    ic->native_fn = native_fn;
+    ic->cls_name = class_name;
+    ic->mth_name = method_name;
+    ic->java_argc = (int16_t)jac;
+    ic->gen = g_vm_cache_gen;
+    ic->kind = (native_fn != NULL) ? 1 : 0;
+    const char* rp = strchr(descriptor, ')');
+    ic->has_ret = (rp && rp[1] != 'V' && rp[1] != '\0') ? 1 : 0;
+    ic->ret_wide = (rp && (rp[1] == 'J' || rp[1] == 'D')) ? 1 : 0;
+    ic->valid = 1;
+}
+
+/* Memoize a successful field resolution. slot<0 clears the entry. */
+void field_cache_fill(JavaFrame* frame, uint16_t index,
+                             JavaClass* declared, int slot, uint8_t wide) {
+    FieldRefCache* fc = field_cache_entry(frame, index);
+    if (fc) {
+        fc->declared = declared;
+        fc->slot = slot;
+        fc->wide = wide;
+        fc->gen = g_vm_cache_gen;
+        fc->valid = (slot >= 0) ? 1 : 0;
+    }
+}
+
 int op_getfield(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
+    /* v34.35 PERF: inline-cache fast path. Entry contract: frame->pc points
+     * AFTER the opcode byte (set by the interpreter loop). On any miss we
+     * fall through to the ORIGINAL slow path below (which re-fetches the
+     * operand itself — do NOT consume anything here). */
+    {
+        FieldRefCache* fc = field_cache_entry(frame, (uint16_t)(((uint16_t)frame->code[frame->pc] << 8) | (uint16_t)frame->code[frame->pc + 1])  /* JVMS: big-endian u16 */);
+        if (fc && fc->valid && fc->gen == g_vm_cache_gen) {
+            JavaObject* obj = (JavaObject*)PEEK(frame).ref;
+            /* [ARGGUARD] v36.49: мусорный receiver -> медленный путь */
+            if (obj && !argguard_bad_ptr((uintptr_t)obj)) {
+                JavaClass* oc = obj->header.clazz;
+                if (oc && (oc == fc->declared || jvm_class_is_subclass_of(oc, fc->declared))) {
+                    /* slot is absolute (Object-first layout); shadowed-field
+                     * semantics are anchored at the CP-declared class —
+                     * exactly what the slow path resolves. */
+                    JavaValue v = obj->fields[fc->slot];
+                    frame->stack[frame->stack_top] = v;
+                    if (fc->wide) {
+                        PUSH(frame, v);
+                    }
+                    frame->pc += 2;   /* pc entered at opcode+1; getfield is 3 bytes */
+                    return 0;
+                }
+            }
+        }
+    }
     uint16_t index = FETCH_U2(frame);
     
     /* Get field reference from constant pool */
@@ -2484,6 +3030,15 @@ int op_getfield(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         return -1;
     }
     
+    /* [ARGGUARD] v36.49: мусорный receiver (не-каноничный/невыровненный)
+     * — НЕ deref [obj+0]; тот же исход, что при NULL классе. */
+    if (argguard_bad_ptr((uintptr_t)obj)) {
+        LOG_SAFE("[EXEC] getfield: FATAL: garbage receiver %p for field %s.%s (ARGGUARD)\n",
+                (void*)obj, class_name ? class_name : "?", field_name ? field_name : "?");
+        jvm_throw_by_name(jvm, "java/lang/InternalError", "garbage receiver (getfield)");
+        return -1;
+    }
+    
     if (!obj->header.clazz) {
         LOG_SAFE("[EXEC] getfield: FATAL: Object %p has NULL class pointer! Field: %s.%s\n", 
                 (void*)obj, class_name ? class_name : "?", field_name ? field_name : "?");
@@ -2501,8 +3056,27 @@ int op_getfield(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     JavaClass* obj_class = obj->header.clazz;
     JavaValue v = { .i = 0 };
     
-    /* === CRITICAL FIX: Use hierarchy-aware field lookup === */
-    FieldLookupResult field_result = find_field_in_hierarchy(obj_class, field_name, descriptor);
+    /* === v18 FIX (JVMS 6.5 getfield): field resolution is anchored at the
+     * CLASS named in the constant-pool Fieldref, NOT at the object's runtime
+     * class. With shadowed fields (ClsBase.fld=1 hidden by ClsDerived.fld=2),
+     * reading through a base-typed reference must observe the BASE field.
+     * Slot offsets are absolute (Object-first), so the returned slot indexes
+     * obj->fields correctly regardless of which hierarchy class defines it.
+     * Fall back to the runtime class when the declared class cannot be
+     * loaded or does not declare the field (obfuscated-bytecode safety). === */
+    JavaClass* ref_class = obj_class;
+    JavaClass* cache_declared = NULL;   /* v34.35: loaded CP-declared class */
+    if (class_name) {
+        JavaClass* declared = jvm_load_class(jvm, class_name);
+        if (declared) { ref_class = declared; cache_declared = declared; }
+    }
+    FieldLookupResult field_result = find_field_in_hierarchy(ref_class, field_name, descriptor);
+    if (!field_result.defining_class && ref_class != obj_class) {
+        /* v34.35 PERF: obj_class fallback — the resolved slot depends on the
+         * receiver's runtime class (subclass shadowing); NOT memoizable. */
+        field_result = find_field_in_hierarchy(obj_class, field_name, descriptor);
+        cache_declared = NULL;
+    }
 
     if (field_result.defining_class) {
         int slot = field_result.slot;
@@ -2519,9 +3093,13 @@ int op_getfield(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 
         v = obj->fields[slot];
 
-        LOG_OPCODE("[GETFIELD] %s.%s%s (slot %d)\n",
-                class_name ? class_name : "?", field_name ? field_name : "?",
-                descriptor ? descriptor : "?", slot);
+        /* v34.35 PERF: memoize declared-anchored hits (cache_declared set
+         * above) — the obj_class fallback is receiver-class-dependent and
+         * must stay on the slow path. */
+        if (cache_declared) {
+            uint8_t wide = (descriptor && (descriptor[0] == 'J' || descriptor[0] == 'D')) ? 1 : 0;
+            field_cache_fill(frame, index, cache_declared, slot, wide);
+        }
     } else {
         LOG_SAFE("[EXEC] getfield: field %s.%s%s not found in hierarchy, returning 0\n", 
                 class_name ? class_name : "?", field_name ? field_name : "?",
@@ -2539,6 +3117,31 @@ int op_getfield(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 }
 
 int op_putfield(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
+    /* v34.35 PERF: inline-cache fast path (see op_getfield). On miss, the
+     * original slow path below re-fetches and handles wide/DRM/NPE cases.
+     * Frame->pc enters at opcode+1. Stack layout: [.., obj, value] or
+     * [.., obj, v, v] for J/D. */
+    {
+        FieldRefCache* fc = field_cache_entry(frame, (uint16_t)(((uint16_t)frame->code[frame->pc] << 8) | (uint16_t)frame->code[frame->pc + 1])  /* JVMS: big-endian u16 */);
+        if (fc && fc->valid && fc->gen == g_vm_cache_gen) {
+            int voff = fc->wide ? 2 : 1;
+            JavaObject* obj = (JavaObject*)frame->stack[frame->stack_top - voff].ref;
+            /* [ARGGUARD] v36.49: мусорный receiver -> медленный путь */
+            if (obj && !argguard_bad_ptr((uintptr_t)obj)) {
+                JavaClass* oc = obj->header.clazz;
+                if (oc && (oc == fc->declared || jvm_class_is_subclass_of(oc, fc->declared))) {
+                    JavaValue v = POP(frame);
+                    if (fc->wide) {
+                        POP_VOID(frame);   /* discard the J/D high slot (copy) */
+                    }
+                    POP_VOID(frame);       /* discard the receiver ref */
+                    obj->fields[fc->slot] = v;
+                    frame->pc += 2;   /* pc entered at opcode+1; putfield is 3 bytes */
+                    return 0;
+                }
+            }
+        }
+    }
     uint16_t index = FETCH_U2(frame);
     
     /* Get field reference from constant pool */
@@ -2560,7 +3163,7 @@ int op_putfield(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     /* Pop value - long and double need 2 stack slots */
     JavaValue value;
     if (descriptor && (descriptor[0] == 'J' || descriptor[0] == 'D')) {
-        POP(frame); /* discard high slot */
+        POP_VOID(frame); /* discard high slot */
         value = POP(frame);
     } else {
         value = POP(frame);
@@ -2581,6 +3184,14 @@ int op_putfield(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         return -1;
     }
     
+    /* [ARGGUARD] v36.49: мусорный receiver — НЕ deref [obj+0] */
+    if (argguard_bad_ptr((uintptr_t)obj)) {
+        LOG_SAFE("[EXEC] putfield: FATAL: garbage receiver %p for field %s.%s (ARGGUARD)\n",
+                (void*)obj, class_name ? class_name : "?", field_name ? field_name : "?");
+        jvm_throw_by_name(jvm, "java/lang/InternalError", "garbage receiver (putfield)");
+        return -1;
+    }
+    
     if (!obj->header.clazz) {
         LOG_SAFE("[EXEC] putfield: FATAL: Object %p has NULL class pointer! Field: %s.%s\n", 
                 (void*)obj, class_name ? class_name : "?", field_name ? field_name : "?");
@@ -2597,8 +3208,21 @@ int op_putfield(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     
     JavaClass* obj_class = obj->header.clazz;
     
-    /* === CRITICAL FIX: Use hierarchy-aware field lookup === */
-    FieldLookupResult field_result = find_field_in_hierarchy(obj_class, field_name, descriptor);
+    /* === v18 FIX (JVMS 6.5 putfield): resolve from the declared class of
+     * the Fieldref (see the getfield comment). Writing through a base-typed
+     * reference must update the BASE field, not a subclass shadow. === */
+    JavaClass* ref_class = obj_class;
+    JavaClass* cache_declared = NULL;   /* v34.35: loaded CP-declared class */
+    if (class_name) {
+        JavaClass* declared = jvm_load_class(jvm, class_name);
+        if (declared) { ref_class = declared; cache_declared = declared; }
+    }
+    FieldLookupResult field_result = find_field_in_hierarchy(ref_class, field_name, descriptor);
+    if (!field_result.defining_class && ref_class != obj_class) {
+        /* v34.35 PERF: obj_class fallback — NOT memoizable (see getfield). */
+        field_result = find_field_in_hierarchy(obj_class, field_name, descriptor);
+        cache_declared = NULL;
+    }
 
     if (field_result.defining_class) {
         int slot = field_result.slot;
@@ -2613,7 +3237,13 @@ int op_putfield(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         }
 
         obj->fields[slot] = value;
-        
+
+        /* v34.35 PERF: memoize declared-anchored hits for the fast path. */
+        if (cache_declared) {
+            uint8_t wide = (descriptor && (descriptor[0] == 'J' || descriptor[0] == 'D')) ? 1 : 0;
+            field_cache_fill(frame, index, cache_declared, slot, wide);
+        }
+
         LOG_OPCODE("[EXEC] putfield: %s.%s (slot %d)\n", 
                    class_name ? class_name : "?", field_name ? field_name : "?", slot);
     } else {
@@ -2625,7 +3255,207 @@ int op_putfield(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 }
 
 /* Method invocation - UPDATED with exception checking after native calls */
+/* v34.4 DIAG: compact context dump for invoke stack underflows. Printed at
+ * most 5 times per process; shows the caller frame, a short bytecode window
+ * right before the invoke (which instruction was supposed to produce the
+ * missing slot) and the surviving operand stack. Diagnoses cases like the
+ * user log "Stack underflow in invokevirtual: Alert.setString ... (stack
+ * has 1)" where an earlier push silently never happened. */
+static void log_invoke_underflow_diag(const char* kind, JavaFrame* frame,
+                                      const char* cls, const char* meth,
+                                      const char* desc, int arg_count,
+                                      int available, int invoke_len) {
+    static int diag_count = 0;
+    if (diag_count >= 5) return;
+    diag_count++;
+    int pc = (int)frame->pc - invoke_len;
+    if (pc < 0) pc = (int)frame->pc;
+    LOG_SAFE("[EXEC] Stack underflow in %s: %s.%s%s at PC=%d (need %d args + this, stack has %d) - padding with zeros\n",
+             kind, cls ? cls : "?", meth ? meth : "?", desc ? desc : "?",
+             pc, arg_count, available);
+    LOG_SAFE("[EXEC]   caller=%s.%s max_stack=%d\n",
+             (frame->clazz && frame->clazz->class_name) ? frame->clazz->class_name : "?",
+             (frame->method && frame->method->name) ? frame->method->name : "?",
+             (int)frame->max_stack);
+    /* Bytecode window before the invoke */
+    {
+        int start = pc - 12;
+        if (start < 0) start = 0;
+        char hex[3 * 12 + 1];
+        size_t pos = 0;
+        for (int i = start; i < pc && pos + 3 < sizeof(hex); i++) {
+            pos += (size_t)snprintf(hex + pos, sizeof(hex) - pos, "%02X ", frame->code[i]);
+        }
+        hex[pos] = '\0';
+        LOG_SAFE("[EXEC]   bytes before invoke [PC %d..%d]: %s\n", start, pc, hex);
+    }
+    /* Surviving operand stack (top 8 entries, top first) */
+    {
+        int depth = frame->stack_top + 1;
+        int n = depth > 8 ? 8 : depth;
+        for (int k = 0; k < n; k++) {
+            int idx = frame->stack_top - k;
+            JavaValue* v = &frame->stack[idx];
+            LOG_SAFE("[EXEC]   stack[%d] ref=%p raw=0x%llx\n", idx,
+                     (void*)v->ref, (unsigned long long)v->raw);
+        }
+        if (depth > 8) {
+            LOG_SAFE("[EXEC]   ... %d more slots\n", depth - 8);
+        }
+    }
+}
+
+/* === v34.6: generic invoke tracer ======================================
+ * NOJME_TRACE_INVOKE="Cls.m1;Cls.m2;..." — print every call of the listed
+ * class.method pairs (invokestatic/virtual/special/interface), throttled:
+ * first 40 hits, then every 500th. Used to trace game-side render chains
+ * (Doom RPG: k.J / i.a / r.c / r.a never reaching Graphics.drawRGB). */
+typedef struct { char* cls; char* mth; char* desc; int hits; } InvokeWatchEntry;
+static InvokeWatchEntry g_invoke_watch[16];
+static int g_invoke_watch_n = -1;   /* -1 = not initialized */
+/* v34.11: NOJME_TRACE_INVOKE_EVERY=<n> — after the first 40 hits of an entry,
+ * print every <n>-th (default 500). Set 1 to log every call. */
+static int g_invoke_watch_every = 500;
+
+static void invoke_watch_init(void) {
+    if (g_invoke_watch_n >= 0) return;
+    g_invoke_watch_n = 0;
+    const char* every_env = getenv("NOJME_TRACE_INVOKE_EVERY");
+    if (every_env && *every_env) {
+        int v = atoi(every_env);
+        if (v > 0) g_invoke_watch_every = v;
+    }
+    const char* env = getenv("NOJME_TRACE_INVOKE");
+    if (!env || !*env) return;
+    /* Manual tokenizer: strtok_r is not portable to all MinGW headers */
+    const char* p = env;
+    while (*p && g_invoke_watch_n < 16) {
+        const char* semi = strchr(p, ';');
+        size_t len = semi ? (size_t)(semi - p) : strlen(p);
+        if (len > 0 && len < 64) {
+            char tok[64];
+            memcpy(tok, p, len);
+            tok[len] = '\0';
+            char* dot = strchr(tok, '.');
+            if (dot && dot != tok && dot[1]) {
+                *dot = '\0';
+                g_invoke_watch[g_invoke_watch_n].cls = strdup(tok);
+                /* Optional descriptor prefix: "Cls.mth(desc" matches methods
+                 * whose descriptor starts with "(desc" (overload disambiguation). */
+                char* paren = strchr(dot + 1, '(');
+                if (paren) {
+                    g_invoke_watch[g_invoke_watch_n].desc = strdup(paren);
+                    *paren = '\0';
+                } else {
+                    g_invoke_watch[g_invoke_watch_n].desc = NULL;
+                }
+                g_invoke_watch[g_invoke_watch_n].mth = strdup(dot + 1);
+                g_invoke_watch[g_invoke_watch_n].hits = 0;
+                g_invoke_watch_n++;
+            }
+        }
+        p = semi ? semi + 1 : p + len;
+    }
+}
+
+static void invoke_watch_hit(const char* cls, const char* mth, const char* desc,
+                             const char* kind, JavaFrame* frame, jint top_int) {
+    if (g_invoke_watch_n <= 0) return;
+    for (int i = 0; i < g_invoke_watch_n; i++) {
+        if (strcmp(g_invoke_watch[i].cls, cls) == 0 &&
+            strcmp(g_invoke_watch[i].mth, mth) == 0 &&
+            (!g_invoke_watch[i].desc ||
+             (desc && strncmp(desc, g_invoke_watch[i].desc,
+                              strlen(g_invoke_watch[i].desc)) == 0))) {
+            int h = ++g_invoke_watch[i].hits;
+            if (h <= 40 || (h % g_invoke_watch_every) == 0) {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                LOG_SAFE("[INVOKE-WATCH] [%ld.%03ld] %s %s.%s%s hit#%d topInt=%d caller=%s.%s pc=%u\n",
+                         (long)(ts.tv_sec % 100000), (long)(ts.tv_nsec / 1000000),
+                         kind, cls, mth, desc ? desc : "", h, top_int,
+                         (frame->clazz && frame->clazz->class_name) ? frame->clazz->class_name : "?",
+                         (frame->method && frame->method->name) ? frame->method->name : "?",
+                         (unsigned)frame->pc);
+            }
+            return;
+        }
+    }
+}
+
+/* v36.03 NATIVE-ARGS-ROOTED: the slow paths of the invoke wrappers call
+ * natives DIRECTLY (bypassing native_call), so the receiver/args are
+ * invisible to the GC frame scan for the whole native. The v34.14 pins
+ * only protect the arg OBJECTS themselves — not the object graph behind
+ * them (a pinned Vector whose elementData elements still get swept was
+ * exactly the field Data Abort shape). Publishing the args buffer to the
+ * mark phase makes the GC mark the full graph reachable from the args
+ * while the native runs. Same helper pattern as native_call's rooting. */
+static int nargs_root_push(JavaThread* thread, JavaValue* args, int count) {
+    if (!thread || !args || count <= 0) return -1;
+    if (thread->native_arg_depth >= NATIVE_ARG_FRAMES_MAX) return -1;
+    int slot = thread->native_arg_depth++;
+    thread->native_arg_frames[slot].args = args;
+    thread->native_arg_frames[slot].count = count;
+    return slot;
+}
+
+static void nargs_root_pop(JavaThread* thread, int slot) {
+    if (slot < 0 || !thread) return;
+    thread->native_arg_frames[slot].args = NULL;
+    thread->native_arg_frames[slot].count = 0;
+    thread->native_arg_depth--;
+}
+
 int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
+    /* v34.35 PERF: monomorphic inline cache. Contract: frame->pc enters at
+     * opcode+1. On miss (no cache entry, receiver class changed, stack
+     * underflow) we fall through to the original slow path which re-fetches
+     * everything and re-executes the compat/DRM/null-receiver hooks. */
+    {
+        InvokeRefCache* ic = invoke_cache_entry(frame,
+                (uint16_t)(((uint16_t)frame->code[frame->pc] << 8) | (uint16_t)frame->code[frame->pc + 1]));
+        if (ic && ic->valid && ic->kind == 0 && ic->java_argc >= 0 && ic->gen == g_vm_cache_gen) {
+            int total_slots = 1;   /* this */
+            for (int i = 0; i < ic->java_argc; i++) total_slots += ic->arg_slots[i];
+            if (frame->stack_top + 1 >= total_slots) {
+                int base = frame->stack_top + 1 - total_slots;
+                JavaObject* recv = (JavaObject*)frame->stack[base].ref;
+                /* [ARGGUARD] v36.49: receiver из operand stack может быть
+                 * мусором (поле: 0x20697465592F7365 = ASCII "es/Yeti ") —
+                 * сначала правдоподобие, ПОТОМ deref [recv+0]; мусор уходит
+                 * в медленный путь с валидацией (Ryujinx suppression
+                 * давала тот же исход: сравнение провалено -> slow path). */
+                if (recv && !argguard_bad_ptr((uintptr_t)recv) &&
+                    recv->header.clazz == ic->target_class) {
+                    /* Hot path: compact args pop + direct execute_method. */
+                    JavaValue args_buf[12];
+                    JavaValue* args = (total_slots <= 12) ? args_buf
+                        : (JavaValue*)malloc((size_t)total_slots * sizeof(JavaValue));
+                    if (args) {
+                        args[0] = frame->stack[base];
+                        int cur = base + 1;
+                        for (int i = 0; i < ic->java_argc; i++) {
+                            args[i + 1] = frame->stack[cur];   /* low slot of Java arg i */
+                            cur += ic->arg_slots[i];
+                        }
+                        frame->stack_top = (int16_t)(base - 1);
+
+                        frame->pc += 2;   /* pc entered at opcode+1; invokevirtual is 3 bytes total */
+                        JavaValue result;
+                        int ret = execute_method(jvm, thread, ic->method, args, &result);
+                        if (args != args_buf) free(args);
+                        if (ret != 0) return -1;   /* pending_exception set by callee */
+                        if (ic->method->is_native && ic->has_ret) {
+                            PUSH(frame, result);
+                            if (ic->ret_wide) PUSH(frame, result);
+                        }
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
     uint16_t index = FETCH_U2(frame);
 
     const char* class_name = NULL;
@@ -2643,10 +3473,20 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         }
     }
 
-    if (!descriptor) {
-        LOG_SAFE("[EXEC] FATAL: invokevirtual at index %d has NULL descriptor!\n", index);
+    if (!descriptor || !method_name) {
+        /* v9: also reject NULL method_name — downstream native_find() would
+         * strcmp() it and MinGW printf would print it, both crash. */
+        LOG_SAFE("[EXEC] FATAL: invokevirtual at index %d has unresolved name/type!\n", index);
+        jvm_throw_by_name(jvm, "java/lang/NoSuchMethodError", "Unresolved virtual method ref");
         return -1;
     }
+
+    invoke_watch_init();
+    /* v34.9: also extract topInt for virtual calls (top of stack = last int
+     * arg for (I...)V style signatures; for (Ls;Z)V the boolean is the top
+     * int slot). Static calls did this from the start. */
+    invoke_watch_hit(class_name, method_name, descriptor, "virtual", frame,
+                     frame->stack_top >= 0 ? frame->stack[frame->stack_top].i : 0);
 
     int arg_count = count_args(descriptor);
 
@@ -2654,17 +3494,30 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
      * Some J2ME games have slightly invalid bytecode or rely on
      * implementation-specific stack behavior. Instead of aborting,
      * pad missing arguments with zeros and continue execution.
-     * This lets the game continue past minor bytecode issues. */
+     * This lets the game continue past minor bytecode issues.
+     * v9: bound the padding by max_stack — if arg_count+1 (args + this)
+     * can never fit, the classfile is broken and padding would PUSH past
+     * frame->stack (release PUSH is unchecked) -> VerifyError instead. */
     int available = frame->stack_top + 1;
     if (available < arg_count + 1) {
+        if (arg_count + 1 > (int)frame->max_stack) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "invokevirtual needs %d stack slots, max_stack=%d",
+                     arg_count + 1, (int)frame->max_stack);
+            LOG_SAFE("[EXEC] invokevirtual: %s\n", msg);
+            jvm_throw_by_name(jvm, "java/lang/VerifyError", msg);
+            return -1;
+        }
         static int underflow_count = 0;
         if (underflow_count < 20) {
-            LOG_SAFE("[EXEC] Stack underflow in invokevirtual: %s.%s%s at PC=%d (need %d args + this, stack has %d) — padding with zeros\n",
-                    class_name ? class_name : "?",
-                    method_name ? method_name : "?",
-                    descriptor ? descriptor : "?",
-                    frame->pc - 3, arg_count, available);
             underflow_count++;
+            /* v34.4: richer context (caller frame, bytecode window, surviving
+             * stack) - the plain line could not explain WHERE the missing
+             * push was lost (user log game 2: Alert.setString "stack has 1"). */
+            log_invoke_underflow_diag("invokevirtual", frame, class_name,
+                                      method_name, descriptor, arg_count,
+                                      available, 3);
         }
         /* Pad the stack with zero values so we can pop what we need */
         while (frame->stack_top + 1 < arg_count + 1) {
@@ -2674,16 +3527,19 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         }
     }
 
-    JavaValue* args = (JavaValue*)malloc((arg_count + 1) * sizeof(JavaValue));
+    /* v18 FIX: compact args[] (args[0]=this + one entry per Java argument,
+     * J/D included) — see count_java_args/pop_args_compact. The old
+     * slot-wise pop shifted every argument after the first long/double. */
+    int java_arg_count = count_java_args(descriptor);
+    JavaValue* args = (JavaValue*)malloc((java_arg_count + 1) * sizeof(JavaValue));
     if (!args) return -1;
     
-    /* Pop arguments */
-    for (int i = arg_count; i >= 1; i--) {
-        args[i] = POP(frame);
+    /* Pop 'this' + arguments compactly */
+    if (pop_args_compact(frame, descriptor, 1, args) < 0) {
+        free(args);
+        jvm_throw_by_name(jvm, "java/lang/OutOfMemoryError", "Args pop failed");
+        return -1;
     }
-    
-    /* Pop object reference (this) */
-    args[0] = POP(frame);
     
     JavaObject* obj = (JavaObject*)args[0].ref;
 
@@ -2784,9 +3640,13 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
          * This is NOT correct Java but needed for game compatibility.
          */
         if (class_name && strcmp(class_name, "javax/microedition/lcdui/Font") == 0) {
-            /* Default font dimensions (matching bitmap_font.h: FONT_WIDTH=5, FONT_HEIGHT=7) */
+            /* Default font dimensions (bitmap_font.h: FONT_WIDTH=5, FONT_HEIGHT=7).
+             * v36.29 [FONT-HEIGHT]: getHeight() = glyph box + 2px LEADING = 9,
+             * matching midp_font_height (graphics.c) — lines spaced by
+             * getHeight() must not touch. Baseline (ascent) stays 5. */
             #define DEFAULT_FONT_WIDTH 5
-            #define DEFAULT_FONT_HEIGHT 7
+            #define DEFAULT_FONT_HEIGHT 9
+            #define DEFAULT_FONT_BASELINE 5
             
             /* Font.stringWidth(String) - return estimated width */
             if (method_name && strcmp(method_name, "stringWidth") == 0 &&
@@ -2873,7 +3733,7 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             if (method_name && strcmp(method_name, "getBaselinePosition") == 0 &&
                 descriptor && strcmp(descriptor, "()I") == 0) {
                 /* Debug logging disabled */
-                JavaValue result = { .i = DEFAULT_FONT_HEIGHT - 2 };
+                JavaValue result = { .i = DEFAULT_FONT_BASELINE };
                 PUSH(frame, result);
                 free(args);
                 return 0;
@@ -3116,7 +3976,10 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             }
         }
         
-        /* Throw NPE for other null method calls - correct Java behavior */
+        /* Throw NPE for other null method calls - correct Java behavior.
+         * v34.4: carry a MESSAGE - "(no message)" NPEs in game logs told us
+         * nothing about WHICH reference was null (user log game 1:
+         * b.paint PC=13 -> "NullPointerException (no message)"). */
         static int npe_invokevirtual_count = 0;
         if (npe_invokevirtual_count < 10) {
             LOG_SAFE("[NPE] invokevirtual on null object: %s.%s%s\n",
@@ -3129,7 +3992,15 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             }
         }
         free(args);
-        jvm_throw_by_name(jvm, "java/lang/NullPointerException", NULL);
+        {
+            char npe_msg[192];
+            snprintf(npe_msg, sizeof(npe_msg),
+                     "Null receiver calling %s.%s%s",
+                     class_name ? class_name : "?",
+                     method_name ? method_name : "?",
+                     descriptor ? descriptor : "?");
+            jvm_throw_by_name(jvm, "java/lang/NullPointerException", npe_msg);
+        }
         return -1;
     }
     
@@ -3138,8 +4009,11 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     if (!is_heap_ptr_check(obj)) {
         /* Check if this is a JavaClass* acting as a Class object */
         /* JavaClass structs have header.clazz pointing to java/lang/Class */
+        /* [ARGGUARD] v36.49: не-кучный obj может быть МУСОРОМ (не-каноничен/
+         * не выровнен) — проба Class-объекта deref-ит [obj+0]; сначала
+         * правдоподобие, проба только для правдоподобных указателей. */
         JavaClass* potential_class = (JavaClass*)obj;
-        if (potential_class->header.clazz && 
+        if (!argguard_bad_ptr((uintptr_t)obj) && potential_class->header.clazz && 
             potential_class->header.clazz->class_name &&
             strcmp(potential_class->header.clazz->class_name, "java/lang/Class") == 0) {
             /* This is a valid JavaClass* acting as a Class object - allow it */
@@ -3218,17 +4092,21 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             /* Check if this looks like UTF-16 data: high byte of each 16-bit word is 0 */
             /* Pattern: for addr like 0x003200650064002f, bytes are 00 32 00 65 00 64 00 2f */
             /* We check if every other byte (positions 1, 3, 5, 7) is 0x00 */
+            uint64_t a64 = (uint64_t)clazz_addr;   /* wide type: shifts up to 56 are legal on 32-bit targets too */
             bool looks_like_utf16 = (
-                ((clazz_addr >> 8) & 0xFF) == 0x00 ||  /* byte 1 */
-                ((clazz_addr >> 24) & 0xFF) == 0x00 || /* byte 3 */
-                ((clazz_addr >> 40) & 0xFF) == 0x00 || /* byte 5 */
-                ((clazz_addr >> 56) & 0xFF) == 0x00    /* byte 7 */
+                ((a64 >> 8) & 0xFF) == 0x00 ||  /* byte 1 */
+                ((a64 >> 24) & 0xFF) == 0x00 || /* byte 3 */
+                ((a64 >> 40) & 0xFF) == 0x00 || /* byte 5 */
+                ((a64 >> 56) & 0xFF) == 0x00    /* byte 7 */
             );
             
             /* Also check if value looks too small to be a pointer (but could be a valid small int) */
-            bool is_small_value = clazz_addr < 0x100000 && clazz_addr > 0;
+            bool is_small_value = clazz_addr != 0 && clazz_addr < 0x100000;
             
-            if (obj_gc_hdr->clazz && clazz_addr > 0x10000 && clazz_addr < 0x7fff00000000ULL && !looks_like_utf16 && !is_small_value) {
+            /* Compare in uint64_t (a64): on 32-bit targets (MinGW32/ARM) clazz_addr
+             * is 32-bit, so the raw < 0x7fff00000000ULL check is always-true and
+             * trips -Wtype-limits under -Wextra. a64 is the same value, widened. */
+            if (obj_gc_hdr->clazz && a64 > 0x10000 && a64 < 0x7fff00000000ULL && !looks_like_utf16 && !is_small_value) {
                 /* Check if it might be a valid JavaClass by checking if it's in heap */
                 if (is_heap_ptr_check(obj_gc_hdr->clazz)) {
                     clazz_ptr = obj_gc_hdr->clazz;
@@ -3238,8 +4116,8 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                     clazz_ptr = obj_gc_hdr->clazz;
                 }
             } else {
-                LOG_SAFE("[EXEC] invokevirtual: GC header clazz appears corrupted (addr=0x%lx, utf16=%d, small=%d), cannot recover\n", 
-                        clazz_addr, looks_like_utf16, is_small_value);
+                LOG_SAFE("[EXEC] invokevirtual: GC header clazz appears corrupted (addr=0x%llx, utf16=%d, small=%d), cannot recover\n", 
+                        (unsigned long long)clazz_addr, looks_like_utf16, is_small_value);
                 free(args);
                 return -1;
             }
@@ -3302,6 +4180,19 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             native = native_find(jvm, search_class->class_name, method_name, descriptor);
             if (!native) search_class = search_class->super_class;
         }
+        /* v34.76: descriptor-relaxed second pass (exact chain missed).
+         * Legacy games compiled against non-standard API stubs (Roboros:
+         * void LayerManager.append) land here; args section must match
+         * byte-for-byte, only the return type may differ. Result push
+         * below is driven by the CALLER's descriptor, so a ")V" caller
+         * of a ")I" native simply discards the value. */
+        if (!native) {
+            JavaClass* relax_class = target_class;
+            while (relax_class && !native) {
+                native = native_find_relaxed(jvm, relax_class->class_name, method_name, descriptor);
+                if (!native) relax_class = relax_class->super_class;
+            }
+        }
         /* M3G-DEBUG: Log native_find result */
         if (class_name && strstr(class_name, "m3g") && method_name) {
 #if M3G_DEBUG_LOG
@@ -3358,20 +4249,42 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             
             /* PINNING: Pin all object arguments before calling native method
              * This prevents GC from moving/collecting them during native execution */
-            for (int pi = 0; pi <= arg_count; pi++) {
+            for (int pi = 0; pi <= java_arg_count; pi++) {
                 if (args[pi].ref && is_heap_ptr_check(args[pi].ref)) {
                     gc_pin(jvm, args[pi].ref);
                 }
             }
             
-            JavaValue result = native(jvm, thread, args, arg_count + 1);
+            /* v34.14 NATIVE-SCOPE AUTO-PIN: objects allocated INSIDE the
+             * native (held only in C locals) are born pinned; the pins are
+             * released together when the native returns. */
+            extern __thread int g_gc_in_native;
+            extern size_t gc_autopin_base(void);
+            extern void gc_autopin_release(size_t base);
+            size_t ap_base = gc_autopin_base();
+            g_gc_in_native++;
+            
+            extern void jvm_note_native_call(JavaThread*, const char*, const char*);
+            jvm_note_native_call(thread, class_name, method_name);
+            /* [ARGGUARD] v36.49: валидация ref-слотов (malloc-массив,
+             * defuse безопасен) + возврата native */
+            argguard_check_array(class_name, method_name, descriptor, args,
+                                 java_arg_count + 1, 1,
+                                 __builtin_return_address(0), 1);
+            int naf_slot = nargs_root_push(thread, args, java_arg_count + 1);
+            JavaValue result = native(jvm, thread, args, java_arg_count + 1);
+            argguard_check_ret(class_name, method_name, descriptor, &result,
+                               __builtin_return_address(0));
+            nargs_root_pop(thread, naf_slot);
+            g_gc_in_native--;
             
             /* UNPINNING: Unpin all object arguments after native method returns */
-            for (int pi = 0; pi <= arg_count; pi++) {
+            for (int pi = 0; pi <= java_arg_count; pi++) {
                 if (args[pi].ref && is_heap_ptr_check(args[pi].ref)) {
                     gc_unpin(jvm, args[pi].ref);
                 }
             }
+            gc_autopin_release(ap_base);
             
             free(args);
             
@@ -3388,8 +4301,40 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         }
         
         /* Stub fallback */
-        LOG_OPCODE("[EXEC] invokevirtual: method %s.%s%s not found (stub?), using default\n", 
+        LOG_OPCODE("[EXEC] invokevirtual: method %s.%s%s not found (stub?), using default\n",
                 target_class->class_name, method_name, descriptor);
+
+        /* v34.6: unhooked API calls are SILENT feature killers for EVERY API
+         * family, not just M3G (Doom RPG: Graphics.drawRGB registered with a
+         * 7-param descriptor while the game called the 8-param one - the 3D
+         * viewport silently never rendered). Surface ALL of them loudly,
+         * throttled. */
+        {
+            static int inv_missing_count = 0;
+            if (inv_missing_count < 60) {
+                inv_missing_count++;
+                MISSING_LOG("[INVOKE-MISSING] virtual: %s.%s%s (caller=%s.%s pc=%u) - stub no-op, default pushed\n",
+                         target_class->class_name ? target_class->class_name : "?",
+                         method_name ? method_name : "?", descriptor ? descriptor : "?",
+                         (frame->clazz && frame->clazz->class_name) ? frame->clazz->class_name : "?",
+                         (frame->method && frame->method->name) ? frame->method->name : "?",
+                         (unsigned)frame->pc);
+            }
+        }
+        
+        /* v11 DIAG: unhooked M3G API calls are SILENT feature killers (they
+         * return defaults and the game skips/loses 3D). Surface them loudly,
+         * throttled, so a game log pinpoints exactly which signature to add. */
+        if (target_class->class_name && method_name && descriptor &&
+            (strstr(target_class->class_name, "m3g/") != NULL ||
+             strstr(target_class->class_name, "micro3d") != NULL)) {
+            static int m3g_missing_count = 0;
+            if (m3g_missing_count < 40) {
+                m3g_missing_count++;
+                MISSING_LOG("[M3G-MISSING] unresolved instance call: %s.%s%s\n",
+                        target_class->class_name, method_name, descriptor);
+            }
+        }
         
         if (strlen(descriptor) > 0) {
             const char* ret = strchr(descriptor, ')');
@@ -3403,6 +4348,40 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         return 0;
     }
     
+    /* v34.35 PERF: fill the inline cache (monomorphic on the receiver's
+     * runtime class — exactly what jvm_resolve_method dispatched on).
+     * Methods with >11 Java args or unresolved stubs stay uncached. */
+    {
+        int jac = count_java_args(descriptor);
+        if (jac >= 0 && jac <= 11 && method->code.code && method->code.code_length > 0) {
+            InvokeRefCache* ic = invoke_cache_entry(frame, index);
+            if (ic) {
+                /* arg slot layout from the descriptor (J/D = 2 slots) */
+                const char* dp = descriptor;
+                if (*dp == '(') dp++;
+                int ai = 0, slots_ok = 1;
+                while (*dp && *dp != ')' && ai < jac) {
+                    if (*dp == 'J' || *dp == 'D') { ic->arg_slots[ai++] = 2; dp++; }
+                    else if (*dp == 'L') { ic->arg_slots[ai++] = 1; while (*dp && *dp != ';') dp++; if (*dp) dp++; }
+                    else if (*dp == '[') { ic->arg_slots[ai] = 1; dp++; if (*dp == 'L') { while (*dp && *dp != ';') dp++; if (*dp) dp++; } else if (*dp) dp++; ai++; }
+                    else { ic->arg_slots[ai++] = 1; dp++; }
+                }
+                if (ai != jac || (*dp != ')')) slots_ok = 0;
+                if (slots_ok) {
+                    ic->target_class = obj->header.clazz;
+                    ic->method = method;
+                    ic->java_argc = (int16_t)jac;
+                    ic->gen = g_vm_cache_gen;
+                    ic->kind = 0;
+                    const char* rp = strchr(descriptor, ')');
+                    ic->has_ret = (rp && rp[1] != 'V' && rp[1] != '\0') ? 1 : 0;
+                    ic->ret_wide = (rp && (rp[1] == 'J' || rp[1] == 'D')) ? 1 : 0;
+                    ic->valid = 1;
+                }
+            }
+        }
+    }
+
     JavaValue result;
     int ret = execute_method(jvm, thread, method, args, &result);
 
@@ -3480,6 +4459,19 @@ int op_invokespecial(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     const char* class_name = NULL;
     const char* method_name = NULL;
     const char* descriptor = NULL;
+    {
+        /* v34.17: cover invokespecial in the INVOKE-WATCH tracer (private
+         * render methods of NET Lizard games are invokespecial targets) */
+        if (index > 0 && index < frame->clazz->constant_pool_count) {
+            ConstantPoolEntry* entry = &frame->clazz->constant_pool[index];
+            if (entry->tag == CONSTANT_Methodref || entry->tag == CONSTANT_InterfaceMethodref) {
+                const char* cn = classfile_get_class_name(frame->clazz, entry->info.ref_info.class_index);
+                const char* mn = NULL, * dn = NULL;
+                classfile_get_name_and_type(frame->clazz, entry->info.ref_info.name_and_type_index, &mn, &dn);
+                if (cn && mn) invoke_watch_hit(cn, mn, dn, "special", frame, 0);
+            }
+        }
+    }
     
     /* DEBUG: Log constant pool state */
     if (g_j2me_runtime_debug) {
@@ -3519,7 +4511,7 @@ int op_invokespecial(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             if (g_j2me_runtime_debug) {
                 if (g_j2me_runtime_debug) LOG_SAFE("[INVOKESPECIAL DEBUG] Unexpected tag! Raw entry data: ");
                 uint8_t* raw = (uint8_t*)entry;
-                for (int i = 0; i < sizeof(ConstantPoolEntry) && i < 32; i++) {
+                for (int i = 0; i < (int)sizeof(ConstantPoolEntry) && i < 32; i++) {
                     LOG_SAFE("%02x ", raw[i]);
                 }
                 LOG_SAFE("\n");
@@ -3570,6 +4562,24 @@ int op_invokespecial(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         
         /* Get stack slots needed (including 2 slots for long/double) */
         int stack_slots = count_args(descriptor);
+
+        /* Underflow guard (release POP is unchecked!): popping stack_slots
+         * argument slots + 1 'this' slot must not run below the stack base.
+         * A corrupted classfile / CP can desync the stack — throw VerifyError
+         * instead of segfaulting below frame->stack (seen on MinGW release). */
+        if (frame->stack_top < stack_slots) {
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                     "%s.%s%s needs %d stack slots, stack has %d",
+                     class_name ? class_name : "?",
+                     method_name ? method_name : "?",
+                     descriptor ? descriptor : "",
+                     stack_slots, frame->stack_top + 1);
+            LOG_SAFE("[EXEC] invokespecial stack underflow: %s\n", msg);
+            free(args);
+            jvm_throw_by_name(jvm, "java/lang/VerifyError", msg);
+            return -1;
+        }
         
         /* Allocate args array: this + java_args */
         args = (JavaValue*)malloc((java_args + 1) * sizeof(JavaValue));
@@ -3591,9 +4601,14 @@ int op_invokespecial(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         
         /* Pop object reference (this) */
         if (frame->stack_top < 0) {
-            LOG_SAFE("[EXEC] Stack underflow: no this reference\n");
+            /* v9: throw instead of bare return — the interpreter loop expects
+             * a pending exception (or a fatal abort) when a handler returns
+             * -1; a catchable VerifyError is the spec-conformant choice. */
+            LOG_SAFE("[EXEC] invokespecial: stack underflow, no 'this' reference\n");
             free(stack_vals);
             free(args);
+            jvm_throw_by_name(jvm, "java/lang/VerifyError",
+                              "invokespecial: missing objectref");
             return -1;
         }
         args[0] = POP(frame);
@@ -3636,6 +4651,28 @@ int op_invokespecial(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         arg_count = java_args;
     }
     
+    /* FIX: guard against unresolved constant pool references.
+     * Previously a NULL descriptor (bad/absent CP entry, e.g. from stub
+     * classes) left args == NULL and the unconditional args[0] read below
+     * crashed the whole emulator with SIGSEGV. Throw a Java-level error
+     * instead, as required by the JVM spec. */
+    if (!class_name || !method_name || !descriptor || !args) {
+        LOG_SAFE("[EXEC] invokespecial: unresolved method ref #%d in %s.%s -> throwing NoSuchMethodError\n",
+                index,
+                frame->clazz && frame->clazz->class_name ? frame->clazz->class_name : "?",
+                class_name ? class_name : "?");
+        free(args); /* free(NULL) is safe */
+        {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "%s.%s%s", 
+                    class_name ? class_name : "?",
+                    method_name ? method_name : "<unknown>",
+                    descriptor ? descriptor : "");
+            jvm_throw_by_name(jvm, "java/lang/NoSuchMethodError", msg);
+        }
+        return -1;
+    }
+    
     JavaObject* obj = (JavaObject*)args[0].ref;
     
     LOG_OPCODE("[EXEC] invokespecial: %s.%s%s (obj=%p, args=%d)\n", 
@@ -3662,6 +4699,70 @@ int op_invokespecial(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     /* Find method */
     JavaMethod* method = jvm_resolve_method(jvm, target_class, method_name, descriptor);
     
+    /* v18 FIX: constructors are NOT inherited. jvm_resolve_method() walks
+     * up the superclass chain, so for a stub class without its own
+     * <init>()V (e.g. java/util/Date after the generic-ctor exclusion) it
+     * found Object.<init>()V - a no-op - and the class's registered native
+     * constructor was never invoked, leaving internal fields at 0
+     * (Date.getTime() == 0). If the resolved <init> is not declared by the
+     * target class itself, prefer the class's own native <init>.
+     *
+     * v34.12 FIX: also prefer the native ctor when the declared one is a
+     * STUB-GENERATED TRIVIAL constructor. create_stub_class() emits
+     * `2A B7 .. .. B1` (aload_0; invokespecial super.<init>; return)
+     * constructors whose ONLY purpose is to make `new X()` resolvable —
+     * they carry no real initialization. Such stub ctors win method
+     * resolution and silently skip the registered native ctors of the M3G
+     * classes (native_transform_init never allocated Transform's matrix
+     * array => every camera transform was identity => M3GTest rendered
+     * blank scenes). Classes whose stub ctor does real work (Thread/Vector/
+     * Hashtable/MIDlet putfield their fields) are NOT trivial and keep
+     * executing bytecode — zero behavior change for them. */
+    if (method_name && strcmp(method_name, "<init>") == 0) {
+        bool ctor_declared_here = false;
+        for (int mi = 0; mi < target_class->methods_count; mi++) {
+            JavaMethod* m = &target_class->methods[mi];
+            if (m->name && m->descriptor &&
+                strcmp(m->name, "<init>") == 0 &&
+                strcmp(m->descriptor, descriptor) == 0) {
+                ctor_declared_here = true;
+                break;
+            }
+        }
+
+        /* v34.12: is the declared ctor a trivial stub (no real init)? */
+        bool ctor_is_trivial_stub = true;
+        if (ctor_declared_here && method) {
+            ctor_is_trivial_stub = false;
+            if (!method->code.code || method->code.code_length == 0) {
+                ctor_is_trivial_stub = true;            /* no code at all */
+            } else if (method->code.code_length == 1 &&
+                       method->code.code[0] == 0xB1) {  /* bare return */
+                ctor_is_trivial_stub = true;
+            } else if (method->code.code_length == 5 &&
+                       method->code.code[0] == 0x2A &&  /* aload_0 */
+                       method->code.code[1] == 0xB7 &&  /* invokespecial */
+                       method->code.code[4] == 0xB1) {  /* return */
+                ctor_is_trivial_stub = true;            /* super-call only */
+            }
+        }
+
+        if (!ctor_declared_here || ctor_is_trivial_stub) {
+            NativeMethod native_ctor = native_find(jvm, target_class->class_name, "<init>", descriptor);
+            if (native_ctor) {
+                if (thread->pending_exception) thread->pending_exception = NULL;
+                argguard_check_array(target_class->class_name, "<init>", descriptor,
+                                     args, arg_count + 1, 1,
+                                     __builtin_return_address(0), 1);
+                JavaValue result = native_ctor(jvm, thread, args, arg_count + 1);
+                (void)result;  /* constructor returns void */
+                free(args);
+                if (thread->pending_exception) return -1;
+                return 0;
+            }
+        }
+    }
+    
     if (!method) {
         /* Try native method in class hierarchy - BUT NOT for constructors!
          * Constructors (<init>) must be executed as bytecode, not native handlers.
@@ -3676,6 +4777,14 @@ int op_invokespecial(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                 native = native_find(jvm, search_class->class_name, method_name, descriptor);
                 if (!native) {
                     search_class = search_class->super_class;
+                }
+            }
+            /* v34.76: descriptor-relaxed second pass (see invokevirtual). */
+            if (!native) {
+                JavaClass* relax_class = target_class;
+                while (relax_class && !native) {
+                    native = native_find_relaxed(jvm, relax_class->class_name, method_name, descriptor);
+                    if (!native) relax_class = relax_class->super_class;
                 }
             }
         }
@@ -3697,7 +4806,25 @@ int op_invokespecial(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                 }
             }
             
+            /* v34.14 NATIVE-SCOPE AUTO-PIN (see invokevirtual site) */
+            extern __thread int g_gc_in_native;
+            extern size_t gc_autopin_base(void);
+            extern void gc_autopin_release(size_t base);
+            size_t ap_base = gc_autopin_base();
+            g_gc_in_native++;
+            
+            extern void jvm_note_native_call(JavaThread*, const char*, const char*);
+            jvm_note_native_call(thread, class_name, method_name);
+            /* [ARGGUARD] v36.49: см. invokevirtual-сайт выше */
+            argguard_check_array(class_name, method_name, descriptor, args,
+                                 arg_count + 1, 1,
+                                 __builtin_return_address(0), 1);
+            int naf_slot = nargs_root_push(thread, args, arg_count + 1);
             JavaValue result = native(jvm, thread, args, arg_count + 1);
+            argguard_check_ret(class_name, method_name, descriptor, &result,
+                               __builtin_return_address(0));
+            nargs_root_pop(thread, naf_slot);
+            g_gc_in_native--;
             
             /* UNPINNING: Unpin all object arguments after native method returns */
             for (int pi = 0; pi <= arg_count; pi++) {
@@ -3705,6 +4832,7 @@ int op_invokespecial(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                     gc_unpin(jvm, args[pi].ref);
                 }
             }
+            gc_autopin_release(ap_base);
             
             /* DEBUG: Log result for array return types */
             if (g_j2me_runtime_debug && descriptor && strlen(descriptor) > 0) {
@@ -3768,6 +4896,9 @@ int op_invokespecial(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
              */
             NativeMethod native_ctor = native_find(jvm, target_class->class_name, "<init>", descriptor);
             if (native_ctor) {
+                argguard_check_array(target_class->class_name, "<init>", descriptor,
+                                     args, arg_count + 1, 1,
+                                     __builtin_return_address(0), 1);
                 JavaValue result = native_ctor(jvm, thread, args, arg_count + 1);
                 (void)result;  /* Constructor returns void */
                 free(args);
@@ -4021,6 +5152,30 @@ int op_invokespecial(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                             }
                         }
                     }
+
+                    /* v38 FIX (BlackShark3D): Float.<init>(float) must store
+                     * its argument into the value field — new Float(x).floatValue()
+                     * returned 0.0f (mission loading froze at 95%). */
+                    if (strstr(class_name, "java/lang/Float") != NULL &&
+                        descriptor && arg_count >= 1) {
+                        if (strncmp(descriptor, "(F)V", 4) == 0) {
+                            jfloat float_val = args[1].f;
+                            if (OBJECT_HAS_FIELDS(obj, 1)) {
+                                obj->fields[0].f = float_val;  /* value */
+                            }
+                        }
+                    }
+
+                    /* v38 FIX: Double.<init>(double) — same pattern. */
+                    if (strstr(class_name, "java/lang/Double") != NULL &&
+                        descriptor && arg_count >= 1) {
+                        if (strncmp(descriptor, "(D)V", 4) == 0) {
+                            jdouble dbl_val = args[1].d;
+                            if (OBJECT_HAS_FIELDS(obj, 2)) {
+                                obj->fields[0].d = dbl_val;  /* value (2 slots) */
+                            }
+                        }
+                    }
                 }
                 
                 free(args);
@@ -4115,6 +5270,94 @@ int op_invokespecial(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 }
 
 int op_invokestatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
+    /* v34.42 PERF: monomorphic inline cache — the static twin of the
+     * v34.35 invokevirtual cache. Contract: frame->pc enters at opcode+1;
+     * on any miss (no entry, generation mismatch, stack underflow, arg
+     * buffer alloc failure) fall through to the original slow path which
+     * re-fetches everything and re-runs the compat/watch hooks.
+     * gprof (Asphalt 3 3D in-race): op_invokestatic ran 26.5M times per
+     * 60 s, every call re-parsing the descriptor 3x (count_args /
+     * count_java_args / pop_args_compact), malloc-ing the arg block and
+     * re-resolving class+method+native by name. */
+    {
+        InvokeRefCache* ic = invoke_cache_entry(frame,
+                (uint16_t)(((uint16_t)frame->code[frame->pc] << 8) | (uint16_t)frame->code[frame->pc + 1])  /* JVMS: big-endian u16 */);
+        if (ic && ic->valid && ic->gen == g_vm_cache_gen &&
+            (ic->kind == 0 || ic->kind == 1)) {
+            int total_slots = 0;   /* static: no 'this' */
+            for (int i = 0; i < ic->java_argc; i++) total_slots += ic->arg_slots[i];
+            if (frame->stack_top + 1 >= total_slots) {
+                int base = frame->stack_top + 1 - total_slots;
+                JavaValue args_buf[12];
+                JavaValue* args = (total_slots <= 12) ? args_buf
+                    : (JavaValue*)malloc((size_t)total_slots * sizeof(JavaValue));
+                if (args) {
+                    int cur = base;
+                    for (int i = 0; i < ic->java_argc; i++) {
+                        args[i] = frame->stack[cur];   /* low slot of Java arg i */
+                        cur += ic->arg_slots[i];
+                    }
+                    frame->stack_top = (int16_t)(base - 1);
+
+                    frame->pc += 2;   /* pc entered at opcode+1; invokestatic is 3 bytes total */
+
+                    if (ic->kind == 0) {
+                        /* Hot path: bytecode method. The callee's return
+                         * opcodes deposit the result onto OUR operand stack
+                         * (same contract as the slow path's execute_method
+                         * call with a NULL result pointer — do NOT push). */
+                        JavaValue result;
+                        int ret = execute_method(jvm, thread, ic->method, args, &result);
+                        if (args != args_buf) free(args);
+                        if (ret != 0) return -1;   /* pending_exception set by callee */
+                        return 0;
+                    }
+
+                    /* Hot path: registered native. Mirrors the slow path
+                     * exactly: stale-exception clear, pin args, autopin
+                     * window, dispatch note, call, unpin, release. */
+                    if (thread->pending_exception) {
+                        thread->pending_exception = NULL;
+                    }
+                    for (int pi = 0; pi < ic->java_argc; pi++) {
+                        if (args[pi].ref && is_heap_ptr_check(args[pi].ref)) {
+                            gc_pin(jvm, args[pi].ref);
+                        }
+                    }
+                    {
+                        extern __thread int g_gc_in_native;
+                        extern size_t gc_autopin_base(void);
+                        extern void gc_autopin_release(size_t base);
+                        extern void jvm_note_native_call(JavaThread*, const char*, const char*);
+                        size_t ap_base = gc_autopin_base();
+                        g_gc_in_native++;
+
+                        jvm_note_native_call(thread, ic->cls_name, ic->mth_name);
+                        JavaValue result = ((NativeMethod)ic->native_fn)(jvm, thread, args, ic->java_argc);
+                        g_gc_in_native--;
+
+                        for (int pi = 0; pi < ic->java_argc; pi++) {
+                            if (args[pi].ref && is_heap_ptr_check(args[pi].ref)) {
+                                gc_unpin(jvm, args[pi].ref);
+                            }
+                        }
+                        gc_autopin_release(ap_base);
+
+                        if (args != args_buf) free(args);
+
+                        if (thread->pending_exception) {
+                            return -1;
+                        }
+                        if (ic->has_ret) {
+                            PUSH(frame, result);
+                            if (ic->ret_wide) PUSH(frame, result);
+                        }
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
     uint16_t index = FETCH_U2(frame);
     
     const char* class_name = NULL;
@@ -4138,13 +5381,42 @@ int op_invokestatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         jvm_throw_by_name(jvm, "java/lang/InternalError", "Null descriptor");
         return -1;
     }
-    
+
+    /* FIX (v9, mirrors the v8 invokespecial guard): a stub/corrupt CP entry
+     * can leave class_name or method_name NULL. jvm_load_class tolerates
+     * NULL, but native_find() strcmp()s it and LOG_SAFE("%s") prints it —
+     * both crash on MinGW (strcmp/printf with NULL). Throw a Java-level
+     * error instead, as the JVM spec demands for unresolved refs. */
+    if (!class_name || !method_name) {
+        LOG_SAFE("[EXEC] invokestatic: unresolved method ref #%d in %s -> NoSuchMethodError\n",
+                index,
+                frame->clazz && frame->clazz->class_name ? frame->clazz->class_name : "?");
+        jvm_throw_by_name(jvm, "java/lang/NoSuchMethodError", "Unresolved static method ref");
+        return -1;
+    }
+
+    invoke_watch_init();
+    invoke_watch_hit(class_name, method_name, descriptor, "static", frame,
+                     frame->stack_top >= 0 ? frame->stack[frame->stack_top].i : 0);
+
     int arg_count = count_args(descriptor);
-    
+
     /* === FIX: Handle stack underflow gracefully ===
-     * Pad missing arguments with zeros instead of aborting. */
+     * Pad missing arguments with zeros instead of aborting — but ONLY when
+     * the call could ever fit on this frame. If arg_count exceeds max_stack
+     * the classfile is broken: padding would PUSH past frame->stack (release
+     * PUSH is unchecked!) -> heap overflow. Throw VerifyError instead. */
     int available = frame->stack_top + 1;
     if (available < arg_count) {
+        if (arg_count > (int)frame->max_stack) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "invokestatic needs %d stack slots, max_stack=%d",
+                     arg_count, (int)frame->max_stack);
+            LOG_SAFE("[EXEC] invokestatic: %s\n", msg);
+            jvm_throw_by_name(jvm, "java/lang/VerifyError", msg);
+            return -1;
+        }
         static int static_underflow_count = 0;
         if (static_underflow_count < 20) {
             LOG_SAFE("[EXEC] Stack underflow in invokestatic (need %d args, stack has %d) — padding with zeros\n", 
@@ -4158,18 +5430,24 @@ int op_invokestatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         }
     }
 
-    /* Allocate args array */
+    /* Allocate args array.
+     * v18 FIX: build the COMPACT args[] (one JavaValue per Java argument,
+     * J/D included). The old slot-wise pop shifted every argument after
+     * the first long/double; see count_java_args/pop_args_compact. */
+    int java_arg_count = count_java_args(descriptor);
     JavaValue* args = NULL;
-    if (arg_count > 0) {
-        args = (JavaValue*)malloc(arg_count * sizeof(JavaValue));
+    if (java_arg_count > 0) {
+        args = (JavaValue*)malloc(java_arg_count * sizeof(JavaValue));
         if (!args) {
             jvm_throw_by_name(jvm, "java/lang/OutOfMemoryError", "Args alloc failed");
             return -1;
         }
         
-        /* Pop arguments in reverse order */
-        for (int i = arg_count - 1; i >= 0; i--) {
-            args[i] = POP(frame);
+        /* Pop arguments compactly */
+        if (pop_args_compact(frame, descriptor, 0, args) < 0) {
+            free(args);
+            jvm_throw_by_name(jvm, "java/lang/OutOfMemoryError", "Args pop failed");
+            return -1;
         }
     }
     
@@ -4214,6 +5492,17 @@ int op_invokestatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             }
         }
         method = jvm_resolve_method(jvm, target_class, method_name, descriptor);
+        /* v34.42 PERF: fill the static inline cache (kind 0) for resolved
+         * BYTECODE methods. Guard mirrors the dispatch preference below: a
+         * class method AND a registered native for the same signature
+         * dispatches to the NATIVE — do not cache kind 0 in that case
+         * (the native branch below fills kind 1 instead). */
+        if (method && !method->is_native &&
+            method->code.code && method->code.code_length > 0 &&
+            !native_find(jvm, class_name, method_name, descriptor)) {
+            invokestatic_cache_fill(frame, index, target_class, method, NULL,
+                                    class_name, method_name, descriptor);
+        }
     }
     
     if (method) {
@@ -4226,6 +5515,10 @@ int op_invokestatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             /* Native method: call directly and push result */
             NativeMethod native = native_find(jvm, class_name, method_name, descriptor);
             if (native) {
+                /* v34.42 PERF: fill the static inline cache (kind 1) for the
+                 * registered native. */
+                invokestatic_cache_fill(frame, index, target_class, NULL, (void*)native,
+                                        class_name, method_name, descriptor);
                 LOG_DEBUG("[INVOKESTATIC] Native via execute_method: %s.%s%s\n",
                         class_name, method_name, descriptor);
                 
@@ -4235,20 +5528,39 @@ int op_invokestatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                 }
                 
                 /* Pin arguments */
-                for (int pi = 0; pi < arg_count; pi++) {
+                for (int pi = 0; pi < java_arg_count; pi++) {
                     if (args[pi].ref && is_heap_ptr_check(args[pi].ref)) {
                         gc_pin(jvm, args[pi].ref);
                     }
                 }
                 
-                JavaValue result = native(jvm, thread, args, arg_count);
+                /* v34.14 NATIVE-SCOPE AUTO-PIN (see invokevirtual site) */
+                extern __thread int g_gc_in_native;
+                extern size_t gc_autopin_base(void);
+                extern void gc_autopin_release(size_t base);
+                size_t ap_base = gc_autopin_base();
+                g_gc_in_native++;
+                
+                extern void jvm_note_native_call(JavaThread*, const char*, const char*);
+                jvm_note_native_call(thread, class_name, method_name);
+                /* [ARGGUARD] v36.49: static — без this */
+                argguard_check_array(class_name, method_name, descriptor, args,
+                                     java_arg_count, 0,
+                                     __builtin_return_address(0), 1);
+                int naf_slot = nargs_root_push(thread, args, java_arg_count);
+                JavaValue result = native(jvm, thread, args, java_arg_count);
+                argguard_check_ret(class_name, method_name, descriptor, &result,
+                                   __builtin_return_address(0));
+                nargs_root_pop(thread, naf_slot);
+                g_gc_in_native--;
                 
                 /* Unpin arguments */
-                for (int pi = 0; pi < arg_count; pi++) {
+                for (int pi = 0; pi < java_arg_count; pi++) {
                     if (args[pi].ref && is_heap_ptr_check(args[pi].ref)) {
                         gc_unpin(jvm, args[pi].ref);
                     }
                 }
+                gc_autopin_release(ap_base);
                 
                 free(args);
                 
@@ -4281,8 +5593,17 @@ int op_invokestatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     
     /* Try native method */
     NativeMethod native = native_find(jvm, class_name, method_name, descriptor);
-    
+    if (!native) {
+        /* v34.76: descriptor-relaxed fallback (see invokevirtual). The
+         * inline cache below is filled with the matched handler under the
+         * CALLER's descriptor, so hot-path re-dispatch stays consistent. */
+        native = native_find_relaxed(jvm, class_name, method_name, descriptor);
+    }
     if (native) {
+        /* v34.42 PERF: fill the static inline cache (kind 1) for the
+         * fallback-resolved native. */
+        invokestatic_cache_fill(frame, index, target_class, NULL, (void*)native,
+                                class_name, method_name, descriptor);
         LOG_DEBUG("[EXEC] invokestatic: calling native\n");
         LOG_DEBUG("[INVOKESTATIC] Found native %s.%s%s, calling...\n", 
                 class_name, method_name, descriptor);
@@ -4295,20 +5616,39 @@ int op_invokestatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         }
         
         /* PINNING: Pin all object arguments before calling native method */
-        for (int pi = 0; pi < arg_count; pi++) {
+        for (int pi = 0; pi < java_arg_count; pi++) {
             if (args[pi].ref && is_heap_ptr_check(args[pi].ref)) {
                 gc_pin(jvm, args[pi].ref);
             }
         }
         
-        JavaValue result = native(jvm, thread, args, arg_count);
+        /* v34.14 NATIVE-SCOPE AUTO-PIN (see invokevirtual site) */
+        extern __thread int g_gc_in_native;
+        extern size_t gc_autopin_base(void);
+        extern void gc_autopin_release(size_t base);
+        size_t ap_base = gc_autopin_base();
+        g_gc_in_native++;
+        
+        extern void jvm_note_native_call(JavaThread*, const char*, const char*);
+        jvm_note_native_call(thread, class_name, method_name);
+        /* [ARGGUARD] v36.49: static — без this */
+        argguard_check_array(class_name, method_name, descriptor, args,
+                             java_arg_count, 0,
+                             __builtin_return_address(0), 1);
+        int naf_slot = nargs_root_push(thread, args, java_arg_count);
+        JavaValue result = native(jvm, thread, args, java_arg_count);
+        argguard_check_ret(class_name, method_name, descriptor, &result,
+                           __builtin_return_address(0));
+        nargs_root_pop(thread, naf_slot);
+        g_gc_in_native--;
         
         /* UNPINNING: Unpin all object arguments after native method returns */
-        for (int pi = 0; pi < arg_count; pi++) {
+        for (int pi = 0; pi < java_arg_count; pi++) {
             if (args[pi].ref && is_heap_ptr_check(args[pi].ref)) {
                 gc_unpin(jvm, args[pi].ref);
             }
         }
+        gc_autopin_release(ap_base);
         
         free(args);
         
@@ -4361,7 +5701,12 @@ int op_invokestatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                 }
             }
 
+            argguard_check_array(class_name, method_name, descriptor, args,
+                                 arg_count, 0,
+                                 __builtin_return_address(0), 1);
             JavaValue native_result = native_fallback(jvm, thread, args, arg_count);
+            argguard_check_ret(class_name, method_name, descriptor, &native_result,
+                               __builtin_return_address(0));
 
             /* Unpin arguments */
             for (int pi = 0; pi < arg_count; pi++) {
@@ -4399,6 +5744,17 @@ int op_invokestatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 
     LOG_SAFE("[EXEC] invokestatic: %s.%s%s not found (stub?), returning default\n",
             class_name, method_name, descriptor);
+    
+    /* v11 DIAG: see the invokevirtual comment — surface unhooked M3G statics */
+    if (class_name && method_name && descriptor &&
+        (strstr(class_name, "m3g/") != NULL || strstr(class_name, "micro3d") != NULL)) {
+        static int m3g_missing_static_count = 0;
+        if (m3g_missing_static_count < 40) {
+            m3g_missing_static_count++;
+            MISSING_LOG("[M3G-MISSING] unresolved static call: %s.%s%s\n",
+                    class_name, method_name, descriptor);
+        }
+    }
     
     free(args);
     
@@ -4439,23 +5795,42 @@ int op_invokeinterface(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         }
     }
 
-    if (!descriptor) {
-        LOG_SAFE("[EXEC] FATAL: invokeinterface at index %d has NULL descriptor!\n", index);
+    if (!descriptor || !method_name) {
+        /* v9: also reject NULL method_name — see the invokevirtual comment. */
+        LOG_SAFE("[EXEC] FATAL: invokeinterface at index %d has unresolved name/type!\n", index);
+        jvm_throw_by_name(jvm, "java/lang/NoSuchMethodError", "Unresolved interface method ref");
         return -1;
     }
+
+    /* v34.8: cover invokeinterface in the generic tracer too (Bounce Tales
+     * resource pipeline runs entirely through interface p.a(...) calls). */
+    invoke_watch_hit(class_name ? class_name : "?", method_name, descriptor,
+                     "interface", frame, 0);
     
     int arg_count = count_args(descriptor);
     
     /* === FIX: Handle stack underflow gracefully ===
-     * Pad missing arguments with zeros instead of aborting. */
+     * Pad missing arguments with zeros instead of aborting.
+     * v9: bound by max_stack — see the invokevirtual comment. */
     {
         int available = frame->stack_top + 1;
         if (available < arg_count + 1) {
+            if (arg_count + 1 > (int)frame->max_stack) {
+                char msg[160];
+                snprintf(msg, sizeof(msg),
+                         "invokeinterface needs %d stack slots, max_stack=%d",
+                         arg_count + 1, (int)frame->max_stack);
+                LOG_SAFE("[EXEC] invokeinterface: %s\n", msg);
+                jvm_throw_by_name(jvm, "java/lang/VerifyError", msg);
+                return -1;
+            }
             static int iface_underflow_count = 0;
             if (iface_underflow_count < 20) {
-                LOG_SAFE("[EXEC] Stack underflow in invokeinterface (need %d args + this, stack has %d) — padding with zeros\n", 
-                        arg_count, available);
                 iface_underflow_count++;
+                /* v34.4: same enriched context as invokevirtual */
+                log_invoke_underflow_diag("invokeinterface", frame, class_name,
+                                          method_name, descriptor, arg_count,
+                                          available, 5);
             }
             while (frame->stack_top + 1 < arg_count + 1) {
                 JavaValue zero;
@@ -4470,17 +5845,18 @@ int op_invokeinterface(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             method_name ? method_name : "?", 
             descriptor, count, arg_count);
     
-    /* Allocate args array: this + arguments */
-    JavaValue* args = (JavaValue*)malloc((arg_count + 1) * sizeof(JavaValue));
+    /* v18 FIX: compact args[] (args[0]=this + one entry per Java argument,
+     * J/D included) — see count_java_args/pop_args_compact. */
+    int java_arg_count = count_java_args(descriptor);
+    JavaValue* args = (JavaValue*)malloc((java_arg_count + 1) * sizeof(JavaValue));
     if (!args) return -1;
     
-    /* Pop arguments in reverse order */
-    for (int i = arg_count; i >= 1; i--) {
-        args[i] = POP(frame);
+    /* Pop 'this' + arguments compactly */
+    if (pop_args_compact(frame, descriptor, 1, args) < 0) {
+        free(args);
+        jvm_throw_by_name(jvm, "java/lang/OutOfMemoryError", "Args pop failed");
+        return -1;
     }
-    
-    /* Pop object reference (this) */
-    args[0] = POP(frame);
     
     JavaObject* obj = (JavaObject*)args[0].ref;
     
@@ -4514,7 +5890,7 @@ int op_invokeinterface(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                 free(args);
                 return 0;
             }
-            if (method_name && strcmp(method_name, "realize") == 0 ||
+            if ((method_name && strcmp(method_name, "realize") == 0) ||
                 (method_name && strcmp(method_name, "prefetch") == 0) ||
                 (method_name && strcmp(method_name, "start") == 0) ||
                 (method_name && strcmp(method_name, "stop") == 0) ||
@@ -4524,7 +5900,7 @@ int op_invokeinterface(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                 free(args);
                 return 0;
             }
-            if (method_name && strcmp(method_name, "getContentType") == 0 ||
+            if ((method_name && strcmp(method_name, "getContentType") == 0) ||
                 (method_name && strcmp(method_name, "getControl") == 0)) {
                 JavaValue null_val = { .ref = NULL };
                 PUSH(frame, null_val);
@@ -4551,11 +5927,34 @@ int op_invokeinterface(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             }
         }
         
+        /* v34.4: message on the NPE so game logs identify the null receiver */
         free(args);
-        jvm_throw_by_name(jvm, "java/lang/NullPointerException", NULL);
+        {
+            char npe_msg[192];
+            snprintf(npe_msg, sizeof(npe_msg),
+                     "Null receiver calling interface method %s.%s%s",
+                     class_name ? class_name : "?",
+                     method_name ? method_name : "?",
+                     descriptor ? descriptor : "?");
+            jvm_throw_by_name(jvm, "java/lang/NullPointerException", npe_msg);
+        }
         return -1;
     }
     
+    /* [ARGGUARD] v36.49: мусорный receiver интерфейсного вызова — НЕ deref
+     * [obj+0]; тот же исход, что у NULL receiver (NPE, catchable). */
+    if (argguard_bad_ptr((uintptr_t)obj)) {
+        char npe_msg[192];
+        snprintf(npe_msg, sizeof(npe_msg),
+                 "Garbage receiver calling interface method %s.%s%s",
+                 class_name ? class_name : "?",
+                 method_name ? method_name : "?",
+                 descriptor ? descriptor : "?");
+        free(args);
+        jvm_throw_by_name(jvm, "java/lang/NullPointerException", npe_msg);
+        return -1;
+    }
+
     /* For interface methods, we need to find the actual implementation in the object's class */
     JavaClass* target_class = obj->header.clazz;
     JavaMethod* method = NULL;
@@ -4578,6 +5977,19 @@ int op_invokeinterface(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         native = native_find(jvm, class_name, method_name, descriptor);
     }
     
+    /* v34.76: descriptor-relaxed second pass (see invokevirtual) - the
+     * receiver's class chain first, then the interface name itself. */
+    if (!method && !native) {
+        JavaClass* relax_class = target_class;
+        while (relax_class && !native) {
+            native = native_find_relaxed(jvm, relax_class->class_name, method_name, descriptor);
+            if (!native) relax_class = relax_class->super_class;
+        }
+        if (!native && class_name) {
+            native = native_find_relaxed(jvm, class_name, method_name, descriptor);
+        }
+    }
+    
     if (method) {
         /* Execute the method */
         JavaValue result;
@@ -4594,8 +6006,11 @@ int op_invokeinterface(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             if (ret_type && ret_type[1] != 'V') {
                 PUSH(frame, result);
                 if (ret_type[1] == 'J' || ret_type[1] == 'D') {
-                    JavaValue zero = { .raw = 0 };
-                    PUSH(frame, zero);
+                    /* v18 FIX: push the SAME value twice (2-slot convention:
+                     * both slots hold the full JavaValue, like every other
+                     * push site — the old zero high slot broke nothing today
+                     * but violated the invariant readers rely on). */
+                    PUSH(frame, result);
                 }
             }
         }
@@ -4606,21 +6021,40 @@ int op_invokeinterface(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         }
         
         /* PINNING: Pin all object arguments before calling native method */
-        for (int pi = 0; pi <= arg_count; pi++) {
+        for (int pi = 0; pi <= java_arg_count; pi++) {
             if (args[pi].ref && is_heap_ptr_check(args[pi].ref)) {
                 gc_pin(jvm, args[pi].ref);
             }
         }
         
         /* Call native method */
-        JavaValue result = native(jvm, thread, args, arg_count + 1);
+        /* v34.14 NATIVE-SCOPE AUTO-PIN (see invokevirtual site) */
+        extern __thread int g_gc_in_native;
+        extern size_t gc_autopin_base(void);
+        extern void gc_autopin_release(size_t base);
+        size_t ap_base = gc_autopin_base();
+        g_gc_in_native++;
+        
+        extern void jvm_note_native_call(JavaThread*, const char*, const char*);
+        jvm_note_native_call(thread, class_name, method_name);
+        /* [ARGGUARD] v36.49: invokeinterface — args[0]=receiver */
+        argguard_check_array(class_name, method_name, descriptor, args,
+                             java_arg_count + 1, 1,
+                             __builtin_return_address(0), 1);
+        int naf_slot = nargs_root_push(thread, args, java_arg_count + 1);
+        JavaValue result = native(jvm, thread, args, java_arg_count + 1);
+        argguard_check_ret(class_name, method_name, descriptor, &result,
+                           __builtin_return_address(0));
+        nargs_root_pop(thread, naf_slot);
+        g_gc_in_native--;
         
         /* UNPINNING: Unpin all object arguments after native method returns */
-        for (int pi = 0; pi <= arg_count; pi++) {
+        for (int pi = 0; pi <= java_arg_count; pi++) {
             if (args[pi].ref && is_heap_ptr_check(args[pi].ref)) {
                 gc_unpin(jvm, args[pi].ref);
             }
         }
+        gc_autopin_release(ap_base);
         
         free(args);
         
@@ -4695,7 +6129,8 @@ int op_new(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     
     JavaClass* clazz = jvm_load_class(jvm, class_name);
     if (!clazz) {
-        LOG_SAFE("[EXEC] op_new: class %s not found!\n", class_name);
+        /* v9: class_name may be NULL (bad CP) — MinGW printf crashes on %s NULL */
+        LOG_SAFE("[EXEC] op_new: class %s not found!\n", class_name ? class_name : "<null>");
         native_throw_cnfe(jvm, thread, class_name);
         return -1;
     }
@@ -4755,12 +6190,13 @@ int op_newarray(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         return -1;
     }
     
-    /* Проверка на разумный размер */
+    /* FIX-19m: do NOT throw IllegalArgumentException for large sizes.
+     * Per JVMS, NEWARRAY signals insufficient memory with a CATCHABLE
+     * OutOfMemoryError - MemTests legitimately allocates new byte[1048576]
+     * and expects OOME, not IAE. Try the allocation and let heap_alloc
+     * decide (it rejects >1MB with NULL -> OOME below). */
     if (count > 1000000) {
-        LOG_SAFE("[NEWARRAY] WARNING: Suspiciously large array size: %d\n", count);
-        /* Может быть, стоит бросить исключение вместо OutOfMemory */
-        native_throw_iae(jvm, thread, "Array size too large");
-        return -1;
+        LOG_SAFE("[NEWARRAY] Large array allocation attempt: %d bytes\n", count);
     }
     
     JavaArray* array = jvm_new_array(jvm, atype, count, NULL);
@@ -4819,7 +6255,7 @@ int op_arraylength(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         /* DRM bypass: return 0 for null array in DRM classes */
         const char* caller_class = frame ? frame->clazz->class_name : NULL;
         if (caller_class && drm_is_drm_class(caller_class)) {
-            POP(frame);
+            POP_VOID(frame);
             JavaValue v = { .i = 0 };
             PUSH(frame, v);
             return 0;
@@ -4838,9 +6274,13 @@ int op_arraylength(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 int op_athrow(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     JavaObject* exception = (JavaObject*)POP(frame).ref;
     
-    /* DEBUG: Log exception throws (only first 10 to avoid log spam) */
+    /* DEBUG: Log exception throws (only first 60 to avoid log spam).
+     * v34.99: budget was 10 — early-boot class-loading exceptions consumed
+     * the whole budget, and the race-start exception (the monitor-leak
+     * trigger at the countdown end) never reached the log. 60 covers boot
+     * noise and still names the trigger. */
     static int athrow_log_count = 0;
-    if (athrow_log_count < 10) {
+    if (athrow_log_count < 60) {
         JavaClass* exc_class = exception ? object_get_class(exception) : NULL;
         const char* exc_name = exc_class ? (exc_class->class_name ? exc_class->class_name : "?") : "NULL";
         
@@ -4849,24 +6289,67 @@ int op_athrow(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         const char* class_name = frame && frame->clazz ? (frame->clazz->class_name ? frame->clazz->class_name : "?") : "?";
         
         LOG_SAFE("[ATHROW] %s at %s.%s PC=%d\n", exc_name, class_name, method_name,
-                frame ? frame->pc - 1 : -1);
+                frame ? (int)frame->pc - 1 : -1);
         
-        /* Also print exception message if available */
-        if (exception) {
+        /* Also print exception message if available.
+         *
+         * [BT-CRASH-FIX] (Bounce Tales, Switch hbloader Data Abort,
+         * ffffffff00460018): the popped "exception" reference can be a
+         * CORRUPTED pseudo-reference — a 64-bit slot whose halves are two
+         * adjacent jint values from the game's pixel data (field evidence:
+         * 0xffffffff00460000 = ARGB white + ARGB transparent dark-green).
+         * object_get_class() above survives garbage (is_heap_ptr + header
+         * validation), but this direct exception->fields[0] read did NOT:
+         * on 64-bit sizeof(ObjectHeader)==24, so the FIRST dereference of a
+         * garbage "object" lands at exactly ptr+0x18 — the reported fault
+         * address 0xffffffff00460018. Guard the receiver with the
+         * heap_java_object_valid() net (session-76 [HT-KEY-VALIDATE]
+         * discipline); read the message length via the validated
+         * string_length() instead of a raw msg->length (same +0x18 trap). */
+        if (exception && heap_java_object_valid(exception)) {
             JavaString* msg = (JavaString*)exception->fields[0].ref;  /* detailMessage is usually first field */
-            if (msg && msg->length > 0) {
-                LOG_SAFE("[ATHROW]   Message: %.*s\n", msg->length, (char*)string_chars(msg));
+            if (msg) {
+                jsize msg_len = string_length(msg);
+                const jchar* msg_chars = string_chars(msg);
+                if (msg_len > 0 && msg_chars) {
+                    LOG_SAFE("[ATHROW]   Message: %.*s\n", (int)msg_len, (char*)msg_chars);
+                }
             }
         }
         
         athrow_log_count++;
-        if (athrow_log_count == 10) {
+        if (athrow_log_count == 60) {
             LOG_SAFE("[ATHROW] Further exception logging suppressed\n");
         }
     }
     
     if (!exception) {
         native_throw_npe(jvm, thread);
+        return -1;
+    }
+    
+    /* [BT-CRASH-FIX] A garbage pseudo-reference (e.g. two adjacent jints
+     * from pixel data sitting in a ref slot) must NEVER enter
+     * pending_exception: every later dereference on the propagation path
+     * (handler lookup, printStackTrace, getMessage, thread-death logging)
+     * would be a native crash. Detect it here, at the single choke point
+     * every athrow passes through, and substitute a clean catchable
+     * InternalError — the game keeps running (J2ME phone semantics: an
+     * internal VM error must not kill the process) and the trace names the
+     * site. Rate-limited log; the thrown InternalError carries the site. */
+    if (!heap_java_object_valid(exception)) {
+        static int athrow_garbage_log = 0;
+        if (athrow_garbage_log < 20) {
+            athrow_garbage_log++;
+            LOG_SAFE("[ATHROW] CORRUPTED exception reference %p at %s.%s PC=%d "
+                     "-> InternalError (ref slot held non-object data)\n",
+                     (void*)exception,
+                     frame && frame->clazz && frame->clazz->class_name ? frame->clazz->class_name : "?",
+                     frame && frame->method && frame->method->name ? frame->method->name : "?",
+                     frame ? (int)frame->pc - 1 : -1);
+        }
+        jvm_throw_by_name(jvm, "java/lang/InternalError", "corrupted exception reference (athrow)");
+        thread->pending_exception = jvm_exception_pending(jvm);
         return -1;
     }
     
@@ -4916,7 +6399,10 @@ int op_checkcast(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
             /* Check if this might be a JavaClass* (Class object) */
             JavaClass* potential_class = (JavaClass*)obj;
             
-            if (potential_class->header.clazz && 
+            /* [ARGGUARD] v36.49: мусорный obj не deref-им: проба только
+             * для правдоподобных указателей; мусор -> ClassCastException
+             * (тот же исход, что при проваленной Ryujinx-подавленной пробе). */
+            if (!argguard_bad_ptr((uintptr_t)obj) && potential_class->header.clazz && 
                 potential_class->header.clazz->class_name &&
                 strcmp(potential_class->header.clazz->class_name, "java/lang/Class") == 0) {
                 /* This is a Class object - check if target is java/lang/Class or Object */
@@ -4973,7 +6459,51 @@ int op_monitorenter(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         return -1;
     }
     
-    return monitor_enter(jvm, obj);
+    int mon_rc;
+    /* v36.57 [MON-SITE]: записываем сайт входа ДО monitor_enter — долгое
+     * ожидание будет названо в [MON-WAIT] с точностью до метода/pc. */
+    {
+        extern void jvm_mon_site_note(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+        jvm_mon_site_note("block %s.%s@%u",
+                          (frame && frame->clazz && frame->clazz->class_name) ? frame->clazz->class_name : "?",
+                          (frame && frame->method && frame->method->name) ? frame->method->name : "?",
+                          frame ? (unsigned)frame->pc : 0u);
+    }
+    mon_rc = monitor_enter(jvm, obj);
+    /* v36.57 [PAINT-BUDGET]: pump-поток исчерпал бюджет ожидания монитора
+     * (paint заблокирован чужим synchronized — см. threads.c). Бросаем
+     * обычный RuntimeException: unwind освобождает мониторы этого кадра
+     * (v34.99 MONITOR-UNWIND), paint() прерывается, насос возвращается к
+     * главному циклу — эмулятор остаётся живым (ввод/пауза/выход). */
+    if (mon_rc != JNI_OK) {
+        extern int jvm_paint_lock_aborted(void);
+        if (jvm_paint_lock_aborted()) {
+            jvm_throw_by_name(jvm, "java/lang/RuntimeException",
+                              "nojme paint-lock budget exceeded");
+        }
+        return mon_rc;
+    }
+    /* v34.99 MONITOR-UNWIND: record block-level ownership so an exception
+     * unwinding out of this frame RELEASES the monitor (JVM spec: monitors
+     * acquired by monitorenter are released when the frame is abandoned).
+     * Without this, a leaked monitor was owned forever and the next
+     * monitor_enter from another OS thread (frontend paint thread) blocked
+     * forever — the standalone countdown-freeze root cause. */
+    if (mon_rc == JNI_OK && frame) {
+        if (frame->mon_owned_n < MON_OWNED_MAX) {
+            frame->mon_owned[frame->mon_owned_n++] = obj;
+        } else {
+            static int mon_track_overflow_logs = 0;
+            if (mon_track_overflow_logs < 5) {
+                mon_track_overflow_logs++;
+                LOG_SAFE("[MON-TRACK] ownership list full (%d) in %s.%s — unwind release not tracked for this acquire\n",
+                         MON_OWNED_MAX,
+                         frame->clazz && frame->clazz->class_name ? frame->clazz->class_name : "?",
+                         frame->method && frame->method->name ? frame->method->name : "?");
+            }
+        }
+    }
+    return mon_rc;
 }
 
 int op_monitorexit(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
@@ -4984,11 +6514,33 @@ int op_monitorexit(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         return -1;
     }
     
-    return monitor_exit(jvm, obj);
+    if (monitor_exit(jvm, obj) != JNI_OK) {
+        /* v18 (audit): JVMS monitorexit — releasing a monitor not owned by the
+         * current thread must throw IllegalMonitorStateException as a normal
+         * catchable exception, never abort the interpreter silently. */
+        native_throw_illegal_monitor_state(jvm, thread);
+        return -1;
+    }
+    /* v34.99 MONITOR-UNWIND: drop the ownership record (last matching) so
+     * the frame-exit drain does not double-release. */
+    if (frame) {
+        for (int mo_i = frame->mon_owned_n - 1; mo_i >= 0; mo_i--) {
+            if (frame->mon_owned[mo_i] == obj) {
+                for (int mo_k = mo_i; mo_k < frame->mon_owned_n - 1; mo_k++)
+                    frame->mon_owned[mo_k] = frame->mon_owned[mo_k + 1];
+                frame->mon_owned[frame->mon_owned_n - 1] = NULL;
+                frame->mon_owned_n--;
+                break;
+            }
+        }
+    }
+    return 0;
 }
 
 /* Wide instructions */
 int op_wide(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
+    (void)jvm;
+    (void)thread;
     uint8_t opcode = FETCH_U1(frame);
     uint16_t index = FETCH_U2(frame);
     JavaValue v1, v2;
@@ -5047,50 +6599,66 @@ int op_wide(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     return 0;
 }
 
-/* Helper function to create multi-dimensional arrays recursively */
-static JavaArray* create_multidim_array(JVM* jvm, const char* class_name, int* sizes, int dimensions, int current_dim) {
-    if (current_dim >= dimensions) return NULL;
+/* v24 FIX (Brick Breaker load hang): build one level of a multi-dimensional
+ * array from its EXACT descriptor. The old code skipped ALL '[' characters to
+ * find the base element type and never stored an element_class on the inner
+ * array levels, so int[][][]/String[][][] walls were built with element_class
+ * = NULL at every reference level. Any later checkcast/instanceof/aastore on
+ * those rows then mis-derived descriptors ("[L[I;") and threw cascading
+ * exceptions that killed the game's loader ~1/3 through.
+ *
+ * This helper strips exactly ONE '[' per level:
+ *   desc="[[[I":                level0 desc="[[[I" -> DESC_ARRAY elem_class "[[I"
+ *                               level1 desc="[[I"  -> DESC_ARRAY elem_class "[I"
+ *                               level2 desc="[I"   -> T_INT (primitive row)
+ *   desc="[[Ljava/lang/String;": level0 -> DESC_ARRAY elem_class "[Ljava/lang/String;"
+ *                                level1 -> DESC_OBJECT elem_class String
+ * Array classes are resolved through jvm_load_class (generic stub named by the
+ * descriptor, e.g. "[I"), which object_instance_of now matches exactly. */
+static JavaArray* create_multidim_array_desc(JVM* jvm, const char* desc,
+                                             jint* sizes, int dimensions, int level) {
+    if (level >= dimensions || !desc || desc[0] != '[') return NULL;
     
-    /* Create the array for this dimension */
-    JavaArray* array = (JavaArray*)jvm_new_array(jvm, DESC_ARRAY, sizes[current_dim], NULL);
-    if (!array) return NULL;
+    const char* elem_desc = desc + 1;  /* strip exactly one '[' */
+    int elem_type = T_INT;
+    JavaClass* elem_class = NULL;
     
-    /* If this is the innermost dimension, create primitive arrays */
-    if (current_dim == dimensions - 1) {
-        /* Determine element type from class name */
-        int elem_type = T_INT;  /* Default */
-        if (class_name) {
-            /* Skip all '[' characters to find the element type */
-            const char* type_ptr = class_name;
-            while (*type_ptr == '[') type_ptr++;
-            
-            if (*type_ptr == 'L') {
-                elem_type = DESC_OBJECT;
-            } else {
-                switch (*type_ptr) {
-                    case 'Z': elem_type = T_BOOLEAN; break;
-                    case 'B': elem_type = T_BYTE; break;
-                    case 'C': elem_type = T_CHAR; break;
-                    case 'S': elem_type = T_SHORT; break;
-                    case 'I': elem_type = T_INT; break;
-                    case 'J': elem_type = T_LONG; break;
-                    case 'F': elem_type = T_FLOAT; break;
-                    case 'D': elem_type = T_DOUBLE; break;
-                    default: elem_type = T_INT; break;
-                }
-            }
+    if (*elem_desc == '[') {
+        /* Element is itself an array: resolve its array class by descriptor */
+        elem_type = DESC_ARRAY;
+        elem_class = jvm_load_class(jvm, elem_desc);
+    } else if (*elem_desc == 'L') {
+        elem_type = DESC_OBJECT;
+        char name[512];
+        const char* semi = strchr(elem_desc, ';');
+        size_t len = semi ? (size_t)(semi - elem_desc - 1) : strlen(elem_desc + 1);
+        if (len >= sizeof(name)) len = sizeof(name) - 1;
+        memcpy(name, elem_desc + 1, len);
+        name[len] = '\0';
+        elem_class = jvm_load_class(jvm, name);
+    } else {
+        switch (*elem_desc) {
+            case 'Z': elem_type = T_BOOLEAN; break;
+            case 'B': elem_type = T_BYTE; break;
+            case 'C': elem_type = T_CHAR; break;
+            case 'S': elem_type = T_SHORT; break;
+            case 'I': elem_type = T_INT; break;
+            case 'J': elem_type = T_LONG; break;
+            case 'F': elem_type = T_FLOAT; break;
+            case 'D': elem_type = T_DOUBLE; break;
+            default: elem_type = T_INT; break;
         }
-        
-        /* Create primitive array */
-        JavaArray* inner = (JavaArray*)jvm_new_array(jvm, elem_type, sizes[current_dim], NULL);
-        return inner;
     }
     
-    /* Recursively create inner arrays */
-    for (int i = 0; i < sizes[current_dim]; i++) {
-        JavaArray* inner = create_multidim_array(jvm, class_name, sizes, dimensions, current_dim + 1);
-        if (inner) {
-            array_set_ref(array, i, inner);
+    JavaArray* array = (JavaArray*)jvm_new_array(jvm, elem_type, sizes[level], elem_class);
+    if (!array) return NULL;
+    
+    if (level + 1 < dimensions) {
+        for (jint i = 0; i < sizes[level]; i++) {
+            JavaArray* inner = create_multidim_array_desc(jvm, elem_desc, sizes, dimensions, level + 1);
+            if (inner) {
+                array_set_ref(array, i, inner);
+            }
         }
     }
     
@@ -5116,95 +6684,38 @@ int op_multianewarray(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         sizes[i] = POP(frame).i;
         if (sizes[i] < 0) {
             free(sizes);
+            /* v18 (audit): JVMS multianewarray — a negative dimension must
+             * throw a catchable NegativeArraySizeException, not silently
+             * abort the interpreter. */
+            native_throw_negative_array_size(jvm, thread);
             return -1;
         }
     }
     
-    /* Determine element type from class name */
-    int elem_type = T_INT;  /* Default */
-    JavaClass* element_class = NULL;
-    if (class_name) {
-        /* Skip all '[' characters to find the element type */
-        const char* type_ptr = class_name;
-        while (*type_ptr == '[') type_ptr++;
-        
-        if (*type_ptr == 'L') {
-            elem_type = DESC_OBJECT;
-            /* Extract element class name (without 'L' and ';') */
-            char* elem_class_name = strdup(type_ptr + 1);
-            if (elem_class_name) {
-                char* semicolon = strchr(elem_class_name, ';');
-                if (semicolon) *semicolon = '\0';
-                element_class = jvm_load_class(jvm, elem_class_name);
-                free(elem_class_name);
-            }
-        } else if (*type_ptr == '[') {
-            elem_type = DESC_ARRAY;
-        } else {
-            switch (*type_ptr) {
-                case 'Z': elem_type = T_BOOLEAN; break;
-                case 'B': elem_type = T_BYTE; break;
-                case 'C': elem_type = T_CHAR; break;
-                case 'S': elem_type = T_SHORT; break;
-                case 'I': elem_type = T_INT; break;
-                case 'J': elem_type = T_LONG; break;
-                case 'F': elem_type = T_FLOAT; break;
-                case 'D': elem_type = T_DOUBLE; break;
-            }
-        }
-    }
-    
-    /* Create outer array */
-    JavaArray* outer_array = (JavaArray*)jvm_new_array(jvm, DESC_ARRAY, sizes[0], NULL);
-    if (!outer_array) {
+    /* v24 FIX: build the whole tree from the exact CP descriptor, storing the
+     * proper element_class on EVERY reference level (see
+     * create_multidim_array_desc above). This also fixes dimensions=1 with a
+     * multi-'[' descriptor (e.g. multianewarray "[[I" 1 must yield int[][],
+     * not int[]) and the dimensions==2 case for object elements. */
+    if (!class_name || class_name[0] != '[') {
         free(sizes);
-        JavaValue v = { .ref = NULL };
-        PUSH(frame, v);
-        return 0;
+        LOG_SAFE("[EXEC] multianewarray: CP entry '%s' is not an array descriptor\n",
+                 class_name ? class_name : "(null)");
+        jvm_throw_by_name(jvm, "java/lang/ClassNotFoundException", class_name);
+        return -1;
     }
     
-    /* Handle different dimensions */
-    if (dimensions == 1) {
-        /* Single dimension - return primitive/object array directly */
-        JavaArray* result = (JavaArray*)jvm_new_array(jvm, elem_type, sizes[0], element_class);
-        JavaValue v = { .ref = result };
-        PUSH(frame, v);
-    } else if (dimensions == 2) {
-        /* 2D array - create inner primitive arrays */
-        for (int i = 0; i < sizes[0]; i++) {
-            JavaArray* inner_array = (JavaArray*)jvm_new_array(jvm, elem_type, sizes[1], element_class);
-            array_set_ref(outer_array, i, inner_array);
-        }
-        JavaValue v = { .ref = outer_array };
-        PUSH(frame, v);
-    } else {
-        /* 3D or more - create nested arrays recursively */
-        for (int i = 0; i < sizes[0]; i++) {
-            /* Create array for this row */
-            JavaArray* row_array = (JavaArray*)jvm_new_array(jvm, DESC_ARRAY, sizes[1], NULL);
-            if (!row_array) continue;
-            
-            if (dimensions == 3) {
-                /* 3D: create primitive arrays for each cell */
-                for (int j = 0; j < sizes[1]; j++) {
-                    JavaArray* inner = (JavaArray*)jvm_new_array(jvm, elem_type, sizes[2], element_class);
-                    array_set_ref(row_array, j, inner);
-                }
-            } else {
-                /* More than 3D - use recursive helper */
-                for (int j = 0; j < sizes[1]; j++) {
-                    JavaArray* inner = create_multidim_array(jvm, class_name, sizes, dimensions, 2);
-                    array_set_ref(row_array, j, inner);
-                }
-            }
-            
-            array_set_ref(outer_array, i, row_array);
-        }
-        
-        LOG_DEBUG("[EXEC] multianewarray: created %dD array\n", dimensions);
-        JavaValue v = { .ref = outer_array };
-        PUSH(frame, v);
+    JavaArray* result_array = create_multidim_array_desc(jvm, class_name, sizes, dimensions, 0);
+    if (!result_array) {
+        free(sizes);
+        /* v18 (audit): allocation failed — OOM is already pending from the
+         * allocator; do NOT push a fake success value. */
+        return -1;
     }
+    
+    LOG_DEBUG("[EXEC] multianewarray: created %dD array (%s)\n", dimensions, class_name);
+    JavaValue v = { .ref = result_array };
+    PUSH(frame, v);
     
     free(sizes);
     return 0;
@@ -5246,6 +6757,9 @@ int op_jsr_w(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     int32_t offset = (int32_t)jvm_read_u32(frame->code + frame->pc);
     JavaValue ret_addr = { .i = frame->pc + 4 };
     PUSH(frame, ret_addr);
-    frame->pc += offset;
+    /* v18 (audit): jsr_w opcode is 5 bytes; pc points at the operand start
+     * after the fetch, so the branch target relative to the START of the
+     * opcode is (pc - 1) + offset = pc + offset - 1. */
+    frame->pc += offset - 1;
     return 0;
 }

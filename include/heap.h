@@ -92,8 +92,34 @@ void heap_destroy(JVM* jvm);
  */
 void* heap_alloc(JVM* jvm, size_t size, JavaClass* clazz, ObjectType type);
 
+/* v19: emergency allocation — may use the reserve area beyond the normal
+ * heap end. Reserved for exception object creation (see jvm_throw_by_name)
+ * so OutOfMemoryError and friends stay catchable on a full heap. */
+void* heap_alloc_emergency(JVM* jvm, size_t size, JavaClass* clazz, ObjectType type);
+
+/* v34: sizes of the LAST failed heap allocation (see heap.c v34 FIX note).
+ * Used by native_throw_oome to build an OutOfMemoryError detailMessage so
+ * genuinely-fatal (uncaught) OOMs still show "Requested/Available" on the
+ * error screen via the main.c / libretro.c uncaught-exception handlers. */
+void heap_get_last_oom_info(size_t* requested, size_t* available);
+
 /* Allocate object */
 JavaObject* heap_alloc_object(JVM* jvm, JavaClass* clazz);
+
+/* v19: emergency variant of heap_alloc_object (exception construction). */
+JavaObject* heap_alloc_object_emergency(JVM* jvm, JavaClass* clazz);
+
+/* v34.59 TLAB: закрыть чанк ТЕКУЩЕГО потока (без lock — только TLS
+ * владельца). Вызывается jvm_gc_safepoint_park() ДО arrival-broadcast,
+ * при входе в gc_collect() и перед выходом потокового раннера.
+ * Идемпотентно. */
+void heap_tlab_flush_self(void);
+
+/* v34.59 TLAB: диагностические счётчики (racy — для логов/бенчей). */
+void heap_tlab_stats(uint64_t* carves, uint64_t* fast_allocs);
+
+/* v34.59: heap.current — верхняя граница занятой области (диагностика). */
+void* heap_top_ptr(void);
 
 /* Allocate array - element_class is the class of array elements for object arrays, NULL for primitives */
 JavaArray* heap_alloc_array(JVM* jvm, uint8_t element_type, jsize length, JavaClass* element_class);
@@ -108,11 +134,31 @@ JavaString* heap_alloc_string(JVM* jvm, jsize length);
 /* Run garbage collection */
 void gc_collect(JVM* jvm);
 
-/* Add GC root */
+/* Add GC root. v35.08: IDEMPOTENT - registering the same slot twice within
+ * one heap lifetime adds it once (the per-session reset below empties the
+ * list, so call sites no longer need "already registered" flags that
+ * silently skipped re-registration in the NEXT session). */
 void gc_add_root(JVM* jvm, void** root);
 
 /* Remove GC root */
 void gc_remove_root(JVM* jvm, void** root);
+
+/* v35.08 MULTI-SESSION (Switch frontend: menu -> game -> menu -> game):
+ * NULL every registered root slot, then empty the list.
+ *
+ * The root slots are PROCESS-GLOBAL statics spread over the whole native
+ * layer (display.c g_display_instance / current_displayable_obj /
+ * g_graphics_object / callSerially queue, form.c g_current_form ...,
+ * native.c Runtime/Timer slots, rms.c enum/listener slots, mobile3d.c
+ * imm-mode bridge ...). They pointed into THIS session's Java heap; after
+ * heap_destroy they dangle, and the next session's heap is frequently
+ * malloc'd at the SAME address - the stale pointers then alias foreign
+ * objects (field-repro: second game died in Display.setCurrent with
+ * "Object has NULL or invalid class pointer"). Every registered root slot
+ * lives in static storage (or the static RMS store table), so NULLing the
+ * slots here is safe and hands every layer a clean slate mechanically.
+ * Call with VM threads quiet (jvm_destroy does). */
+void gc_roots_reset_all(void);
 
 /* Pin object (prevent GC from moving it) */
 void gc_pin(JVM* jvm, void* object);
@@ -221,5 +267,41 @@ static inline bool is_heap_ptr_check(void* ptr) {
     extern void* g_heap_end;
     return ptr >= g_heap_start && ptr < g_heap_end;
 }
+
+/* [ARGGUARD] v36.49: правдоподобность ref-значения ПЕРЕД сырым
+ * разыменованием header.clazz (смещение 0 — первое, что VM читает у
+ * объекта). Полевой факт (Ryujinx): Invalid memory access at
+ * 0x20697465592F7365 = ASCII "es/Yeti " — байты ПУТИ ИГРЫ, попавшие в
+ * ref-слот (C-стек соседствовал со строкой пути). Такой мусор всегда
+ * не-каноничен (>= 2^48) и/или не выровнен на 8; настоящие ссылки
+ * (объекты кучи, malloc-классы, интерьеры строк) — каноничны и
+ * выровнены минимум на 8 на всех целях (x86-64, aarch64, armv7).
+ * NULL мусором не считается. Возвращает 1 = «разыменовывать нельзя». */
+static inline int argguard_bad_ptr(uintptr_t raw) {
+    return raw != 0 && (raw > 0x0000FFFFFFFFFFF8ull || (raw & 7) != 0);
+}
+
+/* [ARGGUARD] реализация в execute.c: validate-walk дескриптора + дамп
+ * (метод, слот, hex + ASCII-8 байтов мусора, адрес моста-вызователя).
+ * check_array: defuse=1 -> мусорные ref-слоты заменяются NULL (безопасно
+ * только когда массив гарантированно >= числа слотов дескриптора —
+ * например, malloc-массивы op_invoke*; для чужих C-стек-мостов вызывать
+ * с defuse=0 — только репорт). check_ret: валидация возвращаемого
+ * значения native (L/[), дефуз безопасен всегда (локальная JavaValue). */
+void argguard_check_array(const char* cname, const char* mname,
+                          const char* desc, JavaValue* args,
+                          int argc_total, int has_this, void* callsite,
+                          int defuse);
+void argguard_check_ret(const char* cname, const char* mname,
+                        const char* desc, JavaValue* rv, void* callsite);
+
+/*
+ * v15: Validate that a JavaObject* held by NATIVE code (M3G object registry,
+ * pending-render queue, cached World/Camera pointers, ...) is still a live
+ * GC object. Native-side structures keep raw pointers that the garbage
+ * collector cannot see; after a collection the pointed-to object may be
+ * freed and its memory reused, so dereferencing header.clazz is a wild
+ * read (crash after the last M3GTest scene on Windows). */
+bool heap_java_object_valid(void* ptr);
 
 #endif /* HEAP_H */

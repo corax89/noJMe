@@ -56,11 +56,23 @@ int thread_start(JVM* jvm, JavaThread* thread);
 /* Join a thread */
 int thread_join(JVM* jvm, JavaThread* thread);
 
+/* v34.71: OS identity of the main/frontend Java thread (captured once in
+ * jvm_init). Used by the heap's TLAB gate — see heap.c "TLAB main-thread
+ * gate" for why allocations on this thread between exec-windows must not
+ * hold a TLAB chunk. */
+void jvm_record_main_os_thread(void);
+int jvm_os_thread_is_main_java(void);
+
 /* Get current thread */
 JavaThread* thread_current(JVM* jvm);
 
 /* Yield to other threads */
 void thread_yield(JVM* jvm);
+
+/* v34.45: java.lang.Thread.yield() entry — adaptive KVM-style rest for
+ * busy-wait frame limiters (`while (now - t0 < period) yield();`), then
+ * the full cooperative path. See threads.c for the rationale. */
+void thread_yield_explicit(JVM* jvm);
 
 /* Check if it's time to yield based on global instruction counter */
 bool thread_should_yield(void);
@@ -109,6 +121,7 @@ void thread_destroy(JVM* jvm, JavaThread* thread);
  */
 
 int monitor_enter(JVM* jvm, JavaObject* obj);
+int monitor_tryenter(JVM* jvm, JavaObject* obj);  /* v36.57 [KEY-TRYLOCK] */
 int monitor_exit(JVM* jvm, JavaObject* obj);
 int monitor_wait(JVM* jvm, JavaObject* obj, jlong timeout, bool timed);
 int monitor_notify(JVM* jvm, JavaObject* obj);
@@ -116,6 +129,22 @@ int monitor_notify_all(JVM* jvm, JavaObject* obj);
 JavaMonitor* monitor_get(JVM* jvm, JavaObject* obj);
 JavaThread* monitor_get_owner(JavaObject* obj);
 jint monitor_get_entry_count(JavaObject* obj);
+
+/* v36.57 [PAINT-BUDGET]: ограниченное ожидание монитора для pump-потока
+ * (см. блок-комментарий у реализации в threads.c). arm/disarm ставит
+ * midp_process_repaints_impl вокруг вызова paint() ТОЛЬКО на потоке
+ * фронтенда; monitor_enter между arm/disarm выходит с JNI_ERR по истечении
+ * бюджета, вызывающая сторона читает jvm_paint_lock_aborted() и бросает
+ * RuntimeException, paint() распаковывается (мониторы освобождаются
+ * v34.99 MONITOR-UNWIND), главный цикл продолжает жить. */
+void jvm_paint_lock_arm(uint32_t budget_ms);
+void jvm_paint_lock_disarm(void);
+int  jvm_paint_lock_aborted(void);
+void jvm_paint_lock_reset(void);
+/* v36.57 [MON-SITE]: сайт входа в monitor_enter для [MON-WAIT] (класс/метод
+ * кадра вызывающей стороны) — пишут op_monitorenter и ACC_SYNC-вход
+ * execute_method ДО monitor_enter. */
+void jvm_mon_site_note(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /*
  * Thread-local storage - simplified
@@ -167,3 +196,33 @@ void lfqueue_destroy(LFQueue* queue);
 void cleanup_monitors(void);
 
 #endif /* THREADS_H */
+
+/* v34.9 GC safepoint API (see threads.c) */
+extern volatile int g_gc_safepoint_request;
+void jvm_gc_safepoint_park(void);
+int  jvm_gc_safepoint_arrived(void);
+void jvm_gc_safepoint_release(void);
+/* v34.26 PERF: event-driven wait used by gc_collect() — wakes on the last
+ * mutator's arrival broadcast instead of polling in 5ms sleep slices. */
+int  jvm_gc_safepoint_wait_arrivals(int expected, int timeout_ms);
+int jvm_live_vm_thread_count(void);
+/* v34.26: 1 if the CALLING OS thread is one of the pthread/CreateThread VM
+ * runners (native.c registry). gc_collect() uses this to compute the exact
+ * safepoint census when triggered from the frontend's retro_run thread. */
+int jvm_current_os_thread_is_vm_runner(void);
+
+/* v34.59 PERF (3D GC-пауза): событийное пробуждение СПЯЩИХ потоков при
+ * запросе stop-the-world. Thread.sleep() игр спал 50-мс кусками nanosleep'ом
+ * и проверял g_gc_safepoint_request ТОЛЬКО на границе куска — каждый GC
+ * (в т.ч. System.gc() из игрового цикла, fmx: ~40 мс) ждал «застревателя»
+ * до 50 мс (sp_wait в [GCSTAMP]). Теперь спящие ждут на глобальном
+ * cond, который коллектор broadcasts при постановке запроса: поток
+ * просыпается МГНОВЕННО и запаркивается.
+ *   jvm_gc_safepoint_wake_sleepers() — broadcast (вызывает gc_collect).
+ *   jvm_sleep_chunk_ms(chunk)       — спать chunk мс, но проснуться при
+ *                                     broadcast; возвращает 1, если разбужен
+ *                                     (возможно ложное срабатывание —
+ *                                     безвредно: цикл сна перепроверит
+ *                                     время/флаг). */
+void jvm_gc_safepoint_wake_sleepers(void);
+int  jvm_sleep_chunk_ms(long chunk_ms);

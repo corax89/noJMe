@@ -56,6 +56,7 @@ typedef struct MidiTrack {
     uint32_t delta_time;
     uint8_t running_status;
     bool ended;
+    uint64_t end_time_us; /* v36.27: true song time at end of track (tempo-aware scan) */
 } MidiTrack;
 
 /* MIDI file header */
@@ -79,6 +80,16 @@ typedef struct MidiNote {
     /* FM synthesis parameters */
     float mod_phase;
     float mod_index;
+    float mod_ratio;      /* v23: per-note (from the patch / drum map) */
+    /* v23: drum/percussion synthesis (channel 9) + sustain support */
+    bool drum;            /* synthesized as GM percussion, not melodic FM */
+    bool key_held;        /* false while held only by the sustain pedal */
+    float decay_k;        /* per-sample exponential decay coefficient (drums) */
+    float sweep_k;        /* per-sample pitch-sweep coefficient (0 = no sweep) */
+    float freq_target;    /* sweep target frequency */
+    float noise_mix;      /* 0..1 noise blend for percussion */
+    uint8_t choke_group;  /* 1 = open hat (choked by closed/pedal hat) */
+    uint32_t rng;         /* xorshift state for noise */
 } MidiNote;
 
 /* MIDI channel state */
@@ -91,6 +102,9 @@ typedef struct MidiChannel {
     float pitch_bend;
     uint8_t bank;
     uint8_t modulation;
+    /* v23: send effect levels (CC91/CC93) */
+    uint8_t reverb;
+    uint8_t chorus;
 } MidiChannel;
 
 /* MIDI sequencer state */
@@ -105,11 +119,36 @@ typedef struct MidiSequencer {
     uint32_t ticks_per_beat;
     uint32_t microseconds_per_beat;
     float current_tempo;
+    uint64_t total_time_us; /* v36.27: max track end time across tracks (duration) */
+
+    /* v23: precise tick timing. SMPTE files carry ticks-per-second, not
+     * ticks-per-beat, so all tick<->time conversions go through us_per_tick. */
+    bool smpte;                  /* header division was SMPTE */
+    double us_per_tick;          /* microseconds per sequencer tick */
+    bool end_reached;            /* played through once (non-loop) - for END_OF_MEDIA */
 
     uint32_t position;
     bool playing;
     bool loop;
     float volume;
+
+    /* v36.28 DIAG: lifetime counters for the sandbox MIDI silence hunt */
+    uint32_t diag_events;        /* process_event calls */
+    uint32_t diag_notes;         /* start_note calls that kept the voice */
+    uint32_t diag_rejects;       /* start_note calls dropped before voice start */
+
+    /* v23: send-effect state (reverb: 4 feedback combs + 2 allpass;
+     * chorus: modulated delay). Mono input, applied to both channels. */
+    float rv_comb[4][2048];
+    int   rv_comb_len[4];
+    int   rv_comb_pos[4];
+    float rv_ap[2][512];
+    int   rv_ap_len[2];
+    int   rv_ap_pos[2];
+    float cho_buf[4096];
+    int   cho_len;
+    int   cho_pos;
+    float cho_lfo;
 
     /* Playback timing */
     uint32_t sample_rate;
@@ -176,6 +215,19 @@ void midi_note_off(uint8_t channel, uint8_t note);
 void midi_control_change(uint8_t channel, uint8_t controller, uint8_t value);
 void midi_program_change(uint8_t channel, uint8_t program);
 void midi_pitch_bend(uint8_t channel, int16_t value);
+
+/* v23: per-file variants - route MIDIControl events to a specific player's
+ * synthesizer instead of the global active sequencer. */
+void midi_note_on_file(MidiFile* midi, uint8_t channel, uint8_t note, uint8_t velocity);
+void midi_note_off_file(MidiFile* midi, uint8_t channel, uint8_t note);
+void midi_control_change_file(MidiFile* midi, uint8_t channel, uint8_t controller, uint8_t value);
+void midi_program_change_file(MidiFile* midi, uint8_t channel, uint8_t program);
+int  midi_get_channel_volume_file(MidiFile* midi, int channel);
+int  midi_get_program_file(MidiFile* midi, int channel);
+
+/* v23: minimal valid MIDI file (header + empty track) used as the synthesizer
+ * target for device://tone and device://midi players. */
+MidiFile* midi_load_empty(void);
 
 /* Get active sequencer (for audio callback) */
 MidiSequencer* midi_get_active_sequencer(void);

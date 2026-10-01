@@ -251,4 +251,10 @@ void sdl_clear_error(void);
 /* Draw the error screen on framebuffer */
 void sdl_draw_error_screen(SdlContext* ctx);
 
+/* v34.72: draw the "MIDlet finished" screen (black background, explicit
+ * message) after the VM stopped — a finished MIDlet must not look like a
+ * frozen frame. Implemented by every backend (SDL window, libretro stubs,
+ * headless). */
+void sdl_draw_midlet_finished_screen(SdlContext* ctx);
+
 #endif /* SDL_BACKEND_H */

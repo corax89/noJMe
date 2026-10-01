@@ -13,7 +13,12 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
+#if defined(_WIN32)
+/* No <pthread.h> on plain MinGW targets — use the Win32 shim */
+#include "win_thread_shim.h"
+#else
 #include <pthread.h>
+#endif
 #include <stdatomic.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -23,12 +28,14 @@
 #include "libretro.h"
 #include "sdl_backend.h"
 #include "midp.h"
+#include "jar_reader.h" /* v19: canonical JAR reader */
 #include "miniz.h"
 
 /* ============================================
  * External variables from libretro.c
  * ============================================ */
 
+extern JVM* g_jvm;  /* defined in libretro.c (non-static) */
 extern retro_video_refresh_t video_cb;
 extern retro_input_poll_t input_poll_cb;
 extern retro_input_state_t input_state_cb;
@@ -39,33 +46,35 @@ extern int libretro_get_screen_width(void);
 extern int libretro_get_screen_height(void);
 
 /* ============================================
- * Audio Thread Implementation
+ * Audio Pipeline (v34.27 REWRITE)
  * ============================================ */
 
 /* Audio buffer constants */
 #define AUDIO_BUFFER_SIZE 8192
 #define AUDIO_SOURCE_RATE 44100
 
-/* Ring buffer for audio data exchange between threads */
-typedef struct {
-    int16_t* buffer;
-    size_t capacity;
-    atomic_size_t write_pos;
-    atomic_size_t read_pos;
-    atomic_size_t count;
-    pthread_mutex_t mutex;
-    pthread_cond_t not_empty;
-    pthread_cond_t not_full;
-} AudioRingBuffer;
+/* v34.27: the libretro build no longer runs any background generator
+ * thread. libretro_process_audio() (frontend thread, once per retro_run)
+ * mixes exactly the samples the elapsed wall time calls for via
+ * media_generate_audio_samples() and pushes them through audio_batch_cb.
+ *
+ * What this removes and why (the actual "crackle + performance drop"):
+ *  1. media.c's audio_thread_func used to run even in libretro builds
+ *     (its g_libretro_mode guard checked J2ME_LIBRETRO, a macro NOTHING
+ *     defines - the Makefile passes -DLIBRETRO). Every 5 ms it mixed a
+ *     FULL 4096-sample buffer (93 ms of audio, 18x realtime) - pure wasted
+ *     CPU competing with the VM interpreter and 200Hz wakeups on
+ *     single-core armv7.
+ *  2. That overproduction overflowed every handoff buffer: under the old
+ *     stubs the ring path DELIVERED RAW 44100 Hz samples to a frontend
+ *     configured for 22050/11025 (the resampler only ran on the legacy
+ *     path!) - wrong pitch/speed audio.
+ *  3. Every full ring write blocked up to 10 ms in pthread_cond_timedwait
+ *     and then DROPPED the whole chunk - periodic gaps = the crackle.
+ *  4. malloc/free of mix and resample buffers on every generation call.
+ *  5. Per-sample atomic RMWs in the ring read/write loops. */
 
-static AudioRingBuffer g_audio_ring = {0};
-static int16_t g_audio_output_buffer[AUDIO_BUFFER_SIZE * 2];
 static bool g_audio_initialized = false;
-
-/* Audio thread state */
-static pthread_t g_audio_thread;
-static atomic_bool g_audio_thread_running = false;
-static atomic_bool g_audio_thread_started = false;
 
 /* Audio parameters */
 static uint32_t g_frontend_sample_rate = 22050;
@@ -80,223 +89,11 @@ static double g_audio_time_accumulator = 0.0;
 extern void media_generate_audio_samples(int samples);
 
 /* ============================================
- * Ring Buffer Implementation
+ * Legacy single-producer queue (the only path now)
  * ============================================ */
 
-static bool audio_ring_init(AudioRingBuffer* ring, size_t capacity) {
-    ring->buffer = (int16_t*)malloc(capacity * 2 * sizeof(int16_t));
-    if (!ring->buffer) return false;
-    
-    ring->capacity = capacity;
-    atomic_store(&ring->write_pos, 0);
-    atomic_store(&ring->read_pos, 0);
-    atomic_store(&ring->count, 0);
-    
-    pthread_mutex_init(&ring->mutex, NULL);
-    pthread_cond_init(&ring->not_empty, NULL);
-    pthread_cond_init(&ring->not_full, NULL);
-    
-    memset(ring->buffer, 0, capacity * 2 * sizeof(int16_t));
-    return true;
-}
-
-static void audio_ring_destroy(AudioRingBuffer* ring) {
-    if (ring->buffer) {
-        free(ring->buffer);
-        ring->buffer = NULL;
-    }
-    pthread_mutex_destroy(&ring->mutex);
-    pthread_cond_destroy(&ring->not_empty);
-    pthread_cond_destroy(&ring->not_full);
-}
-
-/* Write samples to ring buffer (called from audio thread) */
-static size_t audio_ring_write(AudioRingBuffer* ring, const int16_t* samples, size_t count) {
-    if (!ring->buffer || count == 0) return 0;
-    
-    pthread_mutex_lock(&ring->mutex);
-    
-    /* Wait if buffer is full (with timeout) */
-    struct timespec timeout;
-    clock_gettime(CLOCK_REALTIME, &timeout);
-    timeout.tv_nsec += 10000000; /* 10ms timeout */
-    if (timeout.tv_nsec >= 1000000000) {
-        timeout.tv_nsec -= 1000000000;
-        timeout.tv_sec++;
-    }
-    
-    while (atomic_load(&ring->count) >= ring->capacity) {
-        if (pthread_cond_timedwait(&ring->not_full, &ring->mutex, &timeout) != 0) {
-            pthread_mutex_unlock(&ring->mutex);
-            return 0; /* Timeout - buffer full */
-        }
-    }
-    
-    size_t written = 0;
-    for (size_t i = 0; i < count && atomic_load(&ring->count) < ring->capacity; i++) {
-        size_t pos = atomic_load(&ring->write_pos);
-        ring->buffer[pos * 2] = samples[i * 2];
-        ring->buffer[pos * 2 + 1] = samples[i * 2 + 1];
-        atomic_store(&ring->write_pos, (pos + 1) % ring->capacity);
-        atomic_fetch_add(&ring->count, 1);
-        written++;
-    }
-    
-    pthread_cond_signal(&ring->not_empty);
-    pthread_mutex_unlock(&ring->mutex);
-    
-    return written;
-}
-
-/* Read samples from ring buffer (called from main thread) */
-static size_t audio_ring_read(AudioRingBuffer* ring, int16_t* samples, size_t count) {
-    if (!ring->buffer || count == 0) return 0;
-    
-    size_t read_count = 0;
-    
-    for (size_t i = 0; i < count && atomic_load(&ring->count) > 0; i++) {
-        size_t pos = atomic_load(&ring->read_pos);
-        samples[i * 2] = ring->buffer[pos * 2];
-        samples[i * 2 + 1] = ring->buffer[pos * 2 + 1];
-        atomic_store(&ring->read_pos, (pos + 1) % ring->capacity);
-        atomic_fetch_sub(&ring->count, 1);
-        read_count++;
-    }
-    
-    if (read_count > 0) {
-        pthread_cond_signal(&ring->not_full);
-    }
-    
-    return read_count;
-}
-
-/* Get available samples count */
-static size_t audio_ring_available(AudioRingBuffer* ring) {
-    return atomic_load(&ring->count);
-}
-
 /* ============================================
- * Audio Thread Function
- * ============================================ */
-
-/* Audio thread - continuously generates audio samples */
-static void* audio_thread_func(void* arg) {
-    (void)arg;
-
-    int16_t* temp_buffer = (int16_t*)malloc(AUDIO_BUFFER_SIZE * 2 * sizeof(int16_t));
-    if (!temp_buffer) {
-        return NULL;
-    }
-    
-    int samples_per_chunk = 512; /* Generate in smaller chunks */
-    int chunks_per_cycle = 4;
-    int cycle_counter = 0;
-    
-    while (atomic_load(&g_audio_thread_running)) {
-        /* Generate audio samples */
-        /* We call media_generate_audio_samples which will call sdl_audio_queue_samples */
-        /* But we want to intercept the output */
-        
-        /* For now, use a simpler approach: generate and write directly */
-        memset(temp_buffer, 0, samples_per_chunk * 2 * sizeof(int16_t));
-        
-        /* Call the media layer to generate samples */
-        media_generate_audio_samples(samples_per_chunk);
-        
-        /* The samples are now in sdl_audio_queue_samples - we need a different approach */
-        /* Let's use a different buffer for the audio thread */
-        
-        cycle_counter++;
-        
-        /* Sleep to maintain buffer - aim for ~60Hz generation rate */
-        usleep(4000); /* 4ms sleep */
-        
-        /* Periodically check if we should stop */
-        if (!atomic_load(&g_audio_thread_running)) break;
-    }
-    
-    free(temp_buffer);
-    return NULL;
-}
-
-/* ============================================
- * Alternative Audio Thread - Pull Model
- * ============================================ */
-
-/* Audio thread state for pull model */
-static atomic_bool g_generate_audio_request = false;
-static atomic_int g_samples_requested = 0;
-static atomic_bool g_audio_data_ready = false;
-
-/* Secondary buffer for thread communication */
-#define THREAD_AUDIO_BUFFER_SIZE 4096
-static int16_t g_thread_audio_buffer[THREAD_AUDIO_BUFFER_SIZE * 2];
-static atomic_size_t g_thread_audio_count = 0;
-
-/* Audio thread with pull model - generates samples on demand */
-static void* audio_thread_pull_func(void* arg) {
-    (void)arg;
-
-    while (atomic_load(&g_audio_thread_running)) {
-        /* Wait for generation request or timeout */
-        int waited = 0;
-        while (!atomic_load(&g_generate_audio_request) && waited < 10000) {
-            usleep(100);
-            waited += 100;
-        }
-        
-        if (!atomic_load(&g_audio_thread_running)) break;
-        
-        /* Generate samples if requested */
-        int samples = atomic_load(&g_samples_requested);
-        if (samples > 0) {
-            /* Clear request */
-            atomic_store(&g_samples_requested, 0);
-            atomic_store(&g_generate_audio_request, false);
-            
-            /* Generate audio */
-            if (samples > THREAD_AUDIO_BUFFER_SIZE) {
-                samples = THREAD_AUDIO_BUFFER_SIZE;
-            }
-            
-            /* Call the audio generator - this will fill our internal buffer */
-            media_generate_audio_samples(samples);
-            
-            /* Mark data as ready */
-            atomic_store(&g_audio_data_ready, true);
-        }
-        
-        /* Always generate some audio to keep the buffer filled */
-        usleep(2000); /* 2ms */
-    }
-
-    return NULL;
-}
-
-/* ============================================
- * Simple Audio Thread - Background Generation
- * ============================================ */
-
-/* This thread continuously generates audio in the background */
-static void* audio_thread_background_func(void* arg) {
-    (void)arg;
-
-    int samples_per_generate = 256;
-    int generate_interval_us = 5000; /* 5ms between generations */
-
-    while (atomic_load(&g_audio_thread_running)) {
-        /* Generate samples in background */
-        media_generate_audio_samples(samples_per_generate);
-        
-        /* Sleep to maintain reasonable CPU usage */
-        usleep(generate_interval_us);
-    }
-
-    return NULL;
-}
-
-/* ============================================
- * Audio Buffer (Legacy - for direct queue from media.c)
+ * Audio Buffer (single-producer queue: media.c -> libretro frontend)
  * ============================================ */
 
 /* Small buffer - just enough for 2-3 frames to prevent overflow */
@@ -320,38 +117,8 @@ static void audio_buffer_init(void) {
         g_audio_resample_pos = 0.0;
         g_audio_time_accumulator = 0.0;
         g_last_frame_time = audio_get_time_us();
-        
-        /* Initialize ring buffer for thread communication */
-        if (!g_audio_ring.buffer) {
-            audio_ring_init(&g_audio_ring, AUDIO_BUFFER_SIZE);
-        }
-        
         g_audio_initialized = true;
     }
-}
-
-/* Start the audio thread */
-static void audio_thread_start(void) {
-    if (atomic_load(&g_audio_thread_started)) return;
-    
-    atomic_store(&g_audio_thread_running, true);
-    
-    int result = pthread_create(&g_audio_thread, NULL, audio_thread_background_func, NULL);
-    if (result == 0) {
-        atomic_store(&g_audio_thread_started, true);
-    }
-}
-
-/* Stop the audio thread */
-static void audio_thread_stop(void) {
-    if (!atomic_load(&g_audio_thread_started)) return;
-    
-    atomic_store(&g_audio_thread_running, false);
-    
-    /* Wait for thread to finish */
-    pthread_join(g_audio_thread, NULL);
-
-    atomic_store(&g_audio_thread_started, false);
 }
 
 void libretro_set_sample_rate(uint32_t rate) {
@@ -362,6 +129,12 @@ void libretro_set_sample_rate(uint32_t rate) {
 }
 
 void libretro_set_fps(int fps) {
+    /* v34.74 (F-1): intentionally a NO-OP in the libretro build — pacing is
+     * FRONTEND-driven: retro_get_system_av_info reports the fps (and the
+     * live-change path pushes SET_SYSTEM_AV_INFO), so RetroArch calls
+     * retro_run at the target rate. Nothing inside the core may sleep or
+     * throttle per-frame. Kept for API compatibility with the SDL builds,
+     * where ctx->target_fps drives the main-loop delay. */
     (void)fps;
 }
 
@@ -386,43 +159,29 @@ static void resample_audio(const int16_t* input, size_t input_samples,
     *output_samples = out_idx;
 }
 
-/* Called from audio thread or media.c to queue samples */
+/* Called from media.c (frontend thread in the libretro build, the SDL audio
+ * thread in the desktop build) to queue resampled samples. */
 void sdl_audio_queue_samples(const int16_t* samples, size_t count) {
     if (!samples || count == 0) return;
     audio_buffer_init();
-    
-    /* Use thread-safe ring buffer if audio thread is running */
-    if (atomic_load(&g_audio_thread_started)) {
-        /* Write to ring buffer for main thread to read */
-        audio_ring_write(&g_audio_ring, samples, count / 2);
+
+    size_t frames = count / 2;
+
+    if (g_audio_resample_ratio != 1.0 && g_audio_resample_ratio > 0.0) {
+        /* v34.27: static scratch instead of malloc/free per call. */
+        static int16_t resampled[AUDIO_BUFFER_SIZE * 2];
+        size_t max_output = (size_t)((double)frames / g_audio_resample_ratio) + 16;
+        if (max_output > AUDIO_BUFFER_SIZE) max_output = AUDIO_BUFFER_SIZE;
+        size_t output_count = max_output;
+        resample_audio(samples, frames, resampled, &output_count,
+                       g_audio_resample_ratio, &g_audio_resample_pos);
+        samples = resampled;
+        frames = output_count;
     }
-    
-    /* Also write to legacy buffer for compatibility */
-    if (g_audio_resample_ratio != 1.0 && g_audio_resample_ratio > 0) {
-        size_t max_output = (size_t)(count / g_audio_resample_ratio) + 16;
-        int16_t* resampled = (int16_t*)malloc(max_output * 2 * sizeof(int16_t));
-        if (resampled) {
-            size_t output_count = max_output;
-            resample_audio(samples, count / 2, resampled, &output_count, 
-                          g_audio_resample_ratio, &g_audio_resample_pos);
-            for (size_t i = 0; i < output_count; i++) {
-                if (g_audio_count >= AUDIO_BUFFER_SIZE) {
-                    g_audio_read_pos = (g_audio_read_pos + 1) % AUDIO_BUFFER_SIZE;
-                    g_audio_count--;
-                }
-                g_audio_buffer[g_audio_write_pos * 2] = resampled[i * 2];
-                g_audio_buffer[g_audio_write_pos * 2 + 1] = resampled[i * 2 + 1];
-                g_audio_write_pos = (g_audio_write_pos + 1) % AUDIO_BUFFER_SIZE;
-                g_audio_count++;
-            }
-            free(resampled);
-            return;
-        }
-    }
-    
-    size_t samples_to_write = count / 2;
-    for (size_t i = 0; i < samples_to_write; i++) {
+
+    for (size_t i = 0; i < frames; i++) {
         if (g_audio_count >= AUDIO_BUFFER_SIZE) {
+            /* Full: drop the oldest samples (bounded latency beats blocking) */
             g_audio_read_pos = (g_audio_read_pos + 1) % AUDIO_BUFFER_SIZE;
             g_audio_count--;
         }
@@ -433,26 +192,44 @@ void sdl_audio_queue_samples(const int16_t* samples, size_t count) {
     }
 }
 
-size_t sdl_audio_get_queued_size(void) { 
-    /* Return count from ring buffer if audio thread is running */
-    if (atomic_load(&g_audio_thread_started) && g_audio_ring.buffer) {
-        return audio_ring_available(&g_audio_ring);
-    }
-    return g_audio_count; 
+size_t sdl_audio_get_queued_size(void) {
+    return g_audio_count;
 }
 
-/* Main thread function - retrieves audio from audio thread and sends to frontend */
+/* v34.94: libretro has no SDL queue device - the sync path feeds the
+ * frontend directly, so report "alive" to keep the media thread idle-safe
+ * (it is never created in libretro mode anyway). */
+int sdl_audio_device_alive(void) {
+    return 1;
+}
+
+/* Frontend thread, once per retro_run: mix and deliver exactly the audio the
+ * elapsed wall time calls for. All mixing happens synchronously here - no
+ * background thread, no queue handoff, no drift. */
 void libretro_process_audio(void) {
     extern retro_audio_sample_batch_t audio_batch_cb;
     if (!audio_batch_cb) return;
-    
-    /* Ensure audio thread is running */
-    if (!atomic_load(&g_audio_thread_started)) {
-        audio_buffer_init();
-        audio_thread_start();
+
+    audio_buffer_init();
+
+    /* v41 PERF-DIAG: NOJME_AUDIO_STALL_MS=<n> — artificially stall the
+     * audio generation (emulates a slow device where media mixing eats
+     * most of the frame; GC-safepoint-timeout experiments). */
+    {
+        static int s_stall_ms = -1;
+        if (s_stall_ms < 0) {
+            const char* e = getenv("NOJME_AUDIO_STALL_MS");
+            s_stall_ms = (e && atoi(e) > 0) ? atoi(e) : 0;
+        }
+        if (s_stall_ms > 0) {
+            struct timespec rq = { .tv_sec = s_stall_ms / 1000,
+                                   .tv_nsec = (long)(s_stall_ms % 1000) * 1000000L };
+            nanosleep(&rq, NULL);
+        }
     }
 
-    /* TIME-BASED SYNCHRONIZATION - the key to correct audio speed! */
+    /* TIME-BASED SYNCHRONIZATION - how many frontend-rate samples does the
+     * elapsed time since the previous frame call for? */
     uint64_t current_time = audio_get_time_us();
     uint64_t elapsed_us = current_time - g_last_frame_time;
     g_last_frame_time = current_time;
@@ -461,9 +238,22 @@ void libretro_process_audio(void) {
     if (elapsed_us < 1000) elapsed_us = 1000;
     if (elapsed_us > 100000) elapsed_us = 100000;
 
-    /* Calculate how many samples are needed for the elapsed time */
     double samples_needed = (double)g_frontend_sample_rate * (double)elapsed_us / 1000000.0;
     g_audio_time_accumulator += samples_needed;
+
+    /* v34.73 DIAG: NOJME_AUDDBG=1 — one-shot trace of the synchronous audio
+     * pump's state (callback registered? elapsed time? sample demand?). */
+    {
+        static int s_adbg = -1;
+        if (s_adbg < 0) {
+            const char* e = getenv("NOJME_AUDDBG");
+            s_adbg = (e && e[0] == '1') ? 1 : 0;
+            if (s_adbg)
+                fprintf(stderr, "[AUDDBG] proc_audio: cb=%p rate=%u elapsed=%lluus need=%.1f\n",
+                        (void*)(size_t)(audio_batch_cb ? 1 : 0), g_frontend_sample_rate,
+                        (unsigned long long)elapsed_us, samples_needed);
+        }
+    }
 
     int samples_to_send = (int)g_audio_time_accumulator;
     if (samples_to_send < 1) return;
@@ -472,52 +262,34 @@ void libretro_process_audio(void) {
     /* Clamp to reasonable range */
     if (samples_to_send > 2048) samples_to_send = 2048;
 
-    /* Try to get samples from ring buffer first (from audio thread) */
-    size_t available = 0;
-    if (atomic_load(&g_audio_thread_started) && g_audio_ring.buffer) {
-        available = audio_ring_available(&g_audio_ring);
-    }
-    
-    /* Also check legacy buffer */
-    size_t legacy_available = g_audio_count;
-    
-    /* Use whichever buffer has data */
-    if (available > 0) {
-        /* Read from ring buffer */
-        if ((size_t)samples_to_send > available) {
-            samples_to_send = (int)available;
-        }
-        
-        /* Read samples from ring buffer */
-        size_t read_count = audio_ring_read(&g_audio_ring, g_audio_output_buffer, samples_to_send);
-        
-        if (read_count > 0) {
-            /* Send to frontend */
-            audio_batch_cb(g_audio_output_buffer, read_count);
-        }
-    } else if (legacy_available > 0) {
-        /* Fallback to legacy buffer */
-        if ((size_t)samples_to_send > legacy_available) {
-            samples_to_send = (int)legacy_available;
-        }
+    /* v34.27: generate synchronously - mix at the 44100 source rate exactly
+     * the amount that resamples into samples_to_send (+2 for the fractional
+     * resampler position). sdl_audio_queue_samples() resamples into the
+     * queue as it enqueues. */
+    double ratio = (g_audio_resample_ratio > 0.0) ? g_audio_resample_ratio : 1.0;
+    int src_samples = (int)((double)samples_to_send * ratio) + 2;
+    if (src_samples > AUDIO_BUFFER_SIZE) src_samples = AUDIO_BUFFER_SIZE;
+    media_generate_audio_samples(src_samples);
 
-        /* Send samples in chunks */
-        int samples_sent = 0;
-        while (samples_sent < samples_to_send) {
-            int remaining = samples_to_send - samples_sent;
-            int chunk = remaining > 256 ? 256 : remaining;
+    /* Pull from the (already resampled) queue. */
+    int avail = (int)g_audio_count;
+    if (avail <= 0) return;
+    if (avail > samples_to_send) avail = samples_to_send;
 
-            size_t contiguous = AUDIO_BUFFER_SIZE - g_audio_read_pos;
-            if (contiguous > (size_t)chunk) contiguous = (size_t)chunk;
-            if (contiguous > g_audio_count) contiguous = g_audio_count;
+    int samples_sent = 0;
+    while (samples_sent < avail) {
+        int remaining = avail - samples_sent;
+        int chunk = remaining > 512 ? 512 : remaining;
 
-            if (contiguous == 0) break;
+        size_t contiguous = AUDIO_BUFFER_SIZE - g_audio_read_pos;
+        if (contiguous > (size_t)chunk) contiguous = (size_t)chunk;
+        if (contiguous > g_audio_count) contiguous = g_audio_count;
+        if (contiguous == 0) break;
 
-            audio_batch_cb(&g_audio_buffer[g_audio_read_pos * 2], contiguous);
-            g_audio_read_pos = (g_audio_read_pos + contiguous) % AUDIO_BUFFER_SIZE;
-            g_audio_count -= contiguous;
-            samples_sent += contiguous;
-        }
+        audio_batch_cb(&g_audio_buffer[g_audio_read_pos * 2], contiguous);
+        g_audio_read_pos = (g_audio_read_pos + contiguous) % AUDIO_BUFFER_SIZE;
+        g_audio_count -= contiguous;
+        samples_sent += contiguous;
     }
 }
 
@@ -602,24 +374,124 @@ void libretro_begin_frame(void) {
     /* J2ME renders incrementally, don't clear */
 }
 
-/* Called at END of frame - copy render buffer to display buffer */
+/* Called at END of frame - copy the latest SETTLED frame to the display
+ * buffer.
+ * v29 FLICKER FIX: only present SETTLED canvas states (a MIDlet frame is
+ * mid-flight while paint() is executing or a Graphics3D bind->release cycle
+ * is open) - implemented then via a UI trylock + mid-frame gates.
+ * v34.61 (Asphalt 3 3D "rarely delivers 3D frames"): the gate design itself
+ * was the starvation. A 3D paint longer than one frontend frame (15-40ms on
+ * ARMv7 vs a 16.6ms retro_run period) held the UI pump lock nearly
+ * full-time; the trylock failed and the display kept stale content while
+ * the game ran on ("the game works fast but rarely delivers 3D frames";
+ * partially filled frames leaked through the remaining gate windows, e.g.
+ * GameCanvas flushGraphics which takes no lock and sets no flags).
+ * FIX - KVM-authentic scanout semantics, like a real display controller:
+ * present the latest SETTLED-frame snapshot (display.c keeps it; snapshots
+ * exist only after a COMPLETE frame - torn/partial output is impossible by
+ * construction), and NEVER consult the UI lock or the mid-frame gates.
+ * The vblank (vsync) tick moved to AFTER the copy so a woken game thread
+ * can neither tear nor veto the frame it just produced. */
 void libretro_end_frame(void) {
     if (!g_buffers[0] || !g_buffers[1]) return;
-    
+
     /* Wait if previous copy is still being read */
     while (atomic_load(&g_copying)) {
         /* Busy wait - should be very short */
     }
-    
-    /* Copy buffer[0] (render) to buffer[1] (display) */
-    atomic_store(&g_copying, true);
-    atomic_thread_fence(memory_order_release);
-    
-    memcpy(g_buffers[1], g_buffers[0], g_buffer_size);
-    
-    atomic_thread_fence(memory_order_release);
-    atomic_store(&g_frame_ready, true);
-    atomic_store(&g_copying, false);
+
+    {
+        extern int midp_canvas_mid_frame(void);
+        extern int midp_ui_trylock_external(void);
+        extern void midp_ui_unlock_external(void);
+        extern uint32_t midp_present_stable_copy(uint32_t* dst, int dst_px);
+
+        /* 1. Present the latest settled frame (scanout). */
+        atomic_store(&g_copying, true);
+        atomic_thread_fence(memory_order_release);
+        uint32_t stable_seq = midp_present_stable_copy(
+                g_buffers[1], g_buffer_width * g_buffer_height);
+        if (stable_seq != 0) {
+            atomic_store(&g_frame_ready, true);
+        } else {
+            /* Bootstrap: no frame has settled yet (nothing completed a
+             * pump before this retro_run). Legacy gated direct copy -
+             * identical to the pre-v34.61 behavior. */
+            int ui_held = (midp_ui_trylock_external() == 0);
+            if (ui_held) {
+                if (!midp_canvas_mid_frame()) {
+                    memcpy(g_buffers[1], g_buffers[0], g_buffer_size);
+                    atomic_store(&g_frame_ready, true);
+                }
+                midp_ui_unlock_external();
+            }
+        }
+        atomic_thread_fence(memory_order_release);
+        atomic_store(&g_copying, false);
+
+        /* 2. v34.61 STALL-DIAG: NOJME_STALL_DIAG=1 counts consecutive
+         * frontend frames during which NO new settled frame appeared
+         * (unchanged stable seq) - the true "frozen picture while the game
+         * runs" detector. (The old counter measured trylock skips, a
+         * condition that no longer exists.) */
+        {
+            static int sd_on = -1;
+            if (sd_on < 0) {
+                const char* e = getenv("NOJME_STALL_DIAG");
+                sd_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+            }
+            if (sd_on) {
+                static volatile uint32_t s_last_seq = 0;
+                static volatile int s_stall_streak = 0;
+                static volatile int s_stall_total = 0;
+                if (stable_seq == s_last_seq) {
+                    s_stall_streak++;
+                    s_stall_total++;
+                    if (s_stall_streak == 10) {
+                        char line[128];
+                        int ln = snprintf(line, sizeof(line),
+                                "[STALL-DIAG] no new settled frame for %d frames in a row (total %d)\n",
+                                s_stall_streak, s_stall_total);
+                        if (ln > 0) fwrite(line, 1, (size_t)ln, stderr);
+                    } else if (s_stall_streak > 10 && (s_stall_streak % 30) == 0) {
+                        char line[128];
+                        int ln = snprintf(line, sizeof(line),
+                                "[STALL-DIAG] no new settled frame for %d frames in a row (total %d)\n",
+                                s_stall_streak, s_stall_total);
+                        if (ln > 0) fwrite(line, 1, (size_t)ln, stderr);
+                    }
+                    /* v34.61 DIAG: dump all VM thread stacks at streak
+                     * milestones (60 / 300 frames) - shows WHERE the game
+                     * thread is while no frames settle. */
+                    if (s_stall_streak == 60 || s_stall_streak == 300) {
+                        extern void jvm_dump_all_threads(void);
+                        jvm_dump_all_threads();
+                    }
+                } else {
+                    if (s_stall_streak >= 10) {
+                        char line[128];
+                        int ln = snprintf(line, sizeof(line),
+                                "[STALL-DIAG] settled frames resumed after %d stalled frames (total %d)\n",
+                                s_stall_streak, s_stall_total);
+                        if (ln > 0) fwrite(line, 1, (size_t)ln, stderr);
+                    }
+                    s_stall_streak = 0;
+                    s_last_seq = stable_seq;
+                }
+            }
+        }
+
+        /* 3. v50 (Asphalt image freeze): end-of-frame vsync tick - game-thread
+         * serviceRepaints() waits on this to pace itself to the frontend
+         * frame rate (KVM "block until vblank" semantics). Bumped ALWAYS
+         * (presented or skipped) so a paced game thread never hangs; v34.61:
+         * bumped AFTER the presentation copy above, so a woken game thread
+         * can neither tear nor veto the frame it just produced. */
+        {
+            extern void midp_vsync_tick(void);
+            midp_vsync_tick();
+        }
+    }
 }
 
 /* Get buffer for display - always return buffer[1] */
@@ -683,27 +555,22 @@ int sdl_init(JVM* jvm, int width, int height, int scale, bool headless) {
     }
     /* framebuffer already set to g_buffers[0] in init_buffers */
     
-    /* Initialize audio and start audio thread */
+    /* v34.27: no audio thread anymore - libretro_process_audio() mixes
+     * synchronously once per frame. */
     audio_buffer_init();
-    audio_thread_start();
-    
+
     return 0;
 }
 
 void sdl_destroy(SdlContext* ctx) {
     (void)ctx;
-    
-    /* Stop audio thread */
-    audio_thread_stop();
-    
+
     for (int i = 0; i < BUFFER_COUNT; i++) {
         if (g_buffers[i]) free(g_buffers[i]);
         g_buffers[i] = NULL;
     }
     g_buffer_size = 0;
-    
-    /* Destroy ring buffer */
-    audio_ring_destroy(&g_audio_ring);
+
     g_audio_initialized = false;
     
     LOG_SAFE("[J2ME] Destroyed\n");
@@ -744,87 +611,58 @@ bool sdl_key_pressed(SdlContext* ctx, int key) {
 MidpGraphics* sdl_get_graphics(SdlContext* ctx) { (void)ctx; return NULL; }
 int sdl_audio_init_simple(uint32_t sample_rate) { (void)sample_rate; audio_buffer_init(); return 0; }
 
+/* v36.16 FIX: media_shutdown_full() (v36.13 bounded exit path) calls
+ * sdl_audio_close(NULL); media.c is shared with the libretro core, but the
+ * core had NO twin — the link failed with "undefined reference to
+ * sdl_audio_close" (--no-undefined in LDFLAGS; broke `make` for the
+ * Windows and linux shared-core builds). Libretro twin is a no-op: the
+ * audio device belongs to the frontend (audio_batch_cb), nothing to close. */
+void sdl_audio_close(SdlContext* ctx) { (void)ctx; }
+
 void sdl_audio_shutdown(void) {
-    audio_thread_stop();
     g_audio_initialized = false;
     g_audio_write_pos = 0;
     g_audio_read_pos = 0;
     g_audio_count = 0;
-    audio_ring_destroy(&g_audio_ring);
 }
 
-/* JAR resource loading */
+/* JAR resource loading
+ * v19: rewritten on top of the single canonical miniz-based reader
+ * (src/utils/jar_reader.c). The old hand-rolled central-directory scan was
+ * one of FOUR divergent copies in the tree; on at least one Windows build it
+ * returned NULL for every resource (classes still loaded via the jvm.c copy)
+ * which left NEscube with a textureless black cube and NPE storms in
+ * getResourceAsStream. miniz handles data descriptors, ZIP64, SFX prefixes
+ * and repacked entry layouts that the old code did not.
+ */
 uint8_t* load_jar_resource(const char* path, size_t* size) {
     if (size) *size = 0;
     if (!path) return NULL;
-    extern JVM* g_jvm;
-    if (!g_jvm || !g_jvm->class_loader.jar_data) return NULL;
-    
-    const uint8_t* jar_data = g_jvm->class_loader.jar_data;
-    size_t jar_size = g_jvm->class_loader.jar_size;
-    
-    size_t eocd = 0;
-    for (size_t i = jar_size - 22; i > 0; i--) {
-        if (jar_data[i] == 0x50 && jar_data[i+1] == 0x4B &&
-            jar_data[i+2] == 0x05 && jar_data[i+3] == 0x06) {
-            eocd = i; break;
-        }
+
+    /* Prefer the libretro.c global JVM; fall back to the context copy set
+     * by sdl_init() (same instance, different storage). */
+    JVM* jvm = g_jvm;
+    if (!jvm) {
+        jvm = g_libretro_context.jvm;
     }
-    if (eocd == 0) return NULL;
-    
-    uint32_t cd_start = jar_data[eocd + 16] | (jar_data[eocd + 17] << 8) |
-                        (jar_data[eocd + 18] << 16) | (jar_data[eocd + 19] << 24);
-    uint16_t cd_entries = jar_data[eocd + 10] | (jar_data[eocd + 11] << 8);
-    
-    size_t cde = cd_start;
-    for (int i = 0; i < cd_entries && cde < eocd; i++) {
-        uint32_t sig = jar_data[cde] | (jar_data[cde+1] << 8) |
-                       (jar_data[cde+2] << 16) | (jar_data[cde+3] << 24);
-        if (sig != 0x02014B50) break;
-        
-        uint16_t compression = jar_data[cde + 10] | (jar_data[cde + 11] << 8);
-        uint32_t comp_size = jar_data[cde + 20] | (jar_data[cde + 21] << 8) |
-                             (jar_data[cde + 22] << 16) | (jar_data[cde + 23] << 24);
-        uint32_t uncomp_size = jar_data[cde + 24] | (jar_data[cde + 25] << 8) |
-                               (jar_data[cde + 26] << 16) | (jar_data[cde + 27] << 24);
-        uint16_t name_len = jar_data[cde + 28] | (jar_data[cde + 29] << 8);
-        uint16_t extra_len = jar_data[cde + 30] | (jar_data[cde + 31] << 8);
-        uint16_t comment_len = jar_data[cde + 32] | (jar_data[cde + 33] << 8);
-        uint32_t local_off = jar_data[cde + 42] | (jar_data[cde + 43] << 8) |
-                             (jar_data[cde + 44] << 16) | (jar_data[cde + 45] << 24);
-        
-        const char* name = (const char*)(jar_data + cde + 46);
-        if (name_len == strlen(path) && memcmp(name, path, name_len) == 0) {
-            uint16_t local_name_len = jar_data[local_off + 26] | (jar_data[local_off + 27] << 8);
-            uint16_t local_extra_len = jar_data[local_off + 28] | (jar_data[local_off + 29] << 8);
-            size_t data_off = local_off + 30 + local_name_len + local_extra_len;
-            
-            if (compression == 0) {
-                *size = uncomp_size;
-                uint8_t* data = (uint8_t*)malloc(*size);
-                if (data) memcpy(data, jar_data + data_off, *size);
-                return data;
-            } else if (compression == 8) {
-                uint8_t* data = (uint8_t*)malloc(uncomp_size);
-                if (!data) return NULL;
-                z_stream stream;
-                memset(&stream, 0, sizeof(stream));
-                if (inflateInit2(&stream, -MAX_WBITS) != Z_OK) { free(data); return NULL; }
-                stream.next_in = (Bytef*)(jar_data + data_off);
-                stream.avail_in = comp_size;
-                stream.next_out = data;
-                stream.avail_out = uncomp_size;
-                if (inflate(&stream, Z_FINISH) != Z_STREAM_END) {
-                    inflateEnd(&stream); free(data); return NULL;
-                }
-                inflateEnd(&stream);
-                *size = uncomp_size;
-                return data;
-            }
+    if (!jvm || !jvm->class_loader.jar_data || jvm->class_loader.jar_size == 0) {
+        /* Class loading uses the same storage — if we get here with a NULL
+         * jar the whole VM would be non-functional anyway. Log it once so a
+         * future log pinpoints the exact failure instead of a silent NULL. */
+        static int logged = 0;
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr,
+                    "[JAR-READ] FAILED (no-jar): '%s' (g_jvm=%p ctx_jvm=%p jar=%p size=%zu)\n",
+                    path, (void*)g_jvm, (void*)g_libretro_context.jvm,
+                    (jvm && jvm->class_loader.jar_data) ? jvm->class_loader.jar_data : NULL,
+                    (jvm && jvm->class_loader.jar_size) ? (size_t)jvm->class_loader.jar_size : (size_t)0);
         }
-        cde += 46 + name_len + extra_len + comment_len;
+        return NULL;
     }
-    return NULL;
+
+    return jar_read_file(jvm->class_loader.jar_data, jvm->class_loader.jar_size,
+                         path, size);
 }
 
 void sdl_present(SdlContext* ctx) { (void)ctx; }
@@ -944,6 +782,7 @@ void sdl_clear_error(void) {
 }
 
 /* Draw a single character on framebuffer */
+__attribute__((unused))
 static void draw_char(uint32_t* fb, int fb_width, int fb_height, int x, int y, char c, uint32_t color) {
     if (x < 0 || y < 0 || x + FONT_WIDTH >= fb_width || y + FONT_HEIGHT >= fb_height) return;
     
@@ -1029,7 +868,7 @@ void sdl_draw_error_screen(SdlContext* ctx) {
     uint32_t bg_color = 0xFF1A1A2E;    /* Dark blue background */
     uint32_t header_bg = 0xFF16213E;   /* Slightly lighter header */
     uint32_t border_color = 0xFFE94560; /* Red-pink accent */
-    uint32_t title_color = 0xFFFFFFFF;  /* White title */
+    uint32_t title_color = 0xFFFFFFFF;  (void)title_color; /* White title */
     uint32_t exc_color = 0xFFFF6B6B;    /* Red for exception name */
     uint32_t msg_color = 0xFFFFFF00;    /* Yellow text for message */
     uint32_t detail_color = 0xFF87CEEB; /* Light blue for details */
@@ -1133,4 +972,109 @@ void sdl_draw_error_screen(SdlContext* ctx) {
     y_pos = height - 15;
     x_pos = 5;
     draw_string(fb, width, height, &x_pos, &y_pos, "SELECT=exit", help_color, width - 10);
+
+    /* v34.61: the error screen is drawn straight into the framebuffer by
+     * the frontend thread; make it the settled frame so the scanout
+     * presenter (which no longer reads the live framebuffer) shows it. */
+    {
+        extern void midp_present_settled_snapshot(void);
+        midp_present_settled_snapshot();
+    }
 }
+
+/* ============================================
+ * v34.72: "MIDlet finished" screen for the libretro core.
+ *
+ * After MIDlet.notifyDestroyed() (or System.exit) the VM stops, but the
+ * frontend keeps calling retro_run() forever — the last game frame used
+ * to stay on screen indefinitely and was indistinguishable from a hang
+ * (user report: "it is not clear the MIDlet has ended, it just looks
+ * frozen"). Draw an unmistakable message on a BLACK background instead.
+ * ============================================ */
+
+static int finished_text_width_px(const char* s) {
+    /* UTF-8 codepoint count * (FONT_WIDTH + 1) - 1 */
+    int n = 0, i = 0, len = 0;
+    if (!s) return 0;
+    while (s[len]) len++;
+    while (i < len) {
+        int cp = utf8_decode(s, &i, len);
+        if (cp < 0) break;
+        n++;
+    }
+    return n > 0 ? n * (FONT_WIDTH + 1) - 1 : 0;
+}
+
+void sdl_draw_midlet_finished_screen(SdlContext* ctx) {
+    if (!ctx || !ctx->framebuffer) return;
+
+    int width  = ctx->width  > 0 ? ctx->width  : 240;
+    int height = ctx->height > 0 ? ctx->height : 320;
+    uint32_t* fb = ctx->framebuffer;
+
+    /* Black background — visually distinct from every game screen and
+     * from the dark-red/dark-blue error screens. */
+    for (int i = 0; i < width * height; i++) {
+        fb[i] = 0xFF000000;
+    }
+
+    const uint32_t title_color  = 0xFFFFFFFF;  /* white */
+    const uint32_t sub_color    = 0xFFA8A8A8;  /* light gray */
+    const uint32_t dim_color    = 0xFF707070;  /* dim gray */
+    const uint32_t frame_color  = 0xFF303030;  /* thin frame */
+
+    /* Thin frame around the screen so a black frame is clearly intentional
+     * even on OLED frontends where "black" could read as "off". */
+    draw_hline(fb, width, 0, 0, width, frame_color);
+    draw_hline(fb, width, height - 1, 0, width, frame_color);
+    for (int y = 1; y < height - 1; y++) {
+        fb[y * width] = frame_color;
+        fb[y * width + width - 1] = frame_color;
+    }
+
+    /* Centered message block */
+    int center_y = (height / 2) - 24;
+
+    const char* title = "MIDlet finished";
+    {
+        int x_pos = (width - finished_text_width_px(title)) / 2;
+        if (x_pos < 1) x_pos = 1;
+        int y_pos = center_y;
+        draw_string(fb, width, height, &x_pos, &y_pos, title, title_color, width - 4);
+    }
+    {
+        const char* sub = "\xD0\x9C\xD0\xB8\xD0\xB4\xD0\xBB\xD0\xB5\xD1\x82 \xD0\xB7\xD0\xB0\xD0\xB2\xD0\xB5\xD1\x80\xD1\x88\xD1\x91\xD0\xBD";  /* "Мидлет завершён" */
+        int x_pos = (width - finished_text_width_px(sub)) / 2;
+        if (x_pos < 1) x_pos = 1;
+        int y_pos = center_y + FONT_HEIGHT + 6;
+        draw_string(fb, width, height, &x_pos, &y_pos, sub, sub_color, width - 4);
+    }
+    /* Small separator */
+    {
+        int y = center_y + 2 * (FONT_HEIGHT + 6) + 2;
+        draw_hline(fb, width, y, width / 4, width - width / 4, frame_color);
+    }
+    {
+        const char* hint = "The application has ended";
+        int x_pos = (width - finished_text_width_px(hint)) / 2;
+        if (x_pos < 1) x_pos = 1;
+        int y_pos = center_y + 3 * (FONT_HEIGHT + 6);
+        draw_string(fb, width, height, &x_pos, &y_pos, hint, dim_color, width - 4);
+    }
+
+    /* Bottom hint: how to close */
+    {
+        const char* hint = "SELECT=close";
+        int x_pos = (width - finished_text_width_px(hint)) / 2;
+        if (x_pos < 1) x_pos = 1;
+        int y_pos = height - 15;
+        draw_string(fb, width, height, &x_pos, &y_pos, hint, dim_color, width - 4);
+    }
+
+    /* Same settled-frame handoff as the error screen (v34.61 scanout). */
+    {
+        extern void midp_present_settled_snapshot(void);
+        midp_present_settled_snapshot();
+    }
+}
+

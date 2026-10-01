@@ -144,6 +144,9 @@ typedef struct ClassHashEntry {
     JavaClass* clazz;
     const char* name;
     struct ClassHashEntry* next;
+    /* v20 (P0-2): set once a JAR lookup proved there is no real class with
+     * this name — prevents re-scanning the JAR on every hot stub lookup. */
+    bool jar_checked;
 } ClassHashEntry;
 
 static ClassHashEntry* g_class_hash[CLASS_HASH_SIZE];
@@ -173,6 +176,7 @@ void class_hash_add(JavaClass* clazz) {
     entry->clazz = clazz;
     entry->name = clazz->class_name;
     entry->next = g_class_hash[idx];
+    entry->jar_checked = false;
     g_class_hash[idx] = entry;
     g_class_count++;
 }
@@ -192,6 +196,37 @@ JavaClass* class_hash_lookup(const char* name) {
         entry = entry->next;
     }
     return NULL;
+}
+
+/* v20 (P0-2): remember that the JAR was searched and does NOT contain a
+ * real class under this name, so stub hits skip the (binary-search) JAR
+ * probe on subsequent lookups. */
+void class_hash_mark_jar_checked(const char* name) {
+    if (!name) return;
+    uint32_t hash = fnv1a_hash(name);
+    uint32_t idx = hash & CLASS_HASH_MASK;
+    ClassHashEntry* entry = g_class_hash[idx];
+    while (entry) {
+        if (strcmp(entry->name, name) == 0) {
+            entry->jar_checked = true;
+            return;
+        }
+        entry = entry->next;
+    }
+}
+
+bool class_hash_was_jar_checked(const char* name) {
+    if (!name) return true;
+    uint32_t hash = fnv1a_hash(name);
+    uint32_t idx = hash & CLASS_HASH_MASK;
+    ClassHashEntry* entry = g_class_hash[idx];
+    while (entry) {
+        if (strcmp(entry->name, name) == 0) {
+            return entry->jar_checked;
+        }
+        entry = entry->next;
+    }
+    return true;
 }
 
 /* Remove class from hash table */
@@ -256,6 +291,7 @@ static JavaMethod* find_method_in_class(JavaClass* clazz, const char* name, cons
 
 /* Optimized jvm_resolve_method implementation */
 JavaMethod* jvm_resolve_method_fast(JVM* jvm, JavaClass* clazz, const char* name, const char* descriptor) {
+    (void)jvm;
     if (!clazz || !name || !descriptor) return NULL;
     
     /* Step 1: Check global method cache */
@@ -303,6 +339,7 @@ typedef struct {
 
 /* Get or create vtable for a class */
 VTable* vtable_get_or_create(JavaClass* clazz) {
+    (void)clazz;
     /* VTable is stored in clazz->header.reserved for now */
     /* This is a placeholder for future implementation */
     return NULL;
@@ -322,4 +359,12 @@ void method_cache_init(void) {
 
 void method_cache_cleanup(void) {
     class_hash_clear();
+}
+
+/* FIX (audit S-10, v18): drop every cached JavaMethod* — must be called when
+ * a class's methods[] array is reallocated (stubs.c ensure_methods_capacity
+ * growth), otherwise cached pointers keep pointing into the freed block and
+ * the VM executes freed memory. */
+void method_cache_flush(void) {
+    memset(g_method_cache, 0, sizeof(g_method_cache));
 }

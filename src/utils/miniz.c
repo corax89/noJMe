@@ -1,4 +1,11 @@
 #define _POSIX_C_SOURCE 200809L
+/* Vendor code (miniz). -Wtype-limits fires on its dead 4GB size guards:
+ * 32-bit sizes are promoted to 64 bits, so e.g.
+ * "(mz_uint64)(a | b) > 0xFFFFFFFFU" can never be true. Upstream logic is
+ * left untouched; the warning is suppressed for this vendor TU only. */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wtype-limits"
+#endif
 #include "miniz.h"
 /**************************************************************************
  *

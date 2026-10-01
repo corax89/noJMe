@@ -119,6 +119,23 @@ typedef enum retro_pixel_format {
 #define RETRO_DEVICE_ANALOG       5
 #define RETRO_DEVICE_POINTER      6
 
+/* v34.34: mouse/pointer input IDs (missing in this bundled legacy header;
+ * guarded so a newer system libretro.h takes precedence) */
+#ifndef RETRO_DEVICE_ID_MOUSE_X
+#define RETRO_DEVICE_ID_MOUSE_X                0
+#define RETRO_DEVICE_ID_MOUSE_Y                1
+#define RETRO_DEVICE_ID_MOUSE_LEFT             2
+#define RETRO_DEVICE_ID_MOUSE_RIGHT            3
+#define RETRO_DEVICE_ID_MOUSE_WHEELUP          4
+#define RETRO_DEVICE_ID_MOUSE_WHEELDOWN        5
+#define RETRO_DEVICE_ID_MOUSE_MIDDLE           6
+#endif
+#ifndef RETRO_DEVICE_ID_POINTER_X
+#define RETRO_DEVICE_ID_POINTER_X              0
+#define RETRO_DEVICE_ID_POINTER_Y              1
+#define RETRO_DEVICE_ID_POINTER_PRESSED        2
+#endif
+
 /* Joypad buttons */
 #define RETRO_DEVICE_ID_JOYPAD_B      0
 #define RETRO_DEVICE_ID_JOYPAD_Y      1
@@ -136,6 +153,12 @@ typedef enum retro_pixel_format {
 #define RETRO_DEVICE_ID_JOYPAD_R2     13
 #define RETRO_DEVICE_ID_JOYPAD_L3     14
 #define RETRO_DEVICE_ID_JOYPAD_R3     15
+
+/* v34.34: analog stick IDs (missing in this legacy header) */
+#ifndef RETRO_DEVICE_ID_ANALOG_X
+#define RETRO_DEVICE_ID_ANALOG_X    0
+#define RETRO_DEVICE_ID_ANALOG_Y    1
+#endif
 
 /* Keyboard keys (subset) */
 #define RETROK_UNKNOWN      0
@@ -242,7 +265,52 @@ typedef struct retro_variable {
     const char* value;
 } retro_variable;
 
-/* Modern core options API (V1/V2) */
+/* v34.81: RETRO_ENVIRONMENT_GET_LANGUAGE (39) return values.
+ * Official libretro.h ordering (stable since libretro API 5); guard for
+ * hosts that bundle their own complete header. */
+#ifndef RETRO_LANGUAGE_ENGLISH
+enum retro_language {
+    RETRO_LANGUAGE_ENGLISH = 0,
+    RETRO_LANGUAGE_JAPANESE,
+    RETRO_LANGUAGE_FRENCH,
+    RETRO_LANGUAGE_SPANISH,
+    RETRO_LANGUAGE_GERMAN,
+    RETRO_LANGUAGE_ITALIAN,
+    RETRO_LANGUAGE_DUTCH,
+    RETRO_LANGUAGE_PORTUGUESE_BRAZIL,
+    RETRO_LANGUAGE_PORTUGUESE_PORTUGAL,
+    RETRO_LANGUAGE_RUSSIAN,
+    RETRO_LANGUAGE_KOREAN,
+    RETRO_LANGUAGE_CHINESE_SIMPLIFIED,
+    RETRO_LANGUAGE_CHINESE_TRADITIONAL,
+    RETRO_LANGUAGE_ESPERANTO,
+    RETRO_LANGUAGE_POLISH,
+    RETRO_LANGUAGE_VIETNAMESE,
+    RETRO_LANGUAGE_ARABIC,
+    RETRO_LANGUAGE_GREEK,
+    RETRO_LANGUAGE_TURKISH,
+    RETRO_LANGUAGE_SLOVAK,
+    RETRO_LANGUAGE_PERSIAN,
+    RETRO_LANGUAGE_HEBREW,
+    RETRO_LANGUAGE_ASTURIAN,
+    RETRO_LANGUAGE_FINNISH,
+    RETRO_LANGUAGE_DUMMY = INT_MAX /* guard against partial enums */
+};
+#endif /* RETRO_LANGUAGE_ENGLISH */
+
+/* Modern core options API (V1/V2)
+ *
+ * v34.82 FIX: 'values' must be an INLINE array of
+ * RETRO_NUM_CORE_OPTION_VALUES_MAX entries — the official v1 layout as
+ * parsed by every v1-era frontend (env 53 SET_CORE_OPTIONS / env 54
+ * SET_CORE_OPTIONS_INTL). v34.81 shipped a pointer here, which shifted
+ * every following field and made frontends read the pointer bytes as a
+ * values[] array (m17: garbage labels + SIGSEGV in OptionList_init).
+ * sizeof(def) is locked by _Static_assert in core_options.c. */
+#ifndef RETRO_NUM_CORE_OPTION_VALUES_MAX
+#define RETRO_NUM_CORE_OPTION_VALUES_MAX 128
+#endif
+
 struct retro_core_option_value {
     const char* value;
     const char* label;
@@ -252,7 +320,7 @@ struct retro_core_option_definition {
     const char* key;
     const char* desc;
     const char* info;
-    const struct retro_core_option_value* values;
+    struct retro_core_option_value values[RETRO_NUM_CORE_OPTION_VALUES_MAX];
     const char* default_value;
 };
 
