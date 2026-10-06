@@ -143,6 +143,17 @@ int g_pg_rotation = 0;
  * стика/D-pad (sdl_dpad_path_digits ниже), поэтому применяется без
  * перезапуска. (Ранее: v36.36 g_pg_dpad — единая раскладка обоих путей.) */
 int g_pg_input_swap = -1;
+/* v36.87 [STICK-DIAG] g_pg_stick_diag и [PG-CONTROLS] g_pg_btn[]
+ * определяются НИЖЕ — после #include "switch/switch_common.h"
+ * (их инициализаторы используют NOJME_DIAG_DEFAULT/NOJME_BTNK_*). */
+/* v36.81 [PERGAME-RENDER] → УДАЛЕНО в v36.82 [SW-ONLY]: per-game выбор
+ * рендерера (g_pg_render/render= в pergame ini) ликвидирован вместе с
+ * самой возможностью аппаратного рендера. Причина: рантайм-переключение
+ * GLES2 -> software (и обратно) приводило к ВЫЛЕТУ приложения (полевой
+ * отчёт на v36.81-swrender1), а сам GLES2-путь хронически клинится
+ * (см. большой комментарий у sdl_switch_renderer_create ниже). Теперь
+ * рендерер ВСЕГДА программный, переключать нечего, настройки «Рендер»
+ * в UI больше нет. Ключ render= в старых pergame ini молча игнорируется. */
 
 /* v36.15: состояние поворота сессии. g_rot_mode печатаются в геометрию
  * текстур при game_begin (следующий запуск игры), g_rot_buf — staging
@@ -314,6 +325,18 @@ static void sdl_process_key_repeat(SdlContext* ctx) {
 #include "wildguard.h" /* [WILDGUARD] v36.50: мусорные указатели (Ryujinx InvalidAccess) */
 #include "utils/battery.h" /* [BATFIX] v36.41: заряд для оверлея/трассы */
 
+/* v36.87 [STICK-DIAG]: per-game режим диагоналей цифрового пути ввода
+ * (NOJME_DIAG_*; дефолт BOTH — «пара + 1-3-7-9»). Ставится main.c при
+ * старте сессии, обновляется ЖИВО из экрана «Управление» (слабый символ
+ * ctl_apply_live в switch_ui.c); читается при КАЖДОМ событии цифрового
+ * пути (sdl_switch_dir_dispatch / dpad-зоны ниже). */
+int g_pg_stick_diag = NOJME_DIAG_DEFAULT;
+/* v36.87 [PG-CONTROLS]: per-game назначение кнопок A/B/X/Y/L/R/ZL/ZR/
+ * L3/R3 (NOJME_BTNK_*; DEFAULT(0) = встроенная раскладка). Ставится
+ * main.c при старте сессии, обновляется ЖИВО из экрана «Управление»;
+ * читается при каждом нажатии (switch_joy_button_to_keycode). */
+int g_pg_btn[NOJME_CTL_BTN_COUNT] = { 0 };
+
 extern void midlet_call_destroy_app(JVM* jvm, bool unconditional);
 
 /* defined below (extracted v34.84): shared keyboard-event handler the
@@ -329,6 +352,14 @@ static SDL_Texture* g_bg_tex = NULL;      /* small blurred background */
 static uint32_t* g_bg_buf = NULL;
 static int g_bg_w = 0, g_bg_h = 0;
 static SDL_Rect g_game_rect = {0, 0, 0, 0};  /* last presented game rect */
+
+/* v36.82 [SW-ONLY]: единая точка создания рендерера — программный,
+ * единственный режим (см. большой комментарий у определения) — и
+ * пересоздания ui-текстуры. Определения — блоком выше
+ * sdl_switch_ui_present(); сюда вынесены прототипы, т.к. первый сайт
+ * создания ниже по коду. */
+static SDL_Renderer* sdl_switch_renderer_create(const char* why);
+static int sdl_switch_ui_tex_recreate(const char* why);
 
 /* ================= v36.18: счётчик кадров = полоса FPS =================
  * Показывает ТОЛЬКО FPS (номер кадра и возраст убраны по запросу),
@@ -439,7 +470,38 @@ static void sdl_switch_fps_strip_draw(void) {
 extern volatile uint32_t g_sd_utf, g_sd_rcf, g_sd_ch, g_sd_chf;
 extern volatile uint32_t g_sd_chg, g_sd_chb; /* v36.44 [SPLIT-PROBE] */
 
+/* ================= v36.81 [TEX-DIAG]: счётчики жизни текстур =================
+ * Полевой лог v36.80 (пользователь просил адреса/размеры текстур) доказал
+ * ценность строки [TEX]: при живых адресах и нулевых отказах видно, что
+ * объекты есть, а пиксели не доезжают. Здесь — счётчики (регистрация в
+ * sdl_present_fail_note по имени сайта + прямые вызовы в ui_present/
+ * pause/batt): up = SDL_UpdateTexture, f = отказы, rc = пересоздания.
+ * Чтение и сброс в одном вызове sdl_switch_tex_diag_line() (ниже, после
+ * объявлений текстур) — гонок между diag-периодами нет. */
+enum { TI_UI = 0, TI_GAME, TI_S2X, TI_BG, TI_BATT, TI_COUNT };
+static uint32_t s_tex_up[TI_COUNT], s_tex_f[TI_COUNT], s_tex_rc[TI_COUNT];
+static const char* const s_tex_names[TI_COUNT] =
+    { "ui", "game", "s2x", "bg", "batt" };
+static void tex_note_up(int id, int rc) {
+    if (id < 0 || id >= TI_COUNT) return;
+    s_tex_up[id]++;
+    if (rc) s_tex_f[id]++;
+}
+static void tex_note_rc(int id) {
+    if (id >= 0 && id < TI_COUNT) s_tex_rc[id]++;
+}
+
 static void sdl_present_fail_note(const char* site, int rc, int is_update) {
+    /* v36.81 [TEX-DIAG]: аплоады считаются ВСЕГДА (не только при отказе)
+     * — строка [TEX] несёт up=/f= по каждой текстуре; имя сайта указывает
+     * бакет (game/s2x/bg/batt; RenderCopy-сайты не считаются). */
+    if (is_update) {
+        int ti = strstr(site, "game") ? TI_GAME
+               : strstr(site, "s2x")  ? TI_S2X
+               : strstr(site, "bg")   ? TI_BG
+               : strstr(site, "batt") ? TI_BATT : -1;
+        tex_note_up(ti, rc);
+    }
     if (rc == 0) return;
     if (is_update) __sync_fetch_and_add(&g_sd_utf, 1);
     else           __sync_fetch_and_add(&g_sd_rcf, 1);
@@ -452,6 +514,133 @@ static void sdl_present_fail_note(const char* site, int rc, int is_update) {
     }
 }
 
+/* ================= v36.76 [WEDGE-GUARD] =================
+ * Полевой фриз v36.74/v36.75 (Treasure Towers, дважды снятый приборами):
+ *   chg=0 chb=1 при fl=100 lvc=100 swh=100 utf=0 rcf=0 — сеттлы идут,
+ * КОНТЕНТ снимков меняется 20 Гц, аплоады «успешны», НО пиксели игрового
+ * ректа на рендер-таргете БАЙТ-В-БАЙТ стоят по 5+ секунд; фриз ПЕРЕЖИВАЕТ
+ * паузу-резюм (v36.74: 138 с pause→close→chg=0). При этом текстура
+ * g_ui_tex в это же время ЖИВА (меню паузы рисовалось и слушалось).
+ * Вывод: клин ПОТЕКСТУРНЫЙ (g_texture/g_s2x_tex принимают аплоад
+ * «успешно», но пиксели не прилипают — класс отказа GLES2-драйвера),
+ * хост-репро (TTRepro, test_tt_freeze.sh) конвейер не заморозил —
+ * отказ железо/драйверо-специфичен.
+ * Лекарство — САМОВОССТАНОВЛЕНИЕ тремя стадиями (каждая — после 2
+ * замерзших проб = ~10 с, чтобы честные «мигания» не лечились зря):
+ *   стадия 1: пересоздать игровые текстуры (stage_presentation) — свежие
+ *             GL-объекты получают свежий путь аплоада;
+ *   стадия 2: то же + байпас Scale2x (вывод 1x-текстурой) — другая
+ *             текстура, другой размер, другой ветвь кода;
+ *   стадия 3: полный ресет рендерера (+ все текстуры, включая ui) —
+ *             ядерная чистка любого состояния драйвера.
+ * Судебные приборы: строка [WEDGE] на каждой замерзшей пробе несёт дельты
+ * ДВУХ промежуточных слоёв (swh — контент сеттлов; src/s2x — контент
+ * CPU-буферов перед аплоадом) — следующий полевой лог назовёт умерший
+ * хоп поимённо, даже если лекарство не сработает.
+ * Ручка: NOJME_WEDGE_GUARD=0 — выключить и детекцию, и лечение.
+ * v36.81 [SLOW-WEDGE]: полевой лог v36.80 показал ВТОРУЮ форму того же
+ * клина: экран течёт 1-2 кадра/с при 20 presents/с новых кадров («низкая
+ * частота около одного-двух в секунду», chg=1-2 за 5-с период) — старая
+ * проба раз в 5 с НЕ ОТЛИЧАЛА это от здоровья (порог «замерло 5 с» не
+ * срабатывал, [WEDGE] молчал всё время деградации). Теперь проба раз в
+ * 1 с + скользящее окно 6 проб: источник жив (>= 4 изменений), экран
+ * почти мёртв (<= 1) — «медленный» клин, та же эскалация, строка
+ * [WEDGE slow]. Лестница стадий теперь МОНОТОННА в пределах сессии
+ * (полевой клин TT хронический: stage 1 лечил на ~8 с, сбрасывался при
+ * «выздоровлении» и начинал заново — вечно стадия 1; теперь вверх без
+ * сброса, полный сброс только на границе сессии) и получила настоящую
+ * молотилку — см. sdl_wedge_recover (стадия 2 = software-рендерер). */
+static int s_wedge_streak = 0;        /* подряд замерзшие/медленные пробы (upstream жив) */
+static uint32_t s_wedge_prev_src = 0; /* хэш CPU-источника на прошлой пробе */
+static int s_wedge_stage_done = 0;    /* сколько стадий проведено (монотонно в сессии) */
+static int s_wedge_bypass_s2x = 0;    /* стадия 3+: выводить мимо Scale2x */
+static volatile int g_wedge_recover_pending = 0; /* 1..4 — отложенное лечение */
+static int s_wedge_guard_on = -1;
+/* v36.81 [SLOW-WEDGE]: окно из 6 последних проб (пробы раз в 1 с);
+ * src_n/rect_n — сколько в окне было изменений источника/игрового ректа.
+ * Медленный клин: src_n >= 4 && rect_n <= 1. */
+#define WEDGE_SLOW_WINDOW 6
+static unsigned char s_wslow_src[WEDGE_SLOW_WINDOW];
+static unsigned char s_wslow_rect[WEDGE_SLOW_WINDOW];
+static int s_wslow_filled = 0;
+static int s_wedge_ever_fired = 0;   /* в этой сессии клин ловился (для [EXIT-FRESH]) */
+static int s_wedge_active = 0;      /* эпизод клина открыт (для «picture resumed») */
+static uint64_t s_wedge_last_log_ms = 0; /* троттлинг строк [WEDGE] (2 с) */
+
+static int sdl_wedge_guard_enabled(void) {
+    if (s_wedge_guard_on < 0) {
+        const char* e = getenv("NOJME_WEDGE_GUARD");
+        s_wedge_guard_on = (e && e[0] == '0') ? 0 : 1;
+    }
+    return s_wedge_guard_on;
+}
+
+/* [WEDGE-SIM] v36.76 (только песочница; прод никогда не ставит env):
+ * детерминированная имитация полевого потекстурного клина для проверки
+ * детекции/эскалации/выздоровления WEDGE-GUARD на хосте.
+ *   NOJME_WEDGE_SIM=1 — клин «по указателям»: после 100-го present аплоады
+ *     в ТЕКУЩИЕ g_texture/g_s2x_tex тихо пропускаются (utf не растёт —
+ *     ровно как в поле). Стадия 1 (пересоздание текстур) даёт новые
+ *     указатели → выздоровление.
+ *   NOJME_WEDGE_SIM=2 — клин «по месту»: аплоад 2x-текстуры пропускается
+ *     ВСЕГДА (как будто путь Scale2x отравлен). Стадия 1 бессильна,
+ *     выздоровление только на стадии 2 (байпас — вывод 1x-текстурой).
+ * Симметрично полю: пропущенный аплоад НЕ считается отказом (utf=0),
+ * композит показывает последний удачный кадр. */
+static int s_wsim_mode = -1;
+static uint64_t s_wsim_frames = 0;
+static int s_wsim_healed = 0;          /* режим 1: клин снят лечением */
+static const SDL_Texture* s_wsim_game_tex = NULL;
+
+static int sdl_wsim_skip(const char* site, SDL_Texture* tex) {
+    (void)tex; /* режим 1 не привязан к указателю (реюз адресов аллокатором) */
+    if (s_wsim_mode < 0) {
+        const char* e = getenv("NOJME_WEDGE_SIM");
+        s_wsim_mode = (e && e[0] >= '1' && e[0] <= '2') ? (e[0] - '0') : 0;
+    }
+    if (s_wsim_mode == 0) return 0;
+    if (strcmp(site, "game") == 0) s_wsim_frames++; /* раз на кадр */
+    if (s_wsim_frames < 100) return 0; /* первые ~100 present — здоровая работа */
+    if (s_wsim_mode == 1) {
+        /* Клин «до первого лечения»: блокирует 1x-аплоад, пока сторож
+         * не провёл восстановления. Наивная привязка к указателю текстуры
+         * бьётся о реюз адреса аллокатором (Destroy+Create того же размера
+         * возвращает тот же адрес — найдено первым прогоном теста). */
+        if (!s_wsim_game_tex) {
+            s_wsim_game_tex = g_texture;
+            sw_trace_force("[WEDGE-SIM] mode 1: blocking game-site uploads "
+                           "until first recovery");
+        }
+        if (!s_wsim_healed && s_wedge_stage_done > 0) {
+            s_wsim_healed = 1;
+            sw_trace_force("[WEDGE-SIM] mode 1: wedge lifted (recovery "
+                           "seen)");
+        }
+        return !s_wsim_healed;
+    }
+    /* mode 2: отравлен только 2x-путь — лечит только байпас стадии 2 */
+    if (!s_wsim_game_tex) {
+        s_wsim_game_tex = g_texture; /* активация */
+        sw_trace_force("[WEDGE-SIM] mode 2: blocking s2x-site uploads forever");
+    }
+    return (strcmp(site, "s2x") == 0);
+}
+
+/* 64-точечный FNV-хэш буфера кадра (тот же сэмплер, что у swh в
+ * display.c: детерминированная сетка 8x8 — дёшево и стабильного
+ * разрешения достаточно, чтобы отличить «контент идёт» от «стоит»). */
+static uint32_t sdl_wedge_sample_hash(const uint32_t* px, int w, int h) {
+    if (!px || w <= 0 || h <= 0) return 0;
+    uint32_t hash = 2166136261u;
+    for (int i = 0; i < 64; i++) {
+        int r = (i >> 3) * h / 8;
+        int c = (i & 7) * w / 8;
+        hash ^= px[(size_t)r * w + c];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
 /* [COMPOSITE-PROBE]: чтение готового композита (ДО RenderPresent — после
  * него задний буфер не определён). Строка y=360 покрывает левый блюр,
  * вид игры и правый блюр при любом масштабе. Чтение раз в 5 с — на
@@ -462,11 +651,20 @@ static void sdl_present_fail_note(const char* site, int rc, int is_update) {
  *   chg>0 — вид игры менялся;  chb>0 — фон/поля менялись;
  *   chg=0 chb>0 при fl>0 — контент игровой текстуры застрял (слой
  *   между present_src и текстурой: аплоад/Scale2x/snapshot);
- *   chg=0 chb=0 — композит целиком статичен (игра сама не рисует). */
-static void sdl_composite_probe(uint64_t now_ms) {
+ *   chg=0 chb=0 — композит целиком статичен (игра сама не рисует).
+ * v36.76 [WEDGE-GUARD]: проба же и детектор клина — см. блок выше.
+ * src_px/rw/rh — CPU-источник текущего кадра (present_src после
+ * ротации): его хэш отличает «источник стоит» (баг сеттлов/ротации)
+ * от «источник идёт, но не доходит» (клин аплоада). */
+static void sdl_composite_probe(uint64_t now_ms,
+                                const uint32_t* src_px, int rw, int rh) {
     static uint64_t s_probe_last_ms = 0;
     if (!g_renderer) return;
-    if (s_probe_last_ms && now_ms - s_probe_last_ms < 5000) return;
+    /* v36.81 [SLOW-WEDGE]: проба раз в 1 с (было 5) — иначе «экран течёт
+     * 1-2 кадра/с» неотличима от здоровья (одно сравнение за 5 с видит
+     * изменение и молчит). Стоимость: 5 построчных ReadPixels в секунду
+     * (на GL это один синк, на software — memcpy). */
+    if (s_probe_last_ms && now_ms - s_probe_last_ms < 1000) return;
     s_probe_last_ms = now_ms;
     /* 5 строк, равномерно по вертикали: верх/низ вида игры и блюр-поля —
      * одна центральная строка пропускала контент, меняющийся только в
@@ -506,6 +704,96 @@ static void sdl_composite_probe(uint64_t now_ms) {
         __sync_fetch_and_add(&g_sd_chg, 1);
     if (s_have && hb != s_prev_hash_b)
         __sync_fetch_and_add(&g_sd_chb, 1);
+    /* v36.76 [WEDGE-GUARD]: детекция потекстурного клина. Сигнатура
+     * (дважды снята в поле на TT): рект игры на композите НЕ менялся
+     * с прошлой пробы, при этом CPU-источник кадра МЕНЯЛСЯ — экран
+     * обязан показывать другой контент, но показывает старый. ВАЖНО:
+     * живость берём из хэша present_src (стейбл-копия — тот кадр, что
+     * должен попасть на экран), а НЕ из счётчика g_sd_swh — его
+     * обнуляет diag каждые 5 с, и гонка чтений превращала детект в
+     * лотерею (первый прогон теста: «оживания» при побайтово
+     * неизменном композите). */
+    if (sdl_wedge_guard_enabled()) {
+        uint32_t src_now = sdl_wedge_sample_hash(src_px, rw, rh);
+        int frozen = (s_have && hg == s_prev_hash_g);
+        int src_alive = (src_now != s_wedge_prev_src);
+        /* v36.81 [SLOW-WEDGE]: окно последних 6 проб (сдвиг влево,
+         * свежая проба — в конец). rect_changed: рект изменился С
+         * прошлой пробы (не frozen). */
+        {
+            int i;
+            for (i = 0; i < WEDGE_SLOW_WINDOW - 1; i++) {
+                s_wslow_src[i] = s_wslow_src[i + 1];
+                s_wslow_rect[i] = s_wslow_rect[i + 1];
+            }
+            s_wslow_src[WEDGE_SLOW_WINDOW - 1] = src_alive ? 1 : 0;
+            s_wslow_rect[WEDGE_SLOW_WINDOW - 1] = (!frozen && s_have) ? 1 : 0;
+            if (s_wslow_filled < WEDGE_SLOW_WINDOW) s_wslow_filled++;
+        }
+        int src_n = 0, rect_n = 0;
+        for (int i = 0; i < s_wslow_filled; i++) {
+            src_n += s_wslow_src[i];
+            rect_n += s_wslow_rect[i];
+        }
+        /* Медленный клин: окно заполнено, источник живёт, экран почти
+         * стоит — полевая форма v36.80 «1-2 fps при 20 presents/с». */
+        int slow = (s_wslow_filled >= WEDGE_SLOW_WINDOW &&
+                    src_n >= 4 && rect_n <= 1);
+        if ((frozen || slow) && src_alive) {
+            s_wedge_streak++;
+            s_wedge_active = 1; /* эпизод клина открыт (для resumed-строки) */
+            {
+                /* троттлинг: пробы раз в 1 с — строка не чаще раза в 2 с */
+                uint64_t nowl = sdl_switch_ui_ticks_ms();
+                if (nowl - s_wedge_last_log_ms >= 2000 || !s_wedge_last_log_ms) {
+                    s_wedge_last_log_ms = nowl;
+                    if (slow && !frozen)
+                        sw_trace("[WEDGE] #%d SLOW game rect (rect %d/%d "
+                                 "changes, src %d/%d alive): src=%08x — "
+                                 "1-2 fps wedge form",
+                                 s_wedge_streak, rect_n, s_wslow_filled,
+                                 src_n, s_wslow_filled, src_now);
+                    else
+                        sw_trace("[WEDGE] #%d frozen game rect, source alive: "
+                                 "src=%08x — texture-upload wedge",
+                                 s_wedge_streak, src_now);
+                }
+            }
+            /* Эскалация: 6 подряд плохих проб (~6 с) — следующая стадия.
+             * v36.81: лестница МОНОТОННА (s_wedge_stage_done не
+             * сбрасывается при кратком оживании — хронический полевой
+             * клин застревал на стадии 1 вечно). Лечение ОТЛОЖЕНО
+             * (g_wedge_recover_pending): проба работает внутри готового
+             * кадра — ломать его текстуры посреди RenderCopy нельзя;
+             * следующий present начнётся с выполнения заявки. */
+            if (s_wedge_streak >= WEDGE_SLOW_WINDOW) {
+                int stage = s_wedge_stage_done + 1;
+                if (stage > 4) stage = 4; /* далее — повторять стадию 4 */
+                if (stage != s_wedge_stage_done || s_wedge_stage_done >= 4) {
+                    g_wedge_recover_pending = stage;
+                    s_wedge_stage_done = stage;
+                    s_wedge_ever_fired = 1;
+                    sw_trace_force("[WEDGE] scheduling recovery stage %d",
+                                   stage);
+                }
+                s_wedge_streak = 0; /* окно копится заново для след. стадии */
+            }
+        } else {
+            /* v36.81: resumed печатается по ФЛАГУ эпизода (после эскалации
+             * стрик обнулён — счётчик не годится как маркер) */
+            if (s_wedge_active)
+                sw_trace("[WEDGE] picture resumed after %d bad probe(s)",
+                         s_wedge_streak);
+            /* Эпизод закрыт (картинка жива или источник статичен —
+             * честная пауза/загрузка). v36.81: s_wedge_stage_done
+             * СОХРАНЯЕТСЯ — лестница монотонна до конца сессии;
+             * сбрасывается только на game_begin/game_end. */
+            s_wedge_streak = 0;
+            s_wedge_active = 0;
+            g_wedge_recover_pending = 0;
+        }
+        s_wedge_prev_src = src_now;
+    }
     s_prev_hash = h; s_prev_hash_g = hg; s_prev_hash_b = hb;
     s_have = 1;
 }
@@ -597,6 +885,43 @@ static int          s_batt_pct = -2;   /* ...и процент/зарядка */
 static int          s_batt_chg = -2;
 static int          s_batt_logged = 0; /* одноразовая трасса включения */
 
+/* v36.81 [TEX-DIAG]: формат одной записи (счётчики объявлены выше, у
+ * sdl_present_fail_note): « name=WxH ptr=0x... up=N f=N rc=N» (или dead,
+ * если текстуры нет). Возвращает приращение buf. */
+static int tex_diag_one(char* buf, size_t cap, int id,
+                        const SDL_Texture* tex, int w, int h) {
+    if (!tex)
+        return snprintf(buf, cap, " %s=dead", s_tex_names[id]);
+    return snprintf(buf, cap, " %s=%dx%d ptr=0x%llx up=%u f=%u rc=%u",
+                    s_tex_names[id], w, h,
+                    (unsigned long long)(uintptr_t)tex,
+                    s_tex_up[id], s_tex_f[id], s_tex_rc[id]);
+}
+/* Полная строка [TEX ...] + сброс счётчиков. Вызывает diag_emit (слабым
+ * символом — белые хост-тесты без графики видят NULL и молчат). */
+int sdl_switch_tex_diag_line(char* buf, size_t cap) {
+    int n = 0;
+    n += snprintf(buf + n, cap - (size_t)n, "[TEX]");
+    n += tex_diag_one(buf + n, cap - (size_t)n, TI_UI, g_ui_tex,
+                      SWITCH_UI_WIDTH, SWITCH_UI_HEIGHT);
+    {
+        const int dw = g_rot_mode ? s_sess_fb_h : s_sess_fb_w;
+        const int dh = g_rot_mode ? s_sess_fb_w : s_sess_fb_h;
+        n += tex_diag_one(buf + n, cap - (size_t)n, TI_GAME, g_texture,
+                          dw > 0 ? dw : 0, dh > 0 ? dh : 0);
+        n += tex_diag_one(buf + n, cap - (size_t)n, TI_S2X, g_s2x_tex,
+                          dw > 0 ? dw * 2 : 0, dh > 0 ? dh * 2 : 0);
+        n += tex_diag_one(buf + n, cap - (size_t)n, TI_BG, g_bg_tex,
+                          g_bg_w, g_bg_h);
+    }
+    n += tex_diag_one(buf + n, cap - (size_t)n, TI_BATT, s_batt_tex,
+                      s_batt_bw, s_batt_bh);
+    memset(s_tex_up, 0, sizeof(s_tex_up));
+    memset(s_tex_f, 0, sizeof(s_tex_f));
+    memset(s_tex_rc, 0, sizeof(s_tex_rc));
+    return n;
+}
+
 /* Ленивое создание текстуры-оверлея (g_renderer уже есть). */
 static void sdl_switch_batt_ensure(void) {
     if (s_batt_tex || !g_renderer) return;
@@ -639,8 +964,9 @@ static void sdl_switch_batt_redraw(int mode) {
     memset(s_batt_buf, 0, (size_t)s_batt_bw * s_batt_bh * sizeof(uint32_t));
     switch_ui_batt_badge_draw(s_batt_buf, s_batt_bw, s_batt_bh, mode);
 
-    SDL_UpdateTexture(s_batt_tex, NULL, s_batt_buf,
-                      s_batt_bw * sizeof(uint32_t));
+    tex_note_up(TI_BATT, /* v36.81 [TEX-DIAG] */
+        SDL_UpdateTexture(s_batt_tex, NULL, s_batt_buf,
+                          s_batt_bw * sizeof(uint32_t)));
 }
 
 /* v34.89: RAW-JOYSTICK input replaces the GameController API.
@@ -879,10 +1205,7 @@ int sdl_switch_platform_init(void) {
         LOG_SAFE("[SWITCH] window failed: %s\n", SDL_GetError());
         return -1;
     }
-    g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED);
-    if (!g_renderer) {
-        g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
-    }
+    g_renderer = sdl_switch_renderer_create("switch ui init"); /* v36.77 [NOJME_RENDER] → v36.82 [SW-ONLY]: программный — единственный режим */
     if (!g_renderer) {
         LOG_SAFE("[SWITCH] renderer failed: %s\n", SDL_GetError());
         SDL_DestroyWindow(g_window);
@@ -891,16 +1214,11 @@ int sdl_switch_platform_init(void) {
         return -1;
     }
     /* v36.43 [PRESENT-GLASS]: ИМЯ рендерера — в поле. GPU-ускоренный и
-     * software пути имеют РАЗНЫЕ классы отказов композита; до сих пор
-     * лог устройства не сообщал, какой из них реально работает. */
-    {
-        SDL_RendererInfo ri;
-        memset(&ri, 0, sizeof(ri));
-        if (SDL_GetRendererInfo(g_renderer, &ri) == 0 && ri.name[0])
-            sw_trace("[RND] renderer=%s", ri.name);
-        else
-            sw_trace("[RND] renderer=(unknown: %s)", SDL_GetError());
-    }
+     * software пути имеют РАЗНЫЕ классы отказов композита; с v36.82
+     * [SW-ONLY] работает только software-путь, но строка [RND] renderer=
+     * остаётся честным прибором: она подтвердит фактический рендерер в
+     * полевом логе (печатает сам sdl_switch_renderer_create при каждом
+     * создании, включая причины: wedge/exit-reset). */
     g_ui_tex = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ARGB8888,
                                  SDL_TEXTUREACCESS_STREAMING,
                                  SWITCH_UI_WIDTH, SWITCH_UI_HEIGHT);
@@ -1045,6 +1363,7 @@ static void switch_input_pump(void) {
     {
         static uint64_t s_prev_pump_ms = 0;
         static uint64_t s_last_gap_rep_ms = 0;
+        static uint64_t s_last_awake_rep_ms = 0;
         uint64_t nowp = (uint64_t)SDL_GetTicks();
         if (s_prev_pump_ms && nowp > s_prev_pump_ms &&
             nowp - s_prev_pump_ms > 250 &&
@@ -1054,6 +1373,31 @@ static void switch_input_pump(void) {
             sw_trace("[PUMP-GAP] %llu ms between input pumps — main-loop "
                      "stall (short press+release pairs may be LOST)",
                      (unsigned long long)(nowp - s_prev_pump_ms));
+        }
+        /* v36.88 [AWAKE-FRESH]: разрыв насоса > 1.2 с — масштаб сна
+         * консоли (Horizon замораживает весь процесс по кнопке HOME),
+         * а не шевеления загрузки. После такого фриза last_native_ms
+         * всех потоков состарен на его длительность — спин-брейкер
+         * (v36.57) может ложно выстрелить по живому кадру (полевой
+         * случай v36.87: Zombie Infection после возврата из меню
+         * консоли — «зависла, осталась работать только музыка»).
+         * Первая линия защиты — гейт [SPIN-BREAK-ICOUNT] в точке
+         * выстрела (execute.c); эта — вторая: освежаем возрасты всем
+         * живым потокам. Рейт-лимит — только на СТРОКУ лога; само
+         * освежение — на каждом таком разрыве (идемпотентно). Спин на
+         * main-файбере сам глушит насос — разрыв виден только ПОСЛЕ
+         * его конца, отложить выстрел освежение не может. */
+        if (s_prev_pump_ms && nowp > s_prev_pump_ms &&
+            nowp - s_prev_pump_ms > 1200) {
+            extern void jvm_spin_break_awake_fresh(void); /* threads.c */
+            jvm_spin_break_awake_fresh();
+            if (s_last_awake_rep_ms == 0 ||
+                nowp - s_last_awake_rep_ms >= 10000) {
+                s_last_awake_rep_ms = nowp;
+                sw_trace("[AWAKE-FRESH] %llu ms input-pump gap — OS "
+                         "suspend/freeze scale, spin-breaker ages refreshed",
+                         (unsigned long long)(nowp - s_prev_pump_ms));
+            }
         }
         s_prev_pump_ms = nowp;
     }
@@ -1515,9 +1859,141 @@ static void sdl_render_thread_check(const char* site) {
 }
 #endif
 
+/* ================= v36.82 [SW-ONLY]: ПРОГРАММНЫЙ РЕНДЕРЕР — ЕДИНСТВЕННЫЙ =================
+ * ⚠️ АППАРАТНЫЙ РЕНДЕР (GLES2) НА NINTENDO SWITCH ОТКЛЮЧЁН НАВСЕГДА. НЕ
+ * ВКЛЮЧАЙТЕ ЕГО ОБРАТНО, пока не найден и не устранён корень хотя бы одной
+ * из двух проблем ниже (полевые отчёты v36.74-v36.81, планшет Treasure
+ * Towers и другие):
+ *
+ * ПРОБЛЕМА 1 — ПРОГРЕССИВНЫЙ КЛИН ДРАЙВЕРА GLES2. Драйвер принимает
+ *   аплоады текстур и команды композита «успешно» (rc=0, [TEX] показывает
+ *   живые адреса и ноль отказов), но пиксели на экран перестают доезжать.
+ *   Форма нарастает от секунд к минутам игры: картинка течёт 1-2 кадра/с
+ *   при живом звуке/вводе, меню паузы рисуется, но НЕВИДИМО (кнопки при
+ *   этом срабатывают — destroyApp исполняется), список игр замерзает,
+ *   настройки открываются ЧЁРНЫМИ. Клин сидит НИЖЕ SDL: пересоздания
+ *   текстур и рендерера ВНУТРИ GL ([WEDGE-GUARD] стадии 1/3 v36.76-77,
+ *   полный EXIT-RESET v36.80) хроническую форму НЕ лечили — до 1-2 fps
+ *   лечилось на ~8 с и возвращалось.
+ *
+ * ПРОБЛЕМА 2 — ВЫЛЕТ ПРИ РАНТАЙМ-ПЕРЕКЛЮЧЕНИИ. DestroyRenderer живого
+ *   (пусть и клинившего) GL-контекста с последующим CreateRenderer
+ *   (SOFTWARE) на том же окне — v36.81 [PERGAME-RENDER]/[STAGE-SW]:
+ *   переключение «аппаратный -> программный» и обратно приводило к
+ *   аварийному завершению приложения (полевой отчёт пользователя на
+ *   v36.81-swrender1).
+ *
+ * РЕШЕНИЕ (v36.82, по полевому подтверждению пользователя: «программный
+ * рендер работает достаточно быстро»): программный рендерер — ЕДИНСТВЕН-
+ * НЫЙ режим работы. Пути GLES2 не существует -> клин невозможен по
+ * построению; переключения не существует -> вылет невозможен; выбор
+ * рендера УДАЛЁН из настроек (per-game строка «Рендер» и env
+ * NOJME_RENDER больше не действуют; ключ render= старых ini и env
+ * молча игнорируются). На Switch SDL2-software выводит через VI-слой
+ * и работает стабильно.
+ *
+ * Фолбэк на SDL_RENDERER_ACCELERATED ниже оставлен ИСКЛЮЧИТЕЛЬНО как
+ * параноидальная страховка платформ-экзотики, где SOFTWARE-создание
+ * откажет совсем (на Switch и в verify-песочнице это не случается) —
+ * чтобы не остаться с NULL-рендерером и мёртвым приложением.
+ * WEDGE-GUARD (детектор замершего экрана) сохранён как страховка:
+ * его лестница стадий теперь чистит/пересоздаёт software-рендерер
+ * (software->software ребилд), не меняя режима. */
+/* Наследие v36.76-77 [UI-PRESENT-GUARD] (механизм жив и нужен):
+ * поле v36.76 — stage 1 вылечила игровые текстуры, но при возврате в
+ * меню экран стал ЧЁРНЫМ: клин бьёт по ВСЕМ текстурам рендерера, а
+ * ui-канву не пересоздавали, и sdl_switch_ui_present() молча рисовал
+ * Clear поверх упавших UpdateTexture/RenderCopy. Отсюда: (1) проверка
+ * rc + пересоздание g_ui_tex при отказах (счётчик g_sd_uipf виден в
+ * diag/[TEX]); (2) WEDGE-стадии пересоздают и ui-текстуру. */
+static volatile uint32_t g_sd_uipf = 0;   /* ui present failures (счётчик diag/меню-строки) */
+
+/* v36.82 [SW-ONLY]: создание рендерера — всегда ПРОГРАММНЫЙ (создание
+ * GLES2-рендерера из кода удалено; см. комментарий блока выше). why —
+ * причина создания для трейса [RND]. Трек «мы на software» остаётся в
+ * s_rnd_is_sw — им пользуются [TEX]/diag-строки и лечение WEDGE, чтобы
+ * честно отражать фактический рендерер (фолбэк-экзотика может дать и
+ * не-software). */
+static int s_rnd_is_sw = 1;   /* текущий g_renderer — программный */
+static SDL_Renderer* sdl_switch_renderer_create(const char* why) {
+    SDL_Renderer* r = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
+    if (!r) {
+        /* software не создался (платформа-экзотика) — параноидальный
+         * фолбэк, чтобы приложение осталось живым. НЕ путь для Switch:
+         * см. [SW-ONLY] выше, почему GLES2 отключён. */
+        sw_trace_force("[RND] software renderer FAILED (%.80s) — "
+                       "paranoid fallback to accelerated", SDL_GetError());
+        r = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED);
+        if (!r) r = SDL_CreateRenderer(g_window, -1, 0);
+    }
+    if (r) {
+        /* чем мы теперь работаем — имя рендерера + трек software */
+        SDL_RendererInfo ri;
+        memset(&ri, 0, sizeof(ri));
+        if (SDL_GetRendererInfo(r, &ri) == 0 && ri.name[0]) {
+            s_rnd_is_sw = (SDL_strcasecmp(ri.name, "software") == 0);
+            sw_trace_force("[RND] renderer=%s (%s)", ri.name, why);
+        } else {
+            s_rnd_is_sw = 1;
+        }
+    }
+    return r;
+}
+
+/* v36.77 [UI-PRESENT-GUARD]: пересоздание ui-текстуры (канва не меняет
+ * размера — её не трогаем). Вызывается при отказах аплоада/копирования и
+ * из WEDGE-стадий. Возвращает 0 при успехе. */
+static int sdl_switch_ui_tex_recreate(const char* why) {
+    if (!g_renderer) return -1;
+    if (g_ui_tex) { SDL_DestroyTexture(g_ui_tex); g_ui_tex = NULL; }
+    g_ui_tex = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ARGB8888,
+                                 SDL_TEXTUREACCESS_STREAMING,
+                                 SWITCH_UI_WIDTH, SWITCH_UI_HEIGHT);
+    if (g_ui_tex) {
+        SDL_SetTextureBlendMode(g_ui_tex, SDL_BLENDMODE_BLEND);
+        sw_trace_force("[UI-RECOVER] ui texture recreated (%.60s)", why);
+        return 0;
+    }
+    sw_trace_force("[UI-RECOVER] ui texture recreate FAILED (%.60s): %.80s",
+                   why, SDL_GetError());
+    return -1;
+}
+
+/* Песочный крючок тестов (прод никогда не ставит): NOJME_UI_PRESENT_FAIL=N —
+ * первые N вызовов sdl_switch_ui_present имитируют отказ аплоада, чтобы
+ * хост-тест проверил пересоздание текстуры по [UI-RECOVER]. */
+static int sdl_uipf_sim_fail(void) {
+    const char* v = getenv("NOJME_UI_PRESENT_FAIL");
+    if (!v || !v[0]) return 0;
+    static int s_left = -1;
+    if (s_left < 0) s_left = atoi(v);
+    if (s_left > 0) { s_left--; return 1; }
+    return 0;
+}
+
+/* v36.81 [MENU-FIRST]: флаг «первый present меню после menu session
+ * start» — ставит switch_ui.c (extern), снимает и печатает бейкон
+ * ui_present. Полевой лог v36.80 обрывался СРАЗУ после первого present
+ * меню (выход из игры) — бейкон с таймингами и адресами делает следующий
+ * лог самодостаточным: жив ли цикл меню, доехал ли первый кадр. */
+volatile int g_sw_menu_first_probe = 0;
+
 void sdl_switch_ui_present(void) {
-    if (!g_ui_tex || !g_renderer || !g_ui_canvas) return;
+    if (!g_renderer || !g_ui_canvas) return;
+    /* v36.77: битая/отсутствующая ui-текстура больше НЕ тихий вылет —
+     * пробуем восстановить сразу (клин драйвера лечится пересозданием). */
+    if (!g_ui_tex) {
+        if (sdl_switch_ui_tex_recreate("ui_present: missing tex") != 0)
+            return;
+    }
     sdl_render_thread_check("ui_present");
+    /* v36.81 [MENU-FIRST]: тайминги для бейкона первого кадра меню */
+    uint64_t mf_t0 = 0;
+    int mf_armed = g_sw_menu_first_probe;
+    if (mf_armed) {
+        g_sw_menu_first_probe = 0;
+        mf_t0 = sdl_switch_ui_ticks_ms();
+    }
     /* v36.17: verification hook — dump the menu canvas as PPM when
      * NOJME_UI_DUMP_DIR is set (sandbox visual tests only; production
      * never sets it). Rate-limited to 4 dumps/sec, capped by
@@ -1554,11 +2030,76 @@ void sdl_switch_ui_present(void) {
             }
         }
     }
-    SDL_UpdateTexture(g_ui_tex, NULL, g_ui_canvas,
-                      SWITCH_UI_WIDTH * sizeof(uint32_t));
+    /* v36.77 [UI-PRESENT-GUARD]: прошлая версия не проверяла rc — битая
+     * после драйвер-клина текстура давала ЧЁРНЫЙ экран при живом цикле
+     * меню и полной тишине в логе. Теперь: отказ UpdateTexture/RenderCopy
+     * считается; 2 подряд — пересоздание текстуры (клин лечится), после
+     * чего кадр рисуется уже в свежую текстуру. Тротлинг 10 с на строку,
+     * счётчик g_sd_uipf печатается в menu alive-строке. */
+    int upl_rc = sdl_uipf_sim_fail() ? -1
+        : SDL_UpdateTexture(g_ui_tex, NULL, g_ui_canvas,
+                            SWITCH_UI_WIDTH * sizeof(uint32_t));
+    tex_note_up(TI_UI, upl_rc); /* v36.81 [TEX-DIAG] */
+    if (upl_rc != 0) {
+        __sync_fetch_and_add(&g_sd_uipf, 1);
+        static uint64_t s_last_uipf_log = 0;
+        static int s_uipf_logged = 0;
+        uint64_t nowf = (uint64_t)SDL_GetTicks();
+        if (!s_uipf_logged || nowf - s_last_uipf_log >= 10000) {
+            s_uipf_logged = 1;
+            s_last_uipf_log = nowf;
+            sw_trace_force("[UI-PRESENT-FAIL] UpdateTexture: %.100s "
+                           "(ui fails total=%u)", SDL_GetError(),
+                           (unsigned)g_sd_uipf);
+        }
+        if (sdl_switch_ui_tex_recreate("ui_present: upload failed") == 0)
+            upl_rc = SDL_UpdateTexture(g_ui_tex, NULL, g_ui_canvas,
+                                       SWITCH_UI_WIDTH * sizeof(uint32_t));
+    }
+    uint64_t mf_t1 = sdl_switch_ui_ticks_ms();
     SDL_RenderClear(g_renderer);
-    SDL_RenderCopy(g_renderer, g_ui_tex, NULL, NULL);
+    int copy_rc = SDL_RenderCopy(g_renderer, g_ui_tex, NULL, NULL);
+    if (copy_rc != 0) {
+        __sync_fetch_and_add(&g_sd_uipf, 1);
+        static uint64_t s_last_cpf_log = 0;
+        static int s_cpf_logged = 0;
+        uint64_t nowc = (uint64_t)SDL_GetTicks();
+        if (!s_cpf_logged || nowc - s_last_cpf_log >= 10000) {
+            s_cpf_logged = 1;
+            s_last_cpf_log = nowc;
+            sw_trace_force("[UI-PRESENT-FAIL] RenderCopy: %.100s "
+                           "(ui fails total=%u)", SDL_GetError(),
+                           (unsigned)g_sd_uipf);
+        }
+        if (sdl_switch_ui_tex_recreate("ui_present: copy failed") == 0) {
+            if (SDL_UpdateTexture(g_ui_tex, NULL, g_ui_canvas,
+                                  SWITCH_UI_WIDTH * sizeof(uint32_t)) == 0)
+                copy_rc = SDL_RenderCopy(g_renderer, g_ui_tex, NULL, NULL);
+        }
+    }
     SDL_RenderPresent(g_renderer);
+    /* v36.81 [MENU-FIRST]: бейкон самого первого present меню после
+     * входа в меню (ставит switch_ui.c) — тайминги + адреса текстур;
+     * если после него в логе тишина, а экран замер — цикл меню мёртв,
+     * и это видно НЕ дожидаясь menu: alive (5 с). */
+    if (mf_armed) {
+        uint64_t mf_t2 = sdl_switch_ui_ticks_ms();
+        sw_trace_force("[MENU-FIRST] first menu present: upl+copy=%llu ms "
+                       "present=%llu ms upl_ok=%d copy_ok=%d "
+                       "tex=0x%llx cv=0x%llx %dx%d",
+                       (unsigned long long)(mf_t1 - mf_t0),
+                       (unsigned long long)(mf_t2 - mf_t1),
+                       upl_rc == 0, copy_rc == 0,
+                       (unsigned long long)(uintptr_t)g_ui_tex,
+                       (unsigned long long)(uintptr_t)g_ui_canvas,
+                       SWITCH_UI_WIDTH, SWITCH_UI_HEIGHT);
+    }
+}
+
+/* v36.77: чтение счётчика ui-отказов для menu alive-строки (слабое —
+ * тестовые сборки без графики видят 0). */
+uint32_t sdl_switch_ui_present_fails(void) {
+    return (uint32_t)g_sd_uipf;
 }
 
 /* ================= v36.17: ЖИВОЙ ФОН «НАСТРОЕК ИГРЫ» =================
@@ -1869,9 +2410,30 @@ static int sdl_switch_stage_presentation(int fb_w, int fb_h) {
     return 0;
 }
 
+/* v36.81→v36.82 [SW-ONLY]: game_begin БОЛЬШЕ не переключает рендерер
+ * (per-game настройка «Рендер» удалена — режим единственный: программный).
+ * Функция ниже — общий полный ребилд для WEDGE-стадий и [EXIT-FRESH],
+ * определение ниже по коду. */
+static int sdl_switch_renderer_switch(SdlContext* ctx, const char* why);
+
 int sdl_switch_game_begin(int fb_w, int fb_h) {
     if (!g_renderer) return -1;
     sdl_render_thread_check("game_begin");
+    /* v36.76 [WEDGE-GUARD]: новая сессия — новый эпизод наблюдения.
+     * v36.81: лестница стадий и окно медленного клина сбрасываются
+     * ПОЛНОСТЬЮ (монотонность — только ВНУТРИ сессии). */
+    s_wedge_streak = 0; s_wedge_stage_done = 0;
+    g_wedge_recover_pending = 0; s_wedge_bypass_s2x = 0;
+    s_wedge_prev_src = 0;
+    s_wslow_filled = 0;
+    memset(s_wslow_src, 0, sizeof(s_wslow_src));
+    memset(s_wslow_rect, 0, sizeof(s_wslow_rect));
+    s_wedge_ever_fired = 0;
+    /* v36.81 [PERGAME-RENDER] → v36.82 [SW-ONLY]: блок приведения
+     * рендерера к per-game режиму УДАЛЁН. Рендерер один (программный),
+     * переключений не существует — рантайм-смена режима GLES2<->software
+     * к тому же приводила к вылету приложения (полевой отчёт
+     * v36.81-swrender1); см. [SW-ONLY] у sdl_switch_renderer_create. */
     {
         /* [YSFIX2] v36.40: определена в main.c (CORE_BUILD_ID); тот же
          * extern-паттерн, что в switch_trace.c. */
@@ -1978,6 +2540,18 @@ void sdl_switch_game_end(void) {
     if (g_texture) { SDL_DestroyTexture(g_texture); g_texture = NULL; }
     if (g_s2x_tex) { SDL_DestroyTexture(g_s2x_tex); g_s2x_tex = NULL; }
     free(g_s2x_buf); g_s2x_buf = NULL; g_s2x_w = g_s2x_h = 0; /* v36.14 */
+    /* v36.76 [WEDGE-GUARD]: сессия закрыта — эпизод и байпас не должны
+     * протекать в следующую игру (байпас — косметика деградации, новый
+     * сеанс начинает со штатного Scale2x).
+     * v36.81: + сброс окна медленного клина и флага лечения сессии. */
+    s_wedge_streak = 0; s_wedge_stage_done = 0;
+    g_wedge_recover_pending = 0; s_wedge_bypass_s2x = 0;
+    s_wedge_prev_src = 0;
+    s_wslow_filled = 0;
+    memset(s_wslow_src, 0, sizeof(s_wslow_src));
+    memset(s_wslow_rect, 0, sizeof(s_wslow_rect));
+    const int wedge_fired = s_wedge_ever_fired;
+    s_wedge_ever_fired = 0;
     free(g_rot_buf); g_rot_buf = NULL; g_rot_mode = 0; /* v36.15 */
     /* v36.18: полоса FPS уходит вместе с игровой сессией */
     if (s_fps_tex) { SDL_DestroyTexture(s_fps_tex); s_fps_tex = NULL; }
@@ -1994,6 +2568,12 @@ void sdl_switch_game_end(void) {
      * leak into the next game (phantom keyRepeated right from launch). */
     memset(&g_sdl_key_repeat, 0, sizeof(g_sdl_key_repeat));
     g_pause_held = 0;
+    /* v36.87 [STICK-DIAG]/[PG-CONTROLS]: per-game управление сбрасывается
+     * к дефолтам (следующая сессия ставит свои значения в main.c по
+     * pergame ini; меню фронтенда работает на глобальной раскладке). */
+    g_pg_stick_diag = NOJME_DIAG_DEFAULT;
+    for (int i = 0; i < NOJME_CTL_BTN_COUNT; i++)
+        g_pg_btn[i] = NOJME_BTNK_DEFAULT;
     /* close any game audio so the menu is silent
      * [AUDIO-HARDEN] v36.50: под мьютексом — sdl_switch_game_end зовётся
      * главным потоком на выходе из игры, пока микшерный поток может быть
@@ -2001,6 +2581,22 @@ void sdl_switch_game_end(void) {
     pthread_mutex_lock(&g_audio_dev_mutex);
     if (g_audio_dev) { SDL_CloseAudioDevice(g_audio_dev); g_audio_dev = 0; }
     pthread_mutex_unlock(&g_audio_dev_mutex);
+    /* v36.81 [EXIT-FRESH] (режим упрощён v36.82 [SW-ONLY]): ЧИСТЫЙ
+     * КОНТЕКСТ МЕНЮ — но только если он подозреваем. Полевой лог v36.80:
+     * безусловный EXIT-RESET (полный ребилд при КАЖДОМ выходе) НЕ вылечил
+     * меню после клина и добавил лишние телодвижения на каждом выходе.
+     * Теперь: клин в сессии ловился (s_wedge_ever_fired) → полный ребилд
+     * (v36.82: ребилд всегда в единственном программном режиме); чистая
+     * сессия → только свежая ui-текстура ([UI-RECOVER] menu entry), как
+     * в v36.77. Идея: не дёргать вывод без нужды. */
+    if (g_renderer) {
+        if (wedge_fired) {
+            /* ctx=NULL: игровые текстуры меню не нужны — только ui + ленивые */
+            sdl_switch_renderer_switch(NULL, "exit-reset (wedge fired this session)");
+        } else {
+            sdl_switch_ui_tex_recreate("menu entry");
+        }
+    }
     LOG_SAFE("[SWITCH] game session end\n");
 }
 
@@ -2010,10 +2606,154 @@ void sdl_switch_game_end(void) {
 static uint32_t s_switch_frame_version_seen = 0;
 static int s_switch_frame_version_advanced = 0;
 
+/* ================= v36.76 [WEDGE-GUARD]: исполнитель лечения ================
+ * Выполняется в НАЧАЛЕ следующего present (не внутри пробы!) — пробы
+ * читают уже собранный кадр; ломать его текстуры между RenderCopy и
+ * RenderPresent нельзя. Стадии (v36.81 [STAGE-SW]; v36.82 [SW-ONLY]:
+ * режим рендерера больше НЕ меняется — он единственный, программный):
+ *   1 — sdl_switch_stage_presentation: свежие g_texture/g_s2x/g_bg
+ *       (те же размеры/фильтры, тот же путь, что при старте сессии);
+ *   2 — ПОЛНЫЙ РЕБИЛД РЕНДЕРЕРА И ВСЕХ ТЕКСТУР (v36.81: уход из GLES2
+ *       на программный — единственное лекарство хронического клина,
+ *       пересоздания ВНУТРИ GL не помогали; v36.82: software->software
+ *       ребилд, чистит накопленное состояние выдачи — GL-пути больше
+ *       не существует вовсе, см. [SW-ONLY] у sdl_switch_renderer_create);
+ *   3 — байпас Scale2x (вывод 1x-текстурой): разгрузка CPU (полный
+ *       2x-кадр не считается);
+ *   4 — снова полный ребилд рендерера; повторные вызовы при хроническом
+ *       клине остаются на 4.
+ * На Switch пересоздание безопасно: окно живо, весь вывод идёт через
+ * g_renderer/g_ui_tex, оба пересоздаются в одном (программном) режиме.
+ * v36.82: залипание лечения в pergame ini (render=software) УДАЛЕНО —
+ * настройки «Рендер» больше нет, режим и так единственный. */
+/* v36.81: полный разбор рендерера (общее тело стадий 2/4 и [EXIT-FRESH]).
+ * v36.82 [SW-ONLY]: параметр force убран — создавать можно ТОЛЬКО
+ * программный рендерер (кросс-режимное переключение GLES2<->software в
+ * рантайме крушало приложение — полевой отчёт v36.81-swrender1).
+ * Вызывать ТОЛЬКО на frame-потоке (present/pause/exit) — конкурентов
+ * за рендерер нет. */
+static int sdl_switch_renderer_switch(SdlContext* ctx, const char* why) {
+    if (!g_renderer) return -1;
+    uint64_t t0 = sdl_switch_ui_ticks_ms();
+    SDL_Renderer* old = g_renderer;
+    /* 1. снести ВСЕ текстуры старого рендерера */
+    if (g_texture)  { SDL_DestroyTexture(g_texture);   g_texture = NULL; }
+    if (g_s2x_tex)  { SDL_DestroyTexture(g_s2x_tex);   g_s2x_tex = NULL; }
+    free(g_s2x_buf); g_s2x_buf = NULL; g_s2x_w = g_s2x_h = 0;
+    if (g_bg_tex)   { SDL_DestroyTexture(g_bg_tex);    g_bg_tex = NULL; }
+    free(g_bg_buf); g_bg_buf = NULL;
+    if (s_fps_tex)  { SDL_DestroyTexture(s_fps_tex);   s_fps_tex = NULL; }
+    free(s_fps_buf); s_fps_buf = NULL; s_fps_bw = s_fps_bh = 0;
+    sdl_switch_fps_state_reset();
+    if (s_batt_tex) { SDL_DestroyTexture(s_batt_tex);  s_batt_tex = NULL; }
+    free(s_batt_buf); s_batt_buf = NULL; s_batt_bw = s_batt_bh = 0;
+    s_batt_mode = -1; s_batt_pct = -1; s_batt_chg = -1;
+    if (g_ui_tex)   { SDL_DestroyTexture(g_ui_tex);    g_ui_tex = NULL; }
+    /* 2. сам рендерер — пересоздаётся единственным доступным способом:
+     * программный (v36.82 [SW-ONLY]; DestroyRenderer+CreateRenderer в
+     * ОДНОМ режиме — безопасная пара, в отличие от кросс-режимного
+     * переключения GLES2<->software, крушившего приложение на v36.81) */
+    SDL_DestroyRenderer(g_renderer);
+    g_renderer = NULL;
+    g_renderer = sdl_switch_renderer_create(why);
+    if (!g_renderer) {
+        sw_trace_force("[RND] renderer switch FAILED (%.60s): %.120s",
+                       why, SDL_GetError());
+        return -1;
+    }
+    /* 3. ui-канва меню + fps/batt ленивы (ensure при следующем
+     * использовании сами пересоздадут свои текстуры) */
+    g_ui_tex = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ARGB8888,
+                                 SDL_TEXTUREACCESS_STREAMING,
+                                 SWITCH_UI_WIDTH, SWITCH_UI_HEIGHT);
+    if (g_ui_tex) SDL_SetTextureBlendMode(g_ui_tex, SDL_BLENDMODE_BLEND);
+    else
+        sw_trace_force("[RND] ui texture FAILED (%.60s): %.120s",
+                       why, SDL_GetError());
+    /* 4. игровые текстуры — штатным стейджингом (если сессия жива) */
+    if (ctx && ctx->width > 0 && ctx->height > 0) {
+        if (sdl_switch_stage_presentation(ctx->width, ctx->height) != 0)
+            sw_trace_force("[RND] game textures FAILED (%.60s): %.120s",
+                           why, SDL_GetError());
+    }
+    tex_note_rc(TI_UI); tex_note_rc(TI_GAME);
+    tex_note_rc(TI_S2X); tex_note_rc(TI_BG); tex_note_rc(TI_BATT);
+    /* v36.80-совместимый формат строки (там это делалось на выходе в
+     * меню и называлось [EXIT-RESET]); здесь — общий хелдер переключения
+     * рендерера: тег [RND-SWITCH], причины различает строка why. */
+    sw_trace_force("[RND-SWITCH] renderer+textures rebuilt in %llu ms "
+                   "(old=0x%llx new=0x%llx) — %s",
+                   (unsigned long long)(sdl_switch_ui_ticks_ms() - t0),
+                   (unsigned long long)(uintptr_t)old,
+                   (unsigned long long)(uintptr_t)g_renderer, why);
+    return 0;
+}
+static int sdl_wedge_recover(SdlContext* ctx, int stage) {
+    if (!g_renderer || !ctx) return -1;
+    if (stage <= 1) {
+        sw_trace_force("[WEDGE-RECOVER] stage 1: recreating game textures "
+                       "(%dx%d)", ctx->width, ctx->height);
+        int rc = sdl_switch_stage_presentation(ctx->width, ctx->height);
+        /* v36.77 [UI-PRESENT-GUARD]: клин драйвера бьёт по ВСЕМ текстурам
+         * рендерера, а не только игровым (поле v36.76: stage 1 вылечила
+         * картинку игры, но при возврате в меню экран стал ЧЁРНЫМ —
+         * g_ui_tex осталась битой). Лечим и её: пауза/меню в этот момент
+         * закрыты, ui_present конкурентного доступа не имеет. */
+        sdl_switch_ui_tex_recreate("wedge stage 1");
+        tex_note_rc(TI_GAME); tex_note_rc(TI_S2X);
+        tex_note_rc(TI_BG); tex_note_rc(TI_UI);
+        if (rc != 0)
+            sw_trace_force("[WEDGE-RECOVER] stage 1 FAILED: %.120s",
+                           SDL_GetError());
+        return rc;
+    }
+    if (stage == 2) {
+        /* v36.81 [STAGE-SW]: уход из GLES2 на программный рендерер.
+         * v36.82 [SW-ONLY]: рендерер ПОСТОЯННО программный, поэтому
+         * стадия 2 = полный ребилд рендерера и всех текстур
+         * (software->software): чистит накопленное состояние выдачи.
+         * Залипание в pergame ini (render=software) удалено — настройки
+         * «Рендер» больше нет, режим и так единственный. */
+        sw_trace_force("[WEDGE-RECOVER] stage 2: full renderer+textures "
+                       "rebuild (software-only)");
+        return sdl_switch_renderer_switch(ctx, "wedge stage 2 (full rebuild)");
+    }
+    if (stage == 3) {
+        sw_trace_force("[WEDGE-RECOVER] stage 3: textures + "
+                       "Scale2x bypass for this session");
+        s_wedge_bypass_s2x = 1;
+        int rc = sdl_switch_stage_presentation(ctx->width, ctx->height);
+        sdl_switch_ui_tex_recreate("wedge stage 3");
+        tex_note_rc(TI_GAME); tex_note_rc(TI_S2X);
+        tex_note_rc(TI_BG); tex_note_rc(TI_UI);
+        if (rc != 0)
+            sw_trace_force("[WEDGE-RECOVER] stage 3 FAILED: %.120s",
+                           SDL_GetError());
+        return rc;
+    }
+    /* стадия 4: снова полный ребилд (v36.82 [SW-ONLY]: режим один —
+     * программный; ресет software->software чистит накопленное
+     * состояние выдачи) */
+    sw_trace_force("[WEDGE-RECOVER] stage 4: full renderer reset");
+    return sdl_switch_renderer_switch(ctx, "wedge stage 4");
+}
+
+static void sdl_wedge_recover_maybe(SdlContext* ctx) {
+    int stage = g_wedge_recover_pending;
+    if (!stage || !ctx || !g_renderer) return;
+    g_wedge_recover_pending = 0;
+    sdl_render_thread_check("wedge_recover");
+    sdl_wedge_recover(ctx, stage);
+}
+
 static void sdl_switch_present_game(SdlContext* ctx) {
     if (!ctx || !ctx->framebuffer || !g_texture || !g_renderer) return;
     if (WILDGUARD_SKIP(ctx->framebuffer, "present:fb")) return; /* [WILDGUARD] v36.50 */
     sdl_render_thread_check("present_game");
+
+    /* v36.76 [WEDGE-GUARD]: отложенное лечение выполняем ДО любой работы
+     * с кадром — здесь безопасно ломать/пересоздавать текстуры. */
+    sdl_wedge_recover_maybe(ctx);
 
     /* v36.28 DEBUG: sandbox game-canvas dump (NOJME_GAME_DUMP_DIR),
      * rate-limited 1/sec, capped by NOJME_GAME_DUMP_MAX (default 200). */
@@ -2241,7 +2981,9 @@ static void sdl_switch_present_game(SdlContext* ctx) {
     /* v36.15: pitch повёрнутой ширины; v36.43 [PRESENT-GLASS]: раньше rc
      * не проверялся — отказ загрузки текстуры (драйвер/GPU) оставлял бы на
      * экране СТАРЫЙ кадр при здоровых fl/lvc; теперь это видно в utf=/rcf=
-     * + трейс [PRESENT-FAIL] с текстом ошибки SDL. */
+     * + трейс [PRESENT-FAIL] с текстом ошибки SDL.
+     * v36.76 [WEDGE-SIM]: песочная имитация клина (прод env не ставит). */
+    if (!sdl_wsim_skip("game", g_texture))
     sdl_present_fail_note("UpdateTexture(game)",
         SDL_UpdateTexture(g_texture, NULL, present_src,
                           rw * (int)sizeof(uint32_t)), 1);
@@ -2258,12 +3000,54 @@ static void sdl_switch_present_game(SdlContext* ctx) {
          * frame: the user saw the blur turn into a garbage blob ("зеленое
          * пятно") while the main image stayed correct — exactly the field
          * report. v35.01: the blur consumes the SAME single-source
-         * decision as the game texture (present_src above). */
-        switch_scaling_blur_bg(present_src, rw, rh, /* v36.15: повёрнутый кадр */
-                               g_bg_buf, g_bg_w, g_bg_h, 2);
-        sdl_present_fail_note("UpdateTexture(bg)",
-            SDL_UpdateTexture(g_bg_tex, NULL, g_bg_buf,
-                              g_bg_w * (int)sizeof(uint32_t)), 1);
+         * decision as the game texture (present_src above).
+         * v36.85 [TURBO-FF] BLUR-DECIMATE: размытый фон — КОСМЕТИКА;
+         * пересчитывать его с каждым кадром незачем: бокс-даунсемпл +
+         * полноэкранный линейный stretch — это вторая по цене часть
+         * present на консоли. Фоновая текстура обновлялась не чаще
+         * раза в NOJME_BG_BLUR_MS (дефолт был 200), сама копия
+         * RenderCopy(bg) остаётся каждый кадр (дешёвая — маленькая
+         * текстура растягивается).
+         * v36.86 [BLUR-EVERYFRAME] ОТКАТ декимации: полевой отчёт «блюр
+         * боковых областей теперь работает не каждый кадр» — ступеньки
+         * фона были видны глазом (фон обновлялся 5 Гц при кадре 15-60 Гц).
+         * Дефолт NOJME_BG_BLUR_MS теперь 0 = пересчёт КАЖДЫЙ present:
+         * в турбо present сам декимирован до ~15 Гц ([PRESENT-DECIM]),
+         * поэтому «каждый present» = каждый ВИДИМЫЙ кадр — фон всегда
+         * синхронен картинке; в обычном режиме это честные 60 Гц.
+         * Цену пересчёта гасит [BLUR-NEON] (switch_scaling.c): даунсемпл
+         * равномерных 8x-блоков на NEON в ~5 раз дешевле скалярного
+         * прохода, бит-в-бит тот же результат. Окно >0 всё ещё можно
+         * вернуть env-ом NOJME_BG_BLUR_MS=200 (первые 3 present сессии
+         * при окне обновляются всегда — старт/смена разрешения). */
+        {
+            static long s_bgblur_ms = -2;
+            static uint64_t s_bg_last_ms = 0;
+            static int s_bg_early = 0;
+            int update_bg = 1;
+            if (s_bgblur_ms == -2) {
+                const char* be = getenv("NOJME_BG_BLUR_MS");
+                /* v36.86 [BLUR-EVERYFRAME]: дефолт 0 — КАЖДЫЙ present
+                 * (было 200 в v36.85). */
+                s_bgblur_ms = (be && be[0]) ? atol(be) : 0;
+            }
+            if (s_bgblur_ms > 0) {
+                uint64_t nowb = (uint64_t)SDL_GetTicks();
+                if (s_bg_early < 3) {
+                    s_bg_early++;
+                } else if (nowb - s_bg_last_ms < (uint64_t)s_bgblur_ms) {
+                    update_bg = 0;
+                }
+                if (update_bg) s_bg_last_ms = nowb;
+            }
+            if (update_bg) {
+                switch_scaling_blur_bg(present_src, rw, rh, /* v36.15: повёрнутый кадр */
+                                       g_bg_buf, g_bg_w, g_bg_h, 2);
+                sdl_present_fail_note("UpdateTexture(bg)",
+                    SDL_UpdateTexture(g_bg_tex, NULL, g_bg_buf,
+                                      g_bg_w * (int)sizeof(uint32_t)), 1);
+            }
+        }
         sdl_present_fail_note("RenderCopy(bg)",
             SDL_RenderCopy(g_renderer, g_bg_tex, NULL, NULL), 0); /* stretched full screen */
     } else {
@@ -2274,11 +3058,14 @@ static void sdl_switch_present_game(SdlContext* ctx) {
     /* v36.14: Scale2x — NEON-апскейл x2 settles-кадра в g_s2x_buf, выгрузка
      * в 2x-текстуру, финальный fit в игровой прямоугольник — на GPU.
      * Перезапись 1x-текстуры НЕ пропускается: pause-меню и все остальные
-     * пути продолжают читать её без изменений. */
-    if (g_s2x_tex && g_s2x_buf &&
+     * пути продолжают читать её без изменений.
+     * v36.76 [WEDGE-GUARD]: после стадии 2 байпасим 2x-путь — вывод 1x-
+     * текстурой (другая текстура/размер/ветвь). */
+    if (!s_wedge_bypass_s2x && g_s2x_tex && g_s2x_buf &&
         g_s2x_w == rw && g_s2x_h == rh) { /* v36.15: повёрнутые размеры */
         switch_scaling_scale2x(present_src, rw, rh,
                                g_s2x_buf);
+        if (!sdl_wsim_skip("s2x", g_s2x_tex))
         sdl_present_fail_note("UpdateTexture(s2x)",
             SDL_UpdateTexture(g_s2x_tex, NULL, g_s2x_buf,
                               (size_t)rw * 2 * sizeof(uint32_t)) == 0 ? 0 : -1, 1);
@@ -2327,11 +3114,14 @@ static void sdl_switch_present_game(SdlContext* ctx) {
     }
     /* v36.43 [PRESENT-GLASS]: проба композита — ДО RenderPresent (после
      * него задний буфер не определён). Заодно env-дамп полного кадра для
-     * песочных пиксель-тестов (test_switch_battgame.sh). */
+     * песочных пиксель-тестов (test_switch_battgame.sh).
+     * v36.76 [WEDGE-GUARD]: пробе передают текущий CPU-источник кадра
+     * (present_src в повёрнутой геометрии rw x rh) — его хэш отличает
+     * клин аплоада от стоящего источника. */
     {
         uint64_t nowp = sdl_switch_ui_ticks_ms();
         sdl_composite_dump_maybe(nowp);
-        sdl_composite_probe(nowp);
+        sdl_composite_probe(nowp, present_src, rw, rh);
     }
     clock_gettime(CLOCK_MONOTONIC, &pv_t1);
     SDL_RenderPresent(g_renderer);
@@ -2454,7 +3244,68 @@ static SDL_Keycode sdl_dpad_translate(SDL_Keycode arrow, int is_stick) {
     return arrow;
 }
 
+/* ================= v36.87 [PG-CONTROLS]: назначение кнопок ================= */
+
+/* Словарь целевых клавиш (NOJME_BTNK_* из switch_common.h) -> SDL keycode
+ * (тот же key_map[], что у физической клавиатуры: цифры идут как ASCII
+ * '0'..'9', стрелки — Nokia -1..-4, софт — F1/F2). Порядок = порядку
+ * пикера switch_ui.c (g_ctl_keys[]). */
+static SDL_Keycode nojme_btnk_to_sdl(int k) {
+    switch (k) {
+        case NOJME_BTNK_0:    return SDLK_0;
+        case NOJME_BTNK_1:    return SDLK_1;
+        case NOJME_BTNK_2:    return SDLK_2;
+        case NOJME_BTNK_3:    return SDLK_3;
+        case NOJME_BTNK_4:    return SDLK_4;
+        case NOJME_BTNK_5:    return SDLK_5;  /* ITU-T OK/FIRE */
+        case NOJME_BTNK_6:    return SDLK_6;
+        case NOJME_BTNK_7:    return SDLK_7;
+        case NOJME_BTNK_8:    return SDLK_8;
+        case NOJME_BTNK_9:    return SDLK_9;
+        case NOJME_BTNK_STAR: return SDLK_ASTERISK;
+        case NOJME_BTNK_HASH: return SDLK_HASH;
+        case NOJME_BTNK_SOFT1: return SDLK_F1; /* левая софт (-6) */
+        case NOJME_BTNK_SOFT2: return SDLK_F2; /* правая софт (-7) */
+        case NOJME_BTNK_CLEAR: return SDLK_c;  /* GAME_C/clear (-8) */
+        case NOJME_BTNK_UP:    return SDLK_UP;    /* Nokia -1 */
+        case NOJME_BTNK_DOWN:  return SDLK_DOWN;  /* Nokia -2 */
+        case NOJME_BTNK_LEFT:  return SDLK_LEFT;  /* Nokia -3 */
+        case NOJME_BTNK_RIGHT: return SDLK_RIGHT; /* Nokia -4 */
+        default: return 0; /* DEFAULT и мусор — встроенная раскладка */
+    }
+}
+
+/* SWJB_* -> индекс в g_pg_btn[] (0..9: A,B,X,Y,L,R,ZL,ZR,L3,R3),
+ * -1 = кнопка не ремапится (крестовина — пути ввода, PLUS/MINUS — системные). */
+static int swjb_remap_index(int b) {
+    switch (b) {
+        case SWJB_A: return 0;
+        case SWJB_B: return 1;
+        case SWJB_X: return 2;
+        case SWJB_Y: return 3;
+        case SWJB_L: return 4;
+        case SWJB_R: return 5;
+        case SWJB_ZL: return 6;
+        case SWJB_ZR: return 7;
+        case SWJB_LSTICK: return 8;
+        case SWJB_RSTICK: return 9;
+        default: return -1;
+    }
+}
+
 static SDL_Keycode switch_joy_button_to_keycode(int b) {
+    /* v36.87 [PG-CONTROLS]: per-MIDlet назначение кнопок побеждает
+     * встроенную раскладку (экран «Управление» в меню паузы; применяется
+     * ЖИВО — таблица читается при каждом нажатии). ВАЖНО: это ТОЛЬКО
+     * игровой путь — навигация меню читает SWJB-биты напрямую из насоса
+     * (sdl_switch_ui_pump_keys), ремап её не затрагивает. */
+    {
+        int ri = swjb_remap_index(b);
+        if (ri >= 0 && g_pg_btn[ri] != NOJME_BTNK_DEFAULT) {
+            SDL_Keycode k = nojme_btnk_to_sdl(g_pg_btn[ri]);
+            if (k) return k;
+        }
+    }
     switch (b) {
         /* v36.37: крестовина — путь СТРЕЛОК (цифры только при swap ON) */
         case SWJB_UP:    return sdl_dpad_translate(SDLK_UP, 0);
@@ -2511,20 +3362,121 @@ static SDL_Keycode switch_joy_button_to_keycode(int b) {
     }
 }
 
+/* ================= v36.87 [STICK-DIAG]: зоны цифрового пути ================= */
+
+/* Маска направления (UP=1/DOWN=2/LEFT=4/RIGHT=8) через поворот
+ * презентации — по биту, той же таблицей, что sdl_rot_map_key
+ * (единственный источник истины о повороте). */
+static int sdl_dir_mask_rot(int mask) {
+    if (!g_rot_mode) return mask;
+    static const int bits[4] = { 1, 2, 4, 8 };
+    static const SDL_Keycode keys[4] = { SDLK_UP, SDLK_DOWN, SDLK_LEFT, SDLK_RIGHT };
+    int out = 0;
+    for (int i = 0; i < 4; i++) {
+        if (!(mask & bits[i])) continue;
+        SDL_Keycode r = sdl_rot_map_key(keys[i]);
+        for (int j = 0; j < 4; j++)
+            if (keys[j] == r) { out |= bits[j]; break; }
+    }
+    return out;
+}
+
+/* 9-зонная маска -> ITU-T цифра кейпада (0 = центр/мусор). Прямые зоны —
+ * те же цифры, что шлёт ортогональная пара; диагонали — [STICK-DIAG]
+ * v36.87: UP|LEFT='7', UP|RIGHT='9', DOWN|LEFT='1', DOWN|RIGHT='3'
+ * (как на реальном телефоне: диагональ = ОДНА клавиша). */
+static SDL_Keycode sdl_dir_zone_digit(int mask) {
+    switch (mask) {
+        case 1:  return SDLK_2;  /* UP */
+        case 2:  return SDLK_8;  /* DOWN */
+        case 4:  return SDLK_4;  /* LEFT */
+        case 8:  return SDLK_6;  /* RIGHT */
+        case 5:  return SDLK_7;  /* UP|LEFT */
+        case 9:  return SDLK_9;  /* UP|RIGHT */
+        case 6:  return SDLK_1;  /* DOWN|LEFT */
+        case 10: return SDLK_3;  /* DOWN|RIGHT */
+        default: return 0;
+    }
+}
+
+/* Только диагональная цифра маски (0 = не диагональ) — «пятая виртуальная
+ * клавиша» режима BOTH: edges лишь при входе/выходе из диагональной зоны. */
+static SDL_Keycode sdl_dir_diag_digit(int mask) {
+    switch (mask) {
+        case 5:  return SDLK_7;
+        case 9:  return SDLK_9;
+        case 6:  return SDLK_1;
+        case 10: return SDLK_3;
+        default: return 0;
+    }
+}
+
+/* Зона из удерживаемых КНОПОК крестовины (bits SWJB_UP/DOWN/LEFT/RIGHT) —
+ * для пути «крестовина = цифры» (swap ON): две смежные кнопки = диагональ. */
+static int sdl_dpad_zone_from_held(uint16_t h) {
+    int m = 0;
+    if (h & (1u << SWJB_UP))    m |= 1;
+    if (h & (1u << SWJB_DOWN))  m |= 2;
+    if (h & (1u << SWJB_LEFT))  m |= 4;
+    if (h & (1u << SWJB_RIGHT)) m |= 8;
+    return m;
+}
+
+/* Общий хвост зон обоих путей: диспетчер диагональной/зонной цифры с
+ * трассой [KEYIN] (тот же формат, что у кнопок — полевая связка с
+ * [KEYIN] SDL joy down). */
+static void sdl_diag_dispatch_edge(SdlContext* ctx, SDL_Keycode key, bool press,
+                                   const char* tag) {
+    sw_trace("[KEYIN] dispatch %s -> key=%d midp=%d",
+             tag, (int)key, switch_sdl_key_to_midp(key));
+    sdl_handle_key_event(ctx, key, press, false);
+}
+
 /* v34.90: stick->dpad direction edges from the CENTRAL pump state
  * (hysteresis-protected — see switch_input_pump). Dispatched only by the
  * frame pump.
- * v36.37: путь СТИКА — по умолчанию ЦИФРЫ (swap OFF), стрелки при swap ON. */
+ * v36.37: путь СТИКА — по умолчанию ЦИФРЫ (swap OFF), стрелки при swap ON.
+ * v36.87 [STICK-DIAG]: в режиме цифр стик получил ДИАГОНАЛИ КЕЙПАДА
+ * (запрос: «диагонали стика эмулируют нажатия кнопок 1 3 7 9»).
+ *   BOTH (дефолт) — ортогональная пара как раньше ПЛЮС диагональная
+ *                   цифра 1/3/7/9 (getGameAction-игры сохраняют движение,
+ *                   кейпадные получают свою 7);
+ *   DIGITS — чистый кейпад: зоны вместо битов, в каждый момент ровно
+ *            ОДНА цифра (переход зоны отпускает старую, жмёт новую);
+ *   OFF — прежнее поведение (только пары 2+4).
+ * В стрелочном режиме (swap ON) всё как раньше — у MIDP нет game action
+ * для 1/3/7/9, пары стрелок остаются диагоналями getGameAction-игр. */
 static void sdl_switch_dir_dispatch(SdlContext* ctx, int slot) {
     struct { int bit; SDL_Keycode key; } dirs[4] = {
         {1, SDLK_UP}, {2, SDLK_DOWN}, {4, SDLK_LEFT}, {8, SDLK_RIGHT},
     };
     int d = g_sw_in.dir[slot], dp = g_sw_in.dir_prev[slot];
+    int diag = sdl_dpad_path_digits(1) ? g_pg_stick_diag : NOJME_DIAG_OFF;
+    if (diag == NOJME_DIAG_DIGITS) {
+        /* чистый кейпад: диспетчер ЗОН (включая прямые направления) */
+        SDL_Keycode kz = sdl_dir_zone_digit(sdl_dir_mask_rot(d));
+        SDL_Keycode pz = sdl_dir_zone_digit(sdl_dir_mask_rot(dp));
+        if (pz && pz != kz)
+            sdl_handle_key_event(ctx, pz, false, false);
+        if (kz && kz != pz)
+            sdl_diag_dispatch_edge(ctx, kz, true, "diag");
+        return;
+    }
+    /* BOTH/OFF: ортогональные биты — как раньше (v36.37) */
     for (int i = 0; i < 4; i++) {
         int was = (dp >> i) & 1, now = (d >> i) & 1;
         if (was != now)
             sdl_handle_key_event(ctx, sdl_dpad_translate(dirs[i].key, 1), /* v36.37: стик */
                                  now ? true : false, false);
+    }
+    if (diag == NOJME_DIAG_BOTH) {
+        /* + диагональная цифра как «пятая виртуальная клавиша» */
+        SDL_Keycode kd = sdl_dir_diag_digit(sdl_dir_mask_rot(d));
+        SDL_Keycode pd = sdl_dir_diag_digit(sdl_dir_mask_rot(dp));
+        if (pd && pd != kd)
+            sdl_handle_key_event(ctx, pd, false, false);
+        if (kd && kd != pd)
+            sdl_diag_dispatch_edge(ctx, kd, true, "diag");
     }
 }
 
@@ -2602,19 +3554,34 @@ static void sdl_pause_release_captured(SdlContext* ctx, int deliver) {
     (void)delivered;
 }
 
+/* v36.81 [PAUSE-FALLBACK]: состояние слепоты меню паузы.
+ * s_pause_blind_streak — сколько проб подряд не нашли полосу выделения
+ * в готовом кадре (1 → CPU-фон, 2 → самолечение рендерера);
+ * s_pause_cpu_bg — рисовать фон паузы CPU-путём (единственная текстура
+ * ui, без игровой текстуры и без GL-блендинга). Оба сбрасываются на
+ * входе в паузу; на выходе s_pause_cpu_bg сбрасывается тоже — игра
+ * после резюма идёт своим путём выдачи (если рендерер переключили — он
+ * уже здоров, а детекция клина в present сама докрутит лечение). */
+static int s_pause_blind_streak = 0;
+static int s_pause_cpu_bg = 0;
+
 /* v34.90: меню паузы (MINUS). v36.19: ЕДИНОЕ меню паузы — его открывают
- * ОБЕ кнопки, MINUS и PLUS; три пункта (Продолжить / Настройки игры /
- * Выйти), курсор вверх/вниз, A (или PLUS) — выбрать, B — продолжить,
- * MINUS — язык, HOME — немедленный выход. Пункт «Настройки игры»
- * открывает прежний экран per-game настроек: VM остаётся запаркованной
- * скобками паузы всё время (экран настроек с v36.19 сам не паркует —
- * скобки begin/end не вложимы), поэтому виртуальное время стоит и в
- * настройках. Возврат из настроек — обратно в это меню. */
+ * ОБЕ кнопки, MINUS и PLUS; v36.87 [PG-CONTROLS]: ЧЕТЫРЕ пункта
+ * (Продолжить / Настройки игры / Управление / Выйти), курсор вверх/вниз,
+ * A (или PLUS) — выбрать, B — продолжить, MINUS — язык, HOME —
+ * немедленный выход. Пункт «Настройки игры» открывает прежний экран
+ * per-game настроек, пункт «Управление» — НОВЫЙ экран per-MIDlet
+ * управления ([STICK-DIAG] + назначение кнопок): VM остаётся
+ * запаркованной скобками паузы всё время (экраны настроек с v36.19 сами
+ * не паркуют — скобки begin/end не вложимы), поэтому виртуальное время
+ * стоит и в настройках. Возврат из настроек — обратно в это меню. */
 static void sdl_switch_pause_menu(SdlContext* ctx) {
     LOG_SAFE("[SWITCH] pause menu open\n");
     sw_trace("pause: open"); /* v34.91 */
     g_switch_pause_open = 1;
     g_switch_pause_req = 0; /* drop duplicate MINUS/PLUS requests */
+    s_pause_blind_streak = 0;  /* v36.81 [PAUSE-FALLBACK]: чистый вход */
+    s_pause_cpu_bg = 0;
     sdl_pause_capture_held(); /* v36.23: game keys held at open — see the block comment */
     switch_input_settle(); /* v34.90: drop the opening button latch */
     {
@@ -2634,12 +3601,19 @@ static void sdl_switch_pause_menu(SdlContext* ctx) {
         return;
     }
 
-    /* v36.19: три пункта меню паузы */
-    static const int PAUSE_ITEMS = 3;
+    /* v36.19→v36.87: четыре пункта меню паузы (пункт «Управление» добавлен
+     * [PG-CONTROLS] — между «Настройками игры» и «Выйти», выход остаётся
+     * последним, как принято в игровых меню). */
+    static const int PAUSE_ITEMS = 4;
     int sel = 0;
     int exit_game = 0;
 
     for (;;) {
+        /* v36.76 [MENU-STALL]: маркер этапа + метка времени итерации —
+         * сторож таймера (trace_beat_cb) видит живость цикла паузы и,
+         * если он умрёт внутри насоса/отрисовки/выдачи, назовёт этап. */
+        SW_DIAG_STAGE("pause:pump");
+        g_sd_loop_ms = sdl_switch_ui_ticks_ms();
         unsigned keys = sdl_switch_ui_pump_keys();
         /* v34.90: MINUS switches the UI language here too; the badge in the
          * top-left corner shows the current language and the hint. */
@@ -2655,9 +3629,9 @@ static void sdl_switch_pause_menu(SdlContext* ctx) {
                     keys |= SWK_MINUS;
                 } else {
                     const int prow_step = 48, py0 = 300;
-                    if (ty >= py0 && ty < py0 + 3 * prow_step) {
+                    if (ty >= py0 && ty < py0 + PAUSE_ITEMS * prow_step) {
                         int row = (ty - py0) / prow_step;
-                        if (row >= 0 && row < 3) {
+                        if (row >= 0 && row < PAUSE_ITEMS) {
                             if (sel == row) keys |= SWK_A;
                             else            sel = row;
                         }
@@ -2671,48 +3645,117 @@ static void sdl_switch_pause_menu(SdlContext* ctx) {
         if (keys & SWK_B) break;                       /* B — продолжить (назад) */
         if (keys & SWK_A) {
             if (sel == 0) break;                       /* Продолжить */
-            if (sel == 2) { exit_game = 1; break; }    /* Выйти в меню */
-            /* sel == 1: Настройки игры — прежний экран per-game
-             * настроек. VM уже запаркована скобками паузы (v36.19:
-             * экран сам не паркует); по B экран вернётся СЮДА. */
-            if (g_switch_current_jar[0]) {
+            if (sel == 3) { exit_game = 1; break; }    /* Выйти в меню */
+            if (sel == 1 && g_switch_current_jar[0]) {
+                /* Настройки игры — прежний экран per-game настроек.
+                 * VM уже запаркована скобками паузы (v36.19: экран сам
+                 * не паркует); по B экран вернётся СЮДА. */
                 sw_trace("pause: pgset");
                 switch_ui_pergame_screen(g_switch_current_jar);
                 switch_input_settle(); /* нажатие не должно протечь в меню */
             }
+            if (sel == 2 && g_switch_current_jar[0]) {
+                /* v36.87 [PG-CONTROLS]: «Управление» — экран per-MIDlet
+                 * управления (диагонали стика + назначение кнопок).
+                 * Тот же контракт, что у per-game экрана. */
+                sw_trace("pause: ctl");
+                switch_ui_controls_screen(g_switch_current_jar);
+                switch_input_settle(); /* нажатие не должно протечь в меню */
+            }
         }
 
-        /* отрисовка: последний кадр игры + полупрозрачное затемнение */
-        if (g_texture && g_renderer) {
-            const SwitchSettings* st = switch_settings_get();
-            int eff_scale = (g_pg_scale >= 0) ? g_pg_scale : st->scale_mode;
-            /* v36.15: текстура сессии содержит ПОВЁРНУТЫЙ кадр — считаем
-             * прямоугольник в повёрнутой геометрии (та же математика,
-             * что в sdl_switch_present_game). */
-            int rot = (g_rot_mode && g_rot_buf) ? g_rot_mode : 0;
-            int dwr = rot ? ctx->height : ctx->width;
-            int dhr = rot ? ctx->width  : ctx->height;
-            int x, y, w, h;
-            switch_scaling_game_rect(eff_scale, dwr, dhr,
-                                     SWITCH_UI_WIDTH, SWITCH_UI_HEIGHT, &x, &y, &w, &h);
-            SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
-            SDL_RenderClear(g_renderer);
-            if (eff_scale == NOJME_SCALE_FIT_BLUR && g_bg_tex && g_bg_buf) {
-                SDL_RenderCopy(g_renderer, g_bg_tex, NULL, NULL);
+        /* отрисовка: последний кадр игры + полупрозрачное затемнение.
+         * v36.81 [PAUSE-FALLBACK] — гипотеза пользователя: «меню паузы
+         * пытается получить несуществующую текстуру из игры для фона и
+         * поэтому не может отрисоваться; проверять текстуру и в случае
+         * проблем рисовать меню на чёрном фоне». Реализовано шире:
+         *   bg_mode 0 — штатно: игровая текстура (+блюр) + вуаль 0x90;
+         *   bg_mode 1 — CPU-фон: settled-кадр рисуется прямо в канву
+         *              (та же машина, что у экрана per-game настроек),
+         *              затемнение 50% вручную — ЕДИНСТВЕННАЯ текстура
+         *              выдачи остаётся ui (меню не зависит ни от игровой
+         *              текстуры, ни от GL-блендинга);
+         *   bg_mode 2 — чёрный непрозрачный фон (текстуры нет вовсе).
+         * Переключение — по СЛЕПОТЕ: проба ReadPixels раз в секунду
+         * ищет сплошную полосу выделения (COL_BAR) в готовом кадре ДО
+         * RenderPresent; полосы нет → [PAUSE-BLIND] → bg_mode 1 →
+         * при повторе — самолечение WEDGE-стадией 2 прямо из паузы
+         * (меню паузы владеет выдачей в этот момент). Полевая правда
+         * v36.80: при клине драйвера SDL_UpdateTexture/RenderCopy
+         * возвращают успех, а пиксели на экран не попадают — потому
+         * «проверять rc» мало, проверяем ПИКСЕЛИ. */
+        SW_DIAG_STAGE("pause:draw");
+        int bg_mode = 0;
+        if (!(g_texture && g_renderer)) {
+            bg_mode = 2; /* фоновая текстура игры недоступна — чёрный фон */
+            {
+                static uint64_t s_pbg_last = 0;
+                uint64_t nowp = sdl_switch_ui_ticks_ms();
+                if (nowp - s_pbg_last >= 10000 || !s_pbg_last) {
+                    s_pbg_last = nowp;
+                    sw_trace_force("[PAUSE-BG] game texture unavailable — "
+                                   "drawing menu on black background");
+                }
             }
-            SDL_RenderCopy(g_renderer, g_texture, NULL,
-                           &(SDL_Rect){x, y, w, h});
+        } else if (s_pause_cpu_bg) {
+            bg_mode = 1; /* слепота замечена — CPU-фон единственной текстурой */
         }
-        /* overlay */
-        for (int i = 0; i < SWITCH_UI_WIDTH * SWITCH_UI_HEIGHT; i++)
-            cv[i] = 0x90000000u;
+        if (g_renderer) {
+            if (bg_mode == 0) {
+                const SwitchSettings* st = switch_settings_get();
+                int eff_scale = (g_pg_scale >= 0) ? g_pg_scale : st->scale_mode;
+                /* v36.15: текстура сессии содержит ПОВЁРНУТЫЙ кадр — считаем
+                 * прямоугольник в повёрнутой геометрии (та же математика,
+                 * что в sdl_switch_present_game). */
+                int rot = (g_rot_mode && g_rot_buf) ? g_rot_mode : 0;
+                int dwr = rot ? ctx->height : ctx->width;
+                int dhr = rot ? ctx->width  : ctx->height;
+                int x, y, w, h;
+                switch_scaling_game_rect(eff_scale, dwr, dhr,
+                                         SWITCH_UI_WIDTH, SWITCH_UI_HEIGHT,
+                                         &x, &y, &w, &h);
+                SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
+                SDL_RenderClear(g_renderer);
+                if (eff_scale == NOJME_SCALE_FIT_BLUR && g_bg_tex && g_bg_buf) {
+                    SDL_RenderCopy(g_renderer, g_bg_tex, NULL, NULL);
+                }
+                SDL_RenderCopy(g_renderer, g_texture, NULL,
+                               &(SDL_Rect){x, y, w, h});
+            } else {
+                /* bg_mode 1/2: только RenderClear — весь кадр соберёт
+                 * ui-текстура (CPU-фон или чёрный лежат в cv) */
+                SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
+                SDL_RenderClear(g_renderer);
+            }
+        }
+        /* overlay: заполнение фона канвы по режиму */
+        if (bg_mode == 1) {
+            int bg_ok = sdl_switch_ui_game_frame_bg(cv, SWITCH_UI_WIDTH,
+                                                    SWITCH_UI_HEIGHT);
+            if (bg_ok) {
+                /* 50% затемнение сплошняком (без GL-блендинга) */
+                for (int i = 0; i < SWITCH_UI_WIDTH * SWITCH_UI_HEIGHT; i++)
+                    cv[i] = ((cv[i] & 0xFEFEFE) >> 1) | 0xFF000000u;
+            } else {
+                /* settled-кадра тоже нет (пауза на загрузке) — чёрный */
+                for (int i = 0; i < SWITCH_UI_WIDTH * SWITCH_UI_HEIGHT; i++)
+                    cv[i] = 0xFF000000u;
+            }
+        } else if (bg_mode == 2) {
+            for (int i = 0; i < SWITCH_UI_WIDTH * SWITCH_UI_HEIGHT; i++)
+                cv[i] = 0xFF000000u; /* чёрный непрозрачный (идея юзера) */
+        } else {
+            for (int i = 0; i < SWITCH_UI_WIDTH * SWITCH_UI_HEIGHT; i++)
+                cv[i] = 0x90000000u;
+        }
         {
-            /* v36.19: заголовок по центру + три пункта с полосой выделения
-             * (синий акцент и цвета — как в списках switch_ui.c) */
-            const char* items[3] = {
-                switch_text(ST_PAUSE_RESUME),    /* Продолжить */
-                switch_text(ST_PAUSE_SETTINGS),  /* Настройки игры */
-                switch_text(ST_PAUSE_EXIT)       /* Выйти */
+            /* v36.19→v36.87: заголовок по центру + ЧЕТЫРЕ пункта с полосой
+             * выделения (синий акцент и цвета — как в списках switch_ui.c) */
+            const char* items[4] = {
+                switch_text(ST_PAUSE_RESUME),     /* Продолжить */
+                switch_text(ST_PAUSE_SETTINGS),   /* Настройки игры */
+                switch_text(ST_PAUSE_CONTROLS),   /* Управление (v36.87) */
+                switch_text(ST_PAUSE_EXIT)        /* Выйти */
             };
             const int row_h = 44, row_step = 48, y0 = 300;
             const uint32_t COL_BAR   = 0xFF2E7CF6u; /* COL_SEL_BG switch_ui.c */
@@ -2755,9 +3798,135 @@ static void sdl_switch_pause_menu(SdlContext* ctx) {
         switch_ui_batt_badge_draw(cv, SWITCH_UI_WIDTH, SWITCH_UI_HEIGHT,
                                   switch_settings_get()->battery_display);
         if (g_ui_tex && g_renderer) {
-            SDL_UpdateTexture(g_ui_tex, NULL, cv, SWITCH_UI_WIDTH * sizeof(uint32_t));
-            SDL_RenderCopy(g_renderer, g_ui_tex, NULL, NULL);
-            SDL_RenderPresent(g_renderer);
+            /* v36.76 [MENU-STALL]: отдельный маркер для выдачи — блок в
+             * SDL_RenderPresent (клин драйвера) отличим от рисования.
+             * v36.81: rc-проверки как у ui_present (отказ больше не
+             * тихий: 1 отказ → пересоздать ui-текстуру и повторить кадр;
+             * счётчик uipf виден в menu alive / [TEX]) + СЛЕПАЯ ПРОБА
+             * (см. [PAUSE-FALLBACK] выше): ищем полосу выделения в
+             * ГОТОВОМ кадре до RenderPresent — раз в секунду. */
+            SW_DIAG_STAGE("pause:present");
+            int upl_rc = SDL_UpdateTexture(g_ui_tex, NULL, cv,
+                                           SWITCH_UI_WIDTH * sizeof(uint32_t));
+            tex_note_up(TI_UI, upl_rc);
+            int copy_rc = -1;
+            if (upl_rc == 0) {
+                copy_rc = SDL_RenderCopy(g_renderer, g_ui_tex, NULL, NULL);
+                if (copy_rc == 0) {
+                    /* [PAUSE-BLIND]: до RenderPresent задний буфер
+                     * определён — читаем строки середины всех трёх
+                     * пунктов; сплошная полоса COL_BAR обязана найтись. */
+                    {
+                        static uint64_t s_blind_last = 0;
+                        uint64_t nowb = sdl_switch_ui_ticks_ms();
+                        if (nowb - s_blind_last >= 1000 || !s_blind_last) {
+                            s_blind_last = nowb;
+                            int blind = 0;
+                            static int s_blind_sim = -1;
+                            if (s_blind_sim < 0) {
+                                const char* sim = getenv("NOJME_PAUSE_BLIND_SIM");
+                                s_blind_sim = (sim && sim[0] && sim[0] != '0') ? 1 : 0;
+                            }
+                            if (s_blind_sim) {
+                                blind = 1; /* песочная имитация слепоты */
+                            } else {
+                                uint32_t row[SWITCH_UI_WIDTH];
+                                /* v36.87: 4 пункта — пробы по серединам
+                                 * всех четырёх строк (300/348/396/444+22) */
+                                const int probe_ys[4] = {
+                                    300 + 22, 348 + 22, 396 + 22, 444 + 22
+                                };
+                                int found = 0, fails = 0;
+                                for (int k = 0; k < 4 && !found; k++) {
+                                    SDL_Rect r = { 0, probe_ys[k],
+                                                   SWITCH_UI_WIDTH, 1 };
+                                    if (SDL_RenderReadPixels(g_renderer, &r,
+                                            SDL_PIXELFORMAT_ARGB8888,
+                                            row, sizeof(row)) != 0) {
+                                        fails++;
+                                        continue;
+                                    }
+                                    for (int i = 0; i < SWITCH_UI_WIDTH; i++) {
+                                        if (row[i] == 0xFF2E7CF6u) {
+                                            found = 1;
+                                            break;
+                                        }
+                                    }
+                                }
+                                /* fails==3 — проба не удалась (НЕ слепота);
+                                 * нашли полосу — оверлей реально в кадре */
+                                blind = (!found && fails == 0);
+                            }
+                            if (blind) {
+                                s_pause_blind_streak++;
+                                {
+                                    static uint64_t s_bl_log = 0;
+                                    uint64_t nowl = sdl_switch_ui_ticks_ms();
+                                    if (nowl - s_bl_log >= 2000 || !s_bl_log) {
+                                        s_bl_log = nowl;
+                                        sw_trace_force("[PAUSE-BLIND] overlay not "
+                                                       "reaching the target "
+                                                       "(streak %d) — switching "
+                                                       "to CPU background",
+                                                       s_pause_blind_streak);
+                                    }
+                                }
+                                s_pause_cpu_bg = 1; /* следующий кадр — bg_mode 1 */
+                                if (s_pause_blind_streak >= 2) {
+                                    /* Дважды слепы: одна ui-текстура без
+                                     * игровой/блендинга тоже не доходит —
+                                     * рендерер мёртв. Лечим ЗДЕСЬ (цикл
+                                     * паузы владеет выдачей): стадия 2
+                                     * (software) или 4, если 2 уже была. */
+                                    int stage = (s_wedge_stage_done >= 2) ? 4 : 2;
+                                    s_wedge_ever_fired = 1;
+                                    sw_trace_force("[PAUSE-BLIND] x%d — wedge "
+                                                   "recovery right from the "
+                                                   "pause (stage %d)",
+                                                   s_pause_blind_streak, stage);
+                                    sdl_wedge_recover(ctx, stage);
+                                    s_wedge_stage_done = stage;
+                                    s_pause_blind_streak = 0;
+                                    /* ui-текстура пересоздана лечением;
+                                     * следующий кадр паузы рисуется уже
+                                     * в здоровый рендерер */
+                                }
+                            } else {
+                                if (s_pause_blind_streak)
+                                    sw_trace("[PAUSE-BLIND] overlay visible "
+                                             "again");
+                                s_pause_blind_streak = 0;
+                            }
+                        }
+                    }
+                    SDL_RenderPresent(g_renderer);
+                }
+            }
+            if (upl_rc != 0 || copy_rc != 0) {
+                /* отказ аплоада/копирования: [UI-PRESENT-GUARD]-модель */
+                __sync_fetch_and_add(&g_sd_uipf, 1);
+                {
+                    static uint64_t s_pupf_log = 0;
+                    uint64_t nowf = sdl_switch_ui_ticks_ms();
+                    if (nowf - s_pupf_log >= 10000 || !s_pupf_log) {
+                        s_pupf_log = nowf;
+                        sw_trace_force("[UI-PRESENT-FAIL] pause: %s: %.100s",
+                                       upl_rc ? "UpdateTexture" : "RenderCopy",
+                                       SDL_GetError());
+                    }
+                }
+                if (sdl_switch_ui_tex_recreate("pause present failed") == 0) {
+                    upl_rc = SDL_UpdateTexture(g_ui_tex, NULL, cv,
+                                               SWITCH_UI_WIDTH * sizeof(uint32_t));
+                    tex_note_up(TI_UI, upl_rc);
+                    if (upl_rc == 0) {
+                        copy_rc = SDL_RenderCopy(g_renderer, g_ui_tex,
+                                                 NULL, NULL);
+                        if (copy_rc == 0)
+                            SDL_RenderPresent(g_renderer);
+                    }
+                }
+            }
         }
         SDL_Delay(16);
     }
@@ -2791,6 +3960,8 @@ static void sdl_switch_pause_menu(SdlContext* ctx) {
      * learns the keys are up (key_level bits clear) and the repeat slots
      * cannot stay latched. Only on resume; on exit the session is over. */
     sdl_pause_release_captured(ctx, !exit_game);
+    s_pause_cpu_bg = 0;       /* v36.81 [PAUSE-FALLBACK]: резюм — штатный путь */
+    s_pause_blind_streak = 0;
     sw_trace("pause: close"); /* v34.91 */
     LOG_SAFE("[SWITCH] pause menu close\n");
 }
@@ -3351,8 +4522,21 @@ void sdl_process_events(SdlContext* ctx) {
              * contract as before. */
             sdl_switch_pause_menu(ctx);
         }
+        /* v36.87 [STICK-DIAG]: путь крестовины в режиме ЦИФР (swap ON)
+         * получил зоны кейпада — симметрично стику: две смежные кнопки
+         * крестовины = диагональ 1/3/7/9. В BOTH одиночные кнопки шлют
+         * свои цифры КАК РАНЬШЕ (зона добавляет только диагональную);
+         * в DIGITS кнопки крестовины ВООБЩЕ не диспетчеризуются поштучно —
+         * только зоны (ровно одна цифра в каждый момент). */
+        int diag_dpad = sdl_dpad_path_digits(0) ? g_pg_stick_diag : NOJME_DIAG_OFF;
+        int dpad_zone_skip =
+            (diag_dpad == NOJME_DIAG_DIGITS); /* DIGITS: зоны вместо кнопок */
         for (int b = 0; b < 16; b++) {
             if (b == SWJB_MINUS || b == SWJB_PLUS) continue; /* handled above */
+            if (dpad_zone_skip &&
+                (b == SWJB_UP || b == SWJB_DOWN ||
+                 b == SWJB_LEFT || b == SWJB_RIGHT))
+                continue; /* v36.87: зоны крестовины диспетчеризуют ниже */
             uint16_t bit = (uint16_t)(1u << b);
             if (press & bit) {
                 SDL_Keycode mapped = switch_joy_button_to_keycode(b);
@@ -3371,6 +4555,28 @@ void sdl_process_events(SdlContext* ctx) {
             if (release & bit) {
                 SDL_Keycode mapped = switch_joy_button_to_keycode(b);
                 if (mapped) sdl_handle_key_event(ctx, mapped, false, false);
+            }
+        }
+        /* v36.87 [STICK-DIAG]: зоны крестовины-цифр (после поштучной
+         * диспетчеризации кнопок этого же насоса — held уже содержит
+         * новые нажатия; prev — предыдущее состояние того же слота). */
+        if (diag_dpad != NOJME_DIAG_OFF) {
+            int z_now = sdl_dir_mask_rot(sdl_dpad_zone_from_held(g_sw_in.held[i]));
+            int z_prev = sdl_dir_mask_rot(sdl_dpad_zone_from_held(g_sw_in.prev[i]));
+            if (diag_dpad == NOJME_DIAG_DIGITS) {
+                SDL_Keycode kz = sdl_dir_zone_digit(z_now);
+                SDL_Keycode pz = sdl_dir_zone_digit(z_prev);
+                if (pz && pz != kz)
+                    sdl_handle_key_event(ctx, pz, false, false);
+                if (kz && kz != pz)
+                    sdl_diag_dispatch_edge(ctx, kz, true, "zone");
+            } else { /* BOTH: только диагональная «пятая клавиша» */
+                SDL_Keycode kd = sdl_dir_diag_digit(z_now);
+                SDL_Keycode pd = sdl_dir_diag_digit(z_prev);
+                if (pd && pd != kd)
+                    sdl_handle_key_event(ctx, pd, false, false);
+                if (kd && kd != pd)
+                    sdl_diag_dispatch_edge(ctx, kd, true, "zone");
             }
         }
         sdl_switch_dir_dispatch(ctx, i);
@@ -3801,6 +5007,27 @@ void sdl_run(SdlContext* ctx) {
     /* Normal SDL2 mode with window - main loop */
     uint64_t last_time = SDL_GetTicks();
     const uint64_t frame_time = 1000 / ctx->target_fps;
+    /* v36.85 [TURBO-FF]: темп цикла насоса. Обычный режим — 60 Гц
+     * (frame_time=16/17 мс): рукопожатие serviceRepaints просыпается к
+     * следующей итерации, т.е. кадр игры квантуется шагом цикла. В турбо
+     * (g_jvm_thread_budget==0) цикл ускоряется до NOJME_TURBO_LOOP_MS
+     * (дефолт 8 мс, 0 = старый темп): раннер, ждущий насос, получает
+     * paint вдвое-втрое быстрее, present-декимация выше не даёт этому
+     * ускорению стоить лишних выдач. Цикл быстрее 4 мс запрещён —
+     * SDL_Delay(1)+switch потока съедят всю выгоду. */
+    uint64_t eff_frame_time = frame_time;
+    {
+        static long s_turbo_loop_ms = -2;
+        if (s_turbo_loop_ms == -2) {
+            const char* le = getenv("NOJME_TURBO_LOOP_MS");
+            s_turbo_loop_ms = (le && le[0]) ? atol(le) : 8;
+        }
+        if (s_turbo_loop_ms >= 4) {
+            extern long g_jvm_thread_budget; /* 0 = turbo */
+            if (g_jvm_thread_budget == 0)
+                eff_frame_time = (uint64_t)s_turbo_loop_ms;
+        }
+    }
     
     ctx->needs_redraw = true;
     uint64_t last_auto_redraw = SDL_GetTicks();
@@ -3962,16 +5189,122 @@ void sdl_run(SdlContext* ctx) {
             sd_stage_max(&g_sd_sj_ms_max, &sd_sj_t0);
         }
 
+        /* v50 (Asphalt image freeze): end-of-frame vsync tick — game-thread
+         * serviceRepaints() paces itself on this (KVM vblank semantics).
+         *
+         * v36.84 [ZPERF-TBP]: тик ПЕРЕД present, не после. Порядок до
+         * сих пор был «present -> тик»: игровой поток, стоявший в
+         * vsync-пейсинге serviceRepaints, просыпался ТОЛЬКО после
+         * present — а на консоли present дорогой (софтовый рендерер
+         * v36.82 + масштабирование в CPU: pv≈10-25 мс). Итог: каждый кадр
+         * логика игры СЕРИАЛИЗОВАЛАСЬ ПОСЛЕ present, вместо того чтобы
+         * идти с ним параллельно на другом ядре. Тик перед present
+         * разблокирует раннер сразу по завершении paint — его следующий
+         * тик логики и лимитер кадра перекрываются с present-блоком
+         * фронтенда. Насос paint кадра N+1 всё равно стартует только
+         * после present N (последовательный цикл), так что гонки с
+         * текстурой/кадром нет: меняется лишь то, ЧТО делает раннер,
+         * пока фронтенд занят выдачей. KVM-семантика «ровно один тик
+         * между serviceRepaints» сохранена. NOJME_VSYNC_BEFORE_PRESENT=0
+         * возвращает старый порядок (A/B и полевой килл-свитч). */
+        SW_DIAG_STAGE("vsync");
+        {
+            static int s_tbp = -1;
+            if (s_tbp < 0) {
+                const char* v = getenv("NOJME_VSYNC_BEFORE_PRESENT");
+                s_tbp = (v && v[0] && atoi(v) == 0) ? 0 : 1;
+            }
+            if (s_tbp) {
+                extern void midp_vsync_tick(void);
+                midp_vsync_tick();
+                __sync_fetch_and_add(&g_sd_vs, 1);
+            }
+        }
+
         SW_DIAG_STAGE("present");
 #ifdef __SWITCH__
         /* v34.94 ASPECT FIX: the old inline RenderCopy used a NULL dst rect —
          * SDL stretched the game texture over the WHOLE screen regardless of
          * the Масштаб setting (the pause menu drew with the correct rect,
          * which is exactly the user's "только в паузе пропорции верные").
-         * Present through the same path the pause menu uses. */
-        SDL_LOCK();
-        sdl_switch_present_game(ctx);
-        SDL_UNLOCK();
+         * Present through the same path the pause menu uses.
+         *
+         * v36.77 [PERF-PRESENT]: present ON DEMAND. Полевой лог v36.76:
+         * loop=300 при fl=100 (skip=200!) и pv=11.5 мс/кадр — 60 Гц цикл
+         * дважды из трёх презентовал СТАРУЮ копию, а каждый present БЛОКИРОВАЛ
+         * главный поток в vsync-свапе (EGL interval 1) на 2/3 кадра. Весь
+         * интерпретатор (кооперативные ucontext-потоки) живёт в ЭТОМ ЖЕ
+         * потоке — во время vsync-блока JVM стоит. Игра с sleep(20) получала
+         * ~25% CPU и будильники, квантованные итерацией 16.7 мс: 20 сеттлов/с
+         * вместо ~45. Теперь present идёт только когда settled-seq продвинулся
+         * (в любую сторону — новый сеттл или сброс сессии), либо раз в 250 мс
+         * heartbeat (батарея/FPS-полоса/экран загрузки не замерзают), либо
+         * present по старой схеме при NOJME_PRESENT_ONDEMAND=0. Пропуск не
+         * задерживает прямую доставку кадра: midp_present_settle_if_stale
+         * зовётся и без present. midp_vsync_tick уже отработал выше
+         * (v36.84 ZPERF-TBP) — KVM-семантика serviceRepaints сохранена
+         * на каждом цикле. */
+        {
+            static int s_ondemand = -1;
+            if (s_ondemand < 0) {
+                const char* v = getenv("NOJME_PRESENT_ONDEMAND");
+                s_ondemand = (v && v[0] && atoi(v) == 0) ? 0 : 1;
+            }
+            int do_present = 1;
+            if (s_ondemand) {
+                static uint32_t s_pd_last_seq = 0;
+                static int s_pd_armed = 0;
+                static uint64_t s_pd_last_ms = 0;
+                extern uint32_t midp_present_stable_seq(void);
+                uint32_t seq = midp_present_stable_seq();
+                uint64_t nowms = (uint64_t)SDL_GetTicks();
+                if (s_pd_armed && seq == s_pd_last_seq &&
+                    nowms - s_pd_last_ms < 250) {
+                    do_present = 0;
+                    /* прямая доставка живого буфера (dset-путь) не должна
+                     * зависеть от present — сеттл уходит по-прежнему */
+                    extern int midp_present_settle_if_stale(void) __attribute__((weak));
+                    if (midp_present_settle_if_stale)
+                        (void)midp_present_settle_if_stale();
+                    __sync_fetch_and_add(&g_sd_pds, 1);
+                } else {
+                    /* v36.85 [TURBO-FF]: декимация present в турбо. Смысл
+                     * турбо = максимум ИГРОВОЙ скорости; выдача кадра на
+                     * экран — дорогая (софт-рендерер v36.82: UpdateTexture +
+                     * масштаб + RenderPresent ≈ 10-25 мс на консоли), и в
+                     * турбо она съедает то самое ускорение. В турбо present
+                     * не чаще раза в NOJME_TURBO_PRESENT_MS (дефолт 66 мс ≈
+                     * 15 fps экрана; 0 = каждый кадр как раньше). 250-мс
+                     * heartbeat выше остаётся вторым гарантом — батарея/FPS
+                     * полоса/экран загрузки не замерзают. */
+                    static long s_turbo_present_ms = -2;
+                    long tpm = 0;
+                    if (s_turbo_present_ms == -2) {
+                        const char* te = getenv("NOJME_TURBO_PRESENT_MS");
+                        s_turbo_present_ms = (te && te[0]) ? atol(te) : 66;
+                    }
+                    tpm = s_turbo_present_ms;
+                    if (tpm > 0 && s_pd_armed) {
+                        extern long g_jvm_thread_budget; /* 0 = turbo */
+                        if (g_jvm_thread_budget == 0 &&
+                            nowms - s_pd_last_ms < (uint64_t)tpm) {
+                            do_present = 0;
+                            __sync_fetch_and_add(&g_sd_pds, 1);
+                        }
+                    }
+                }
+                if (do_present) {
+                    s_pd_armed = 1;
+                    s_pd_last_seq = seq;
+                    s_pd_last_ms = nowms;
+                }
+            }
+            if (do_present) {
+                SDL_LOCK();
+                sdl_switch_present_game(ctx);
+                SDL_UNLOCK();
+            }
+        }
 #else
         SDL_LOCK();
         sdl_update_texture(ctx);
@@ -3981,13 +5314,20 @@ void sdl_run(SdlContext* ctx) {
         SDL_UNLOCK();
 #endif
 
-        /* v50 (Asphalt image freeze): end-of-frame vsync tick — game-thread
-         * serviceRepaints() paces itself on this (KVM vblank semantics). */
+        /* v36.84 [ZPERF-TBP]: тик уже сработал выше (перед present) —
+         * здесь только легаси-порядок при NOJME_VSYNC_BEFORE_PRESENT=0. */
         SW_DIAG_STAGE("vsync");
         {
-            extern void midp_vsync_tick(void);
-            midp_vsync_tick();
-            __sync_fetch_and_add(&g_sd_vs, 1);
+            static int s_tbp2 = -1;
+            if (s_tbp2 < 0) {
+                const char* v = getenv("NOJME_VSYNC_BEFORE_PRESENT");
+                s_tbp2 = (v && v[0] && atoi(v) == 0) ? 0 : 1;
+            }
+            if (!s_tbp2) {
+                extern void midp_vsync_tick(void);
+                midp_vsync_tick();
+                __sync_fetch_and_add(&g_sd_vs, 1);
+            }
         }
 
         SW_DIAG_STAGE("pace");
@@ -4012,7 +5352,7 @@ void sdl_run(SdlContext* ctx) {
 #endif
         current_time = SDL_GetTicks();
         uint64_t elapsed = current_time - last_time;
-        if (elapsed < frame_time) {
+        if (elapsed < eff_frame_time) {
             SDL_Delay(1);
         }
         last_time = SDL_GetTicks();

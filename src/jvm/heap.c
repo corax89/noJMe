@@ -971,14 +971,77 @@ static void heap_stage_trace(const char* fmt, ...) {
     }
 }
 
+/* v36.85 [ARENA-PARK]: слоты парковки арены (см. блок в heap_init и
+ * heap_destroy). Живут в статике heap.c; указатели на них раздаются
+ * init/destroy через эти глобалы (destroy зовётся из jvm_destroy без
+ * доступа к static-контексту heap_init). */
+static uint8_t** g_arena_park_ptr  = NULL;
+static size_t*   g_arena_park_size = NULL;
+static int       g_arena_reused    = 0;
+static int       g_arena_park_on   = -1; /* env-кэш NOJME_ARENA_PARK */
+
 int heap_init(JVM* jvm, size_t initial_size, size_t max_size) {
     (void)jvm; (void)max_size;
-    
+
     /* v19: the underlying buffer also holds the emergency reserve.
      * heap.end stays at start+initial_size (normal/GC watermarks unchanged);
      * heap.hard_end marks the true end of the buffer. */
     size_t buffer_size = initial_size + HEAP_EMERGENCY_RESERVE;
-    
+
+    /* v36.85 [ARENA-PARK]: мульти-сессионная парковка арены кучи.
+     * Полевой краш-дамп (Data Abort @0x8, "Out of memory" в регистрах, SDL
+     * window-путь, вылет после нескольких открытий/закрытий игр): каждая
+     * сессия аллоцировала свежие 64 МБ (heap_size_mb=64) и освобождала их
+     * на teardown — но newlib НЕ возвращает освобождённые мегаблоки
+     * прозрачно: образы/текстуры/буферы следующей сессии вырезают куски из
+     * освобождённого 64-МБ чанка, и когда ОЧЕРЕДНАЯ арена не влезает в
+     * остаток, куча растёт ещё на 64 МБ. Несколько сессий — исчерпание
+     * hbloader-хипа, OOM в SDL-аллокациях, вылет по NULL+8.
+     * Лечение: арена живёт ВЕСЬ процесс. heap_destroy не освобождает буфер,
+     * а ПАРКУЕТ его (zero-fill + сохранить указатель/размер); heap_init
+     * переиспользует припаркованный буфер, если он не меньше запрошенного
+     * (end/hard_end считаются от ЗАПРОШЕННОГО размера — хвост просто не
+     * используется). Нужна арена БОЛЬШЕ припаркованной — освобождаем и
+     * берём свежую (редкий случай: per-game heap override вверх).
+     * Бонус безопасности: зомби-раннер, пишущий в арены между сессиями,
+     * раньше писал в ОСВОБОЖДЁННЫЙ чанк (порча метаданных аллокатора,
+     * крэш) — теперь пишет в наш частный буфер, который heap_init всё
+     * равно переинициализирует.
+     * Рубильник: NOJME_ARENA_PARK=0 — старое поведение (free на каждой
+     * teardown). */
+    {
+        static uint8_t* s_parked_arena = NULL;
+        static size_t   s_parked_bytes = 0;
+        if (g_arena_park_on < 0) {
+            const char* e = getenv("NOJME_ARENA_PARK");
+            g_arena_park_on = (e && e[0] == '0') ? 0 : 1;
+        }
+        g_arena_park_ptr  = &s_parked_arena;
+        g_arena_park_size = &s_parked_bytes;
+        if (g_arena_park_on && s_parked_arena) {
+            if (s_parked_bytes >= buffer_size) {
+                heap.start = s_parked_arena;
+                heap_stage_trace("heap: reusing parked arena %u KB for %u KB request",
+                                 (unsigned)(s_parked_bytes / 1024),
+                                 (unsigned)(buffer_size / 1024));
+                s_parked_arena = NULL; /* отдано текущей сессии */
+                s_parked_bytes = 0;
+                g_arena_reused = 1;
+            } else {
+                /* припаркованная меньше запрошенной — выкинуть, взять свежую */
+#if defined(_WIN32) || defined(_WIN64)
+                _aligned_free(s_parked_arena);
+#else
+                free(s_parked_arena);
+#endif
+                s_parked_arena = NULL;
+                s_parked_bytes = 0;
+                heap_stage_trace("heap: parked arena too small — fresh alloc");
+            }
+        }
+    }
+
+    if (!g_arena_reused) {
     /* Выравниваем начальный адрес кучи */
 #if defined(_WIN32) || defined(_WIN64)
     /* Windows: использование _aligned_malloc */
@@ -1042,6 +1105,7 @@ int heap_init(JVM* jvm, size_t initial_size, size_t max_size) {
         return JNI_ERR;
     }
 #endif
+    } /* !g_arena_reused: свежая аллокация завершена */
 
     /* v36.13 ZERO-FILL ("хип просто заполнять нулями"): the pool used to be
      * left with whatever malloc returned — typically the PREVIOUS session's
@@ -1053,8 +1117,12 @@ int heap_init(JVM* jvm, size_t initial_size, size_t max_size) {
      * loudly (is_heap_ptr range + type checks + the [STR-CHARS-NULL]
      * trace), never masquerades as a live object of the past session.
      * Cost: one 32 MB memset per session (~5-10 ms on HOS) — noise next
-     * to the session start budget. */
+     * to the session start budget.
+     * v36.85 [ARENA-PARK]: memset остаётся и для ПЕРЕИСПОЛЬЗОВАННОЙ арены —
+     * zero-fill при парковке не гарантирует чистоту (зомби-раннер мог
+     * писать в буфер между сессиями); детерминизм важнее 5-10 мс. */
     memset(heap.start, 0, buffer_size);
+    g_arena_reused = 0; /* сброс флага для следующей init */
 
     heap.current = heap.start;
     heap.end = heap.start + initial_size;
@@ -1116,32 +1184,51 @@ static void gc_mark_stack_destroy(void);
 void heap_destroy(JVM* jvm) {
     (void)jvm;
 
-    /* CRITICAL FIX: Use _aligned_free on Windows for memory allocated with _aligned_malloc!
-     * Using free() on _aligned_malloc memory causes heap corruption and crashes.
-     * The _aligned_malloc functions use a special header to track alignment,
-     * and _aligned_free knows how to find the original allocation address.
-     */
+    /* v36.85 [ARENA-PARK]: буфер арены больше НЕ освобождается — он
+     * ПАРКУЕТСЯ на следующий процесс-глобальный слот и переиспользуется
+     * ближайшим heap_init (полное обоснование — комментарий [ARENA-PARK]
+     * в heap_init). Полевая проблема: 64-МБ malloc/free на каждую сессию
+     * при выключенной парковке фрагментировал newlib-кучу — после
+     * нескольких открытий/закрытий игр очередная арена не влезала,
+     * процесс шёл к OOM, и следущая же SDL-аллокация падала по NULL+8
+     * (краш-дамп "Out of memory"). ZERO-FILL сохранён: (а) зомби-раннер
+     * пишет в видимые нули, (б) следующая сессия стартует из
+     * детерминированного нулевого пула. NOJME_ARENA_PARK=0 — старое
+     * поведение (free каждый teardown). */
+    if (g_arena_park_on < 0) {
+        const char* e = getenv("NOJME_ARENA_PARK");
+        g_arena_park_on = (e && e[0] == '0') ? 0 : 1;
+    }
+    if (heap.start) {
+        if (g_arena_park_on && g_arena_park_ptr && g_arena_park_size &&
+            !*g_arena_park_ptr) {
+            /* нулевой fill + парковка: слот свободен (иначе — арена уже
+             * занята кем-то; этот free-путь — только для страховки) */
+            memset(heap.start, 0, (size_t)(heap.hard_end - heap.start));
+            *g_arena_park_ptr  = heap.start;
+            *g_arena_park_size = (size_t)(heap.hard_end - heap.start);
+            heap_stage_trace("heap: arena parked %u KB for next session",
+                             (unsigned)((size_t)(heap.hard_end - heap.start) / 1024));
+        } else {
 #if defined(_WIN32) || defined(_WIN64)
-    if (heap.start) {
-        _aligned_free(heap.start);
-    }
+            _aligned_free(heap.start);
 #else
-    if (heap.start) {
-        /* v36.13 ZERO-FILL before free (the "хип нулями" half): (a) a
-         * zombie runner that ignored the kill and still writes through a
-         * heap pointer now writes into a visible zero field instead of
-         * silently corrupting whatever malloc reuses the block for;
-         * (b) the freed pool can never be fingerprinted as "last session's
-         * heap" by a stale pointer aliasing into the NEXT session's
-         * malloc — zeros fail every object-header validation. */
-        memset(heap.start, 0, (size_t)(heap.hard_end - heap.start));
-        free(heap.start);
-    }
+            /* v36.13 ZERO-FILL before free (the "хип нулями" half): (a) a
+             * zombie runner that ignored the kill and still writes through a
+             * heap pointer now writes into a visible zero field instead of
+             * silently corrupting whatever malloc reuses the block for;
+             * (b) the freed pool can never be fingerprinted as "last session's
+             * heap" by a stale pointer aliasing into the NEXT session's
+             * malloc — zeros fail every object-header validation. */
+            memset(heap.start, 0, (size_t)(heap.hard_end - heap.start));
+            free(heap.start);
 #endif
-    
+        }
+    }
+
     free(heap.roots);
     gc_mark_stack_destroy();  /* Free the GC mark stack */
-    
+
     heap.start = NULL;
     heap.current = NULL;
     heap.end = NULL;
@@ -2970,6 +3057,53 @@ void gc_collect(JVM* jvm) {
                 {
                     extern void jvm_dump_all_threads(void);
                     jvm_dump_all_threads();
+                }
+                /* v36.73 [GC-STRAGGLER]: the dump above goes to stderr —
+                 * INVISIBLE in the device log.txt. The v36.72 field trace
+                 * froze 17 s at java/lang/Thread.start with zero names:
+                 * every GC abort-retry cycle stop-the-worlds all mutators
+                 * for up to 2 s while ONE straggler sits inside a native
+                 * that never polls safepoints, and the log could not say
+                 * WHICH. Mirror the abort dump into the trace channel
+                 * (same pattern as jvm_destroy's [JVM-DESTROY] dump):
+                 * the per-thread td lines carry nat=/age=/why=/monenter= —
+                 * the straggler is the runner with the big age and no
+                 * park reason. Throttled to once per backoff window. */
+                {
+                    extern void sw_trace_force(const char* fmt, ...)
+                        __attribute__((weak));
+                    extern void jvm_threads_dump_snprint(JVM* jvm, char* buf,
+                                                         size_t cap, int deep);
+                    if (&sw_trace_force && sw_trace_force) {
+                        static jlong s_last_straggler_ms = -4000;
+                        struct timespec st_ts;
+                        clock_gettime(CLOCK_MONOTONIC, &st_ts);
+                        jlong st_now = (jlong)st_ts.tv_sec * 1000 +
+                                       st_ts.tv_nsec / 1000000;
+                        if (st_now - s_last_straggler_ms >= 4000) {
+                            s_last_straggler_ms = st_now;
+                            sw_trace_force("[GC-STRAGGLER] census %d/%d after "
+                                           "2000ms — GC ABORTED, mutators frozen; "
+                                           "straggler = the tN line with a big "
+                                           "age and no why=", arrived, expected);
+                            static char dump[4096];
+                            jvm_threads_dump_snprint(jvm, dump, sizeof(dump), 0);
+                            char* p = dump;
+                            int lines = 0;
+                            while (p && *p && lines < 24) {
+                                char* nl = strchr(p, '\n');
+                                size_t len = nl ? (size_t)(nl - p) : strlen(p);
+                                char one[320];
+                                if (len >= sizeof(one)) len = sizeof(one) - 1;
+                                memcpy(one, p, len);
+                                one[len] = '\0';
+                                if (one[0]) sw_trace_force("%s", one);
+                                lines++;
+                                if (!nl) break;
+                                p = nl + 1;
+                            }
+                        }
+                    }
                 }
                 gc_in_progress = false;
                 jvm_gc_safepoint_release_local();

@@ -411,6 +411,93 @@ static void pergame_path(char* out, size_t cap, const char* jar_path) {
     snprintf(out, cap, "%s/" NOJME_PERGAME_DIR "/%.180s.ini", base, name);
 }
 
+/* ================= v36.87 [PG-CONTROLS]: словарь управления =================
+ * Хелперы общего словаря: имена кнопок консоли (A..R3) и целевых клавиш
+ * (NOJME_BTNK_*). Порядок g_ctl_keys[] = порядок строк пикера клавиш;
+ * индекс массива СОВПАДАЕТ с кодом NOJME_BTNK_* (g_ctl_keys[k].k == k). */
+static const char* const g_ctl_btn_names[NOJME_CTL_BTN_COUNT] = {
+    "A", "B", "X", "Y", "L", "R", "ZL", "ZR", "L3", "R3"
+};
+
+/* Имя кнопки (ini-ключ btn.<name> / строка UI) -> индекс 0..9, -1 = нет. */
+static int switch_ctl_btn_index(const char* name) {
+    if (!name || !name[0]) return -1;
+    for (int i = 0; i < NOJME_CTL_BTN_COUNT; i++)
+        if (!strcmp(name, g_ctl_btn_names[i])) return i;
+    return -1;
+}
+
+/* Индекс кнопки -> короткое имя (статичная строка; "?" при выходе за диапазон). */
+static const char* switch_ctl_btn_name(int i) {
+    if (i < 0 || i >= NOJME_CTL_BTN_COUNT) return "?";
+    return g_ctl_btn_names[i];
+}
+
+static const struct {
+    int         k;    /* NOJME_BTNK_* (== индекс в массиве) */
+    const char* ini;  /* слово в ini (btn.A=<ini>) */
+} g_ctl_keys[NOJME_BTNK_COUNT] = {
+    { NOJME_BTNK_DEFAULT, "default" },
+    { NOJME_BTNK_0,    "0" },
+    { NOJME_BTNK_1,    "1" },
+    { NOJME_BTNK_2,    "2" },
+    { NOJME_BTNK_3,    "3" },
+    { NOJME_BTNK_4,    "4" },
+    { NOJME_BTNK_5,    "5" },
+    { NOJME_BTNK_6,    "6" },
+    { NOJME_BTNK_7,    "7" },
+    { NOJME_BTNK_8,    "8" },
+    { NOJME_BTNK_9,    "9" },
+    { NOJME_BTNK_STAR,   "star" },
+    { NOJME_BTNK_HASH,   "hash" },
+    { NOJME_BTNK_SOFT1,  "soft1" },
+    { NOJME_BTNK_SOFT2,  "soft2" },
+    { NOJME_BTNK_CLEAR,  "clear" },
+    { NOJME_BTNK_UP,     "up" },
+    { NOJME_BTNK_DOWN,   "down" },
+    { NOJME_BTNK_LEFT,   "left" },
+    { NOJME_BTNK_RIGHT,  "right" },
+};
+
+/* ini-слово -> NOJME_BTNK_*; -1 = не распознано. */
+static int switch_btnk_parse(const char* val) {
+    if (!val || !val[0]) return -1;
+    for (int i = 0; i < NOJME_BTNK_COUNT; i++)
+        if (!strcmp(val, g_ctl_keys[i].ini)) return g_ctl_keys[i].k;
+    return -1;
+}
+
+/* NOJME_BTNK_* -> ini-слово (для записи; вне диапазона -> "default"). */
+static const char* switch_btnk_ini_name(int k) {
+    if (k <= 0 || k >= NOJME_BTNK_COUNT) return "default";
+    return g_ctl_keys[k].ini;
+}
+
+/* NOJME_BTNK_* -> отображаемое имя (пикер и колонка значений).
+ * Цифры/star/hash — ASCII-литералы (одна статическая ячейка: экран
+ * однопоточный, значение копируется в буфер строки немедленно). */
+static const char* switch_btnk_display_name(int k) {
+    switch (k) {
+        case NOJME_BTNK_DEFAULT: return switch_text(ST_CTL_K_DEFAULT);
+        case NOJME_BTNK_STAR:    return "*";
+        case NOJME_BTNK_HASH:    return "#";
+        case NOJME_BTNK_SOFT1:   return switch_text(ST_CTL_K_SOFT1);
+        case NOJME_BTNK_SOFT2:   return switch_text(ST_CTL_K_SOFT2);
+        case NOJME_BTNK_CLEAR:   return switch_text(ST_CTL_K_CLEAR);
+        case NOJME_BTNK_UP:      return switch_text(ST_CTL_K_UP);
+        case NOJME_BTNK_DOWN:    return switch_text(ST_CTL_K_DOWN);
+        case NOJME_BTNK_LEFT:    return switch_text(ST_CTL_K_LEFT);
+        case NOJME_BTNK_RIGHT:   return switch_text(ST_CTL_K_RIGHT);
+        default:
+            if (k >= NOJME_BTNK_0 && k <= NOJME_BTNK_9) {
+                static char d[2] = { 0, 0 };
+                d[0] = (char)('0' + (k - NOJME_BTNK_0));
+                return d;
+            }
+            return switch_text(ST_CTL_K_DEFAULT);
+    }
+}
+
 void switch_pergame_load(const char* jar_path, SwitchPerGameSettings* out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
@@ -423,6 +510,13 @@ void switch_pergame_load(const char* jar_path, SwitchPerGameSettings* out) {
     out->tex_filter = -1; /* v36.11: наследовать глобальную настройку */
     out->rotation = 0;   /* v36.15: поворота нет и наследовать нечего */
     out->input_swap = -1; /* v36.37: наследовать глобальный стик/D-pad swap */
+    out->stick_diag = NOJME_DIAG_DEFAULT; /* v36.87 [STICK-DIAG]: BOTH */
+    for (int i = 0; i < NOJME_CTL_BTN_COUNT; i++)
+        out->ctl_btn[i] = NOJME_BTNK_DEFAULT; /* v36.87 [PG-CONTROLS] */
+    /* v36.81 [PERGAME-RENDER] → v36.82 [SW-ONLY]: поле render УДАЛЕНО —
+     * рендерер один (программный), выбора больше не существует. Ключ
+     * render= в старых ini молча игнорируется парсером (как keyhint=
+     * в v36.48). */
     if (!jar_path || !jar_path[0]) return;
 
     char pbuf[1024];
@@ -488,10 +582,31 @@ void switch_pergame_load(const char* jar_path, SwitchPerGameSettings* out) {
                 out->rotation = 2;
             else out->rotation = 0;
         } else if (strcmp(key, "swap") == 0) {
-            /* v36.37: per-game стик/D-pad swap (inherit/off/on) */
+            /* v36.37: per-game стик/D-pad swap (inherit/off/on).
+             * v36.87 [PG-CONTROLS]: редактируется из экрана «Управление». */
             if (strcmp(val, "on") == 0) out->input_swap = NOJME_SWAP_ON;
             else if (strcmp(val, "off") == 0) out->input_swap = NOJME_SWAP_OFF;
             else out->input_swap = -1;
+        } else if (strcmp(key, "diag") == 0) {
+            /* v36.87 [STICK-DIAG]: диагонали цифрового пути (both/digits/off).
+             * Неизвестное значение -> BOTH (дефолт). */
+            if (strcmp(val, "digits") == 0) out->stick_diag = NOJME_DIAG_DIGITS;
+            else if (strcmp(val, "off") == 0) out->stick_diag = NOJME_DIAG_OFF;
+            else out->stick_diag = NOJME_DIAG_BOTH;
+        } else if (strncmp(key, "btn.", 4) == 0 && key[4]) {
+            /* v36.87 [PG-CONTROLS]: назначение кнопки (btn.A=7 и т.п.).
+             * Имя кнопки -> индекс, значение (слово) -> NOJME_BTNK_*. */
+            int bi = switch_ctl_btn_index(key + 4);
+            if (bi >= 0) {
+                int k = switch_btnk_parse(val);
+                out->ctl_btn[bi] = (k >= 0) ? k : NOJME_BTNK_DEFAULT;
+            }
+        } else if (strcmp(key, "render") == 0) {
+            /* v36.81 [PERGAME-RENDER] → v36.82 [SW-ONLY]: ключ render=
+             * старых pergame ini ПРИНИМАЕТСЯ МОЛЧА (поля больше нет —
+             * рендерер всегда программный; предшественник [KEYHINT-
+             * REMOVE] v36.48 поступил так же с keyhint=). Файлы на
+             * устройствах не требуют чистки. */
         } else if (strcmp(key, "dpad") == 0) {
             /* v36.36→v36.37 МИГРАЦИЯ: pergame dpad=arrows -> swap=off,
              * dpad=digits -> swap=on, inherit -> -1 (см. глобальный парсер) */
@@ -501,10 +616,10 @@ void switch_pergame_load(const char* jar_path, SwitchPerGameSettings* out) {
         }
     }
     fclose(f);
-    ui_log("pergame settings loaded: %s (res=%s%dx%d scale=%d filter=%d flip=%d vm=%d tex=%d rot=%d)\n",
+    ui_log("pergame settings loaded: %s (res=%s%dx%d scale=%d filter=%d flip=%d vm=%d tex=%d rot=%d diag=%d)\n",
            pbuf, out->res_mode ? "" : "auto ", out->res_w, out->res_h,
            out->scale_mode, out->filter, out->flip_mode, out->vm_speed,
-           out->tex_filter, out->rotation);
+           out->tex_filter, out->rotation, out->stick_diag);
 }
 
 int switch_pergame_save(const char* jar_path, const SwitchPerGameSettings* s) {
@@ -556,10 +671,26 @@ int switch_pergame_save(const char* jar_path, const SwitchPerGameSettings* s) {
     if (s->rotation == 1) fprintf(f, "rotation=right\n");
     else if (s->rotation == 2) fprintf(f, "rotation=left\n");
     else fprintf(f, "rotation=off\n");
-    /* v36.37: per-game стик/D-pad swap (старый ключ dpad= исчезает) */
+    /* v36.37: per-game стик/D-pad swap (старый ключ dpad= исчезает).
+     * v36.87 [PG-CONTROLS]: строка переехала в экран «Управление» —
+     * ключ в ini тот же, чтобы существующие файлы сохраняли смысл. */
     if (s->input_swap == NOJME_SWAP_OFF) fprintf(f, "swap=off\n");
     else if (s->input_swap == NOJME_SWAP_ON) fprintf(f, "swap=on\n");
     else fprintf(f, "swap=inherit\n");
+    /* v36.87 [STICK-DIAG]: диагонали цифрового пути */
+    if (s->stick_diag == NOJME_DIAG_DIGITS) fprintf(f, "diag=digits\n");
+    else if (s->stick_diag == NOJME_DIAG_OFF) fprintf(f, "diag=off\n");
+    else fprintf(f, "diag=both\n");
+    /* v36.87 [PG-CONTROLS]: назначения кнопок — пишем ТОЛЬКО отличия от
+     * встроенной раскладки (файл не разбухает; сброс = удаление строк). */
+    for (int i = 0; i < NOJME_CTL_BTN_COUNT; i++) {
+        if (s->ctl_btn[i] == NOJME_BTNK_DEFAULT) continue;
+        fprintf(f, "btn.%s=%s\n", switch_ctl_btn_name(i),
+                switch_btnk_ini_name(s->ctl_btn[i]));
+    }
+    /* v36.81 [PERGAME-RENDER] → v36.82 [SW-ONLY]: запись render= в pergame
+     * ini УДАЛЕНА — рендерер всегда программный, настраивать нечего
+     * (сами файлы перезаписываются без ключа при следующем сейве). */
     fclose(f);
     ui_log("pergame settings saved to %s\n", pbuf);
     return 0;
@@ -760,6 +891,36 @@ static const char* g_ui_texts[ST_TEXT_COUNT][2] = {
     /* v36.48 [KEYHINT-REMOVE]: панель «Кнопки в игре» и настройка
      * «Подсказка управления» ([KEY-HINT] v36.45) удалены по запросу
      * пользователя — плашка выскакивала в начале каждой игры. */
+    /* v36.82 [SW-ONLY]: строки «Рендер» per-game настроек (ST_PG_RENDER /
+     * ST_PG_RENDER_SW / ST_HINT_PG_RENDER, v36.81 [PERGAME-RENDER])
+     * УДАЛЕНЫ по запросу пользователя: рендерер один (программный),
+     * выбора не существует. Аппаратный путь отключён из-за прогрессирующего
+     * клина драйвера GLES2 и вылета при рантайм-переключении режимов —
+     * подробности в большом комментарии [SW-ONLY] у sdl_switch_renderer_create
+     * (src/sdl/sdl_graphics.c). */
+    /* v36.87 [STICK-DIAG] + [PG-CONTROLS] (В КОНЕЦ — по порядку enum):
+     * пункт «Управление» в меню паузы, экран управления, пикер клавиш. */
+    /* ST_PAUSE_CONTROLS   */ { u8"Управление",                    "Controls" },
+    /* ST_CTL_DIAG         */ { u8"Диагонали стика",               "Stick diagonals" },
+    /* ST_CTL_DIAG_BOTH    */ { u8"Пара + 1-3-7-9",                "Pair + 1-3-7-9" },
+    /* ST_CTL_DIAG_DIGITS  */ { u8"Только 1-3-7-9",                "1-3-7-9 only" },
+    /* ST_CTL_DIAG_OFF     */ { u8"Только пары",                   "Pairs only" },
+    /* ST_CTL_RESET        */ { u8"Сбросить всё",                  "Reset all" },
+    /* ST_CTL_FOOTER       */ { u8"A - изменить   B - назад к игре", "A - change   B - back to game" },
+    /* ST_CTL_PICK_TITLE   */ { u8"Назначение кнопки",             "Button assignment" },
+    /* ST_CTL_PICK_FOOTER  */ { u8"A - выбрать   B - отмена",      "A - select   B - cancel" },
+    /* ST_CTL_K_DEFAULT    */ { u8"По умолчанию",                  "Default" },
+    /* ST_CTL_K_SOFT1      */ { u8"Софт левая (-6)",               "Left soft (-6)" },
+    /* ST_CTL_K_SOFT2      */ { u8"Софт правая (-7)",              "Right soft (-7)" },
+    /* ST_CTL_K_CLEAR      */ { u8"C - очистка (-8)",              "C - clear (-8)" },
+    /* ST_CTL_K_UP         */ { u8"Стрелка вверх (-1)",            "Arrow up (-1)" },
+    /* ST_CTL_K_DOWN       */ { u8"Стрелка вниз (-2)",             "Arrow down (-2)" },
+    /* ST_CTL_K_LEFT       */ { u8"Стрелка влево (-3)",            "Arrow left (-3)" },
+    /* ST_CTL_K_RIGHT      */ { u8"Стрелка вправо (-4)",           "Arrow right (-4)" },
+    /* ST_CTL_HINT_DIAG    */ { u8"Диагональ стика в режиме цифр нажимает 1/3/7/9 (или только их).", "A stick diagonal in digits mode presses 1/3/7/9 (or only those)." },
+    /* ST_CTL_HINT_SWAP    */ { u8"Стик - цифры 2/4/6/8 или стрелки; крестовина наоборот.", "Stick sends digits 2/4/6/8 or arrows; D-pad the other way." },
+    /* ST_CTL_HINT_BTN     */ { u8"Действие кнопки в игре; меню эмулятора не затрагивается.", "What the button does in game; emulator menus are not affected." },
+    /* ST_CTL_HINT_RESET   */ { u8"Вернуть встроенную раскладку и диагонали для этой игры.", "Restore the built-in layout and diagonals for this game." },
 };
 
 int switch_lang(void) { return switch_settings_get()->lang == NOJME_LANG_EN ? NOJME_LANG_EN : NOJME_LANG_RU; }
@@ -2216,6 +2377,9 @@ static void pg_cycle_value(SwitchPerGameSettings* pg, int sel, int dir,
             if (pg->input_swap > NOJME_SWAP_ON) pg->input_swap = -1;
             if (pg->input_swap < -1) pg->input_swap = NOJME_SWAP_ON;
             break;
+        /* v36.81 case 8 [PERGAME-RENDER] → УДАЛЁН в v36.82 [SW-ONLY]:
+         * строка «Рендер» убрана из настроек — рендерер всегда
+         * программный, выбора больше не существует. */
     }
 }
 
@@ -2262,9 +2426,9 @@ void switch_ui_pergame_screen(const char* jar_path) {
             if (sdl_switch_touch_tap(&ttx, &tty)) {
                 if (switch_ui_badge_hit(ttx, tty, 8)) {
                     keys |= SWK_MINUS;
-                } else if (tty >= LIST_Y && tty < LIST_Y + 8 * SET_ROW_H) {
+                } else if (tty >= LIST_Y && tty < LIST_Y + 7 * SET_ROW_H) {
                     int row = (tty - LIST_Y) / SET_ROW_H;
-                    if (row >= 0 && row < 8) {
+                    if (row >= 0 && row < 7) { /* v36.87: 7 строк — «Стик и D-pad» переехал в «Управление» */
                         if (sel == row) keys |= SWK_A;
                         else            sel = row;
                     }
@@ -2274,8 +2438,8 @@ void switch_ui_pergame_screen(const char* jar_path) {
         if (keys & SWK_B || keys & SWK_EXIT) break;
         /* v36.17: снимок выделения для анимации курсора */
         int prev_sel = sel;
-        if (keys & SWK_UP) { sel--; if (sel < 0) sel = 7; }
-        if (keys & SWK_DOWN) { sel++; if (sel > 7) sel = 0; }
+        if (keys & SWK_UP) { sel--; if (sel < 0) sel = 6; } /* v36.87: 7 строк */
+        if (keys & SWK_DOWN) { sel++; if (sel > 6) sel = 0; } /* v36.87: 7 строк */
         if (sel != prev_sel) cursor_anim_arm((float)prev_sel, sel, LIST_Y, SET_ROW_H);
 
         /* v36.05: A / RIGHT = next value, LEFT = previous value.
@@ -2341,14 +2505,10 @@ void switch_ui_pergame_screen(const char* jar_path) {
                     if (&sdl_switch_reapply_presentation)
                         sdl_switch_reapply_presentation();
                 }
-                /* v36.37: стик/D-pad swap применяется ЖИВО — он читается
-                 * при каждом событии стика/D-pad (sdl_graphics), так что
-                 * следующий же нажатый стрелка/цифра уже с новым кодом.
-                 * Слабый символ — как у scale/flip/rotation выше. */
-                if (sel == 7) {
-                    extern int g_pg_input_swap __attribute__((weak));
-                    if (&g_pg_input_swap) g_pg_input_swap = pg.input_swap;
-                }
+                /* v36.37: стик/D-pad swap применяется ЖИВО. v36.87 [PG-CONTROLS]:
+                 * строка ПЕРЕНЕСЕНА в экран «Управление» (все настройки
+                 * ввода в одном месте) — живое применение теперь там
+                 * (ctl_apply_live). */
                 /* Остальные строки (разрешение, скорость ВМ) печатаются в
                  * геометрию/бюджет сессии и требуют следующего запуска игры.
                  * (Фильтр/масштаб/флип/поворот — живые, см. выше.) */
@@ -2401,41 +2561,39 @@ void switch_ui_pergame_screen(const char* jar_path) {
                 const char* rotv = pg.rotation == 1 ? switch_text(ST_ROT_RIGHT)
                                 : pg.rotation == 2 ? switch_text(ST_ROT_LEFT)
                                                    : switch_text(ST_ROT_OFF);
-                const char* dpv = pg.input_swap < 0
-                    ? switch_text(ST_SCALE_INHERIT)
-                    : switch_swap_name(pg.input_swap); /* v36.37 */
-                const char* names[8] = {
+                /* v36.87 [PG-CONTROLS]: строка «Стик и D-pad» (dpv, 8-я)
+                 * ПЕРЕНЕСЕНА в новый экран «Управление». */
+                const char* names[7] = {
                     switch_text(ST_PG_RES), switch_text(ST_PG_SCALE),
                     switch_text(ST_PG_FILTER), switch_text(ST_PG_FLIP),
                     switch_text(ST_PG_VMSPEED), switch_text(ST_PG_TEXF),
-                    switch_text(ST_PG_ROT), /* v36.15 */
-                    switch_text(ST_PG_DPAD) /* v36.37: «Стик и D-pad» */
+                    switch_text(ST_PG_ROT) /* v36.15 */
                 };
-                const char* vals[8] = { rv, sv, fv, lv, vv, tv, rotv, dpv };
+                const char* vals[7] = { rv, sv, fv, lv, vv, tv, rotv };
                 /* v36.17: строки поверх живого кадра — с тенью; полоса
                  * выделения может анимироваться (cursor_anim) */
                 g_row_text_shadow = 1;
                 s_hl_y_override = cursor_anim_highlight_top(LIST_Y, SET_ROW_H, sel);
                 draw_hl_bar_underlay(cv, cw, SET_ROW_H); /* полоса под текстом */
                 int y = LIST_Y;
-                for (int i = 0; i < 8; i++)
-                    y = draw_row(cv, cw, y, names[i], vals[i], sel == i, i, 8, SET_ROW_H);
+                for (int i = 0; i < 7; i++) /* v36.87: 7 строк («Стик и D-pad» -> «Управление») */
+                    y = draw_row(cv, cw, y, names[i], vals[i], sel == i, i, 7, SET_ROW_H);
                 g_row_text_shadow = 0;
                 s_hl_y_override = -1;
                 /* v36.15: всплывающее описание выделенного пункта + пометка
                  * о моменте применения (перезапуск игры для большинства
                  * строк, «сразу» для масштаба и 3D-текстур) */
                 {
-                    static const int desc_ids[8] = {
+                    static const int desc_ids[7] = {
                         ST_HINT_PG_RES, ST_HINT_PG_SCALE, ST_HINT_PG_FILTER,
                         ST_HINT_PG_FLIP, ST_HINT_PG_VMSPEED, ST_HINT_PG_TEXF,
-                        ST_HINT_PG_ROT,
-                        ST_HINT_PG_DPAD /* v36.36 */
+                        ST_HINT_PG_ROT
                     };
                     /* 1 = применяется сразу при закрытии меню, 0 = нужен
                      * следующий запуск игры (v36.16: флип стал живым;
-                     * v36.36: раскладка D-pad тоже живая) */
-                    static const int live_row[8] = { 0, 1, 0, 1, 0, 1, 0, 1 };
+                     * v36.37: раскладка D-pad тоже живая — теперь она в
+                     * экране «Управление», см. v36.87 [PG-CONTROLS]) */
+                    static const int live_row[7] = { 0, 1, 0, 1, 0, 1, 0 };
                     draw_hint_box(cv, cw, switch_text(desc_ids[sel]),
                                   switch_text(live_row[sel] ? ST_HINT_LIVE
                                                             : ST_HINT_RESTART));
@@ -2456,6 +2614,292 @@ void switch_ui_pergame_screen(const char* jar_path) {
      * держит и снимает ВЫЗЫВАЮЩЕЕ меню паузы (begin/end вокруг всего
      * хаба). Возврат из этого экрана — обратно в меню паузы. */
     sw_trace("pgset: close");
+}
+
+/* ================= v36.87 [PG-CONTROLS]: экран «Управление» =================
+ * Настройки ввода ДЛЯ ЭТОГО мидлета — новый пункт «Управление» меню паузы
+ * (запрос пользователя: «добавь настройку управления для каждого мидлета»).
+ * Строки:
+ *   0        «Диагонали стика» — Пара + 1-3-7-9 / Только 1-3-7-9 / Только
+ *            пары ([STICK-DIAG]; применяется к цифровому пути: swap OFF —
+ *            стик, swap ON — крестовина);
+ *   1        «Стик и D-pad» — ПЕРЕНЕСЕНА сюда из per-game экрана (v36.87:
+ *            все настройки ввода в одном месте; ini-ключ swap= тот же);
+ *   2..11    кнопки A/B/X/Y/L/R/ZL/ZR/L3/R3 — A открывает пикер клавиши
+ *            (словарь NOJME_BTNK_*; «По умолчанию» = встроенная раскладка);
+ *   12       «Сбросить всё» — вернуть встроенную раскладку + дефолты.
+ * VM запаркована скобками меню паузы (тот же контракт, что у per-game
+ * экрана v36.19 — сам экран НЕ паркует). ВСЁ применяется ЖИВО: diag/swap
+ * читаются при каждом событии ввода, кнопки — при каждом нажатии
+ * (слабые символы sdl_graphics.c, см. ctl_apply_live). */
+
+/* Живое применение per-game управления к слою ввода (sdl_graphics.c).
+ * Слабые символы — как у g_pg_scale/g_pg_flip в per-game экране:
+ * хост-сборки без sdl_graphics.c получают NULL-адреса и пропускают. */
+static void ctl_apply_live(const SwitchPerGameSettings* pg) {
+    if (!pg) return;
+    {
+        extern int g_pg_input_swap __attribute__((weak));
+        if (&g_pg_input_swap) g_pg_input_swap = pg->input_swap;
+    }
+    {
+        extern int g_pg_stick_diag __attribute__((weak));
+        if (&g_pg_stick_diag) g_pg_stick_diag = pg->stick_diag;
+    }
+    {
+        extern int g_pg_btn[NOJME_CTL_BTN_COUNT] __attribute__((weak));
+        if (&g_pg_btn) {
+            for (int i = 0; i < NOJME_CTL_BTN_COUNT; i++)
+                g_pg_btn[i] = pg->ctl_btn[i];
+        }
+    }
+}
+
+/* v36.87: пикер целевой клавиши для кнопки с индексом btn_idx (строка
+ * заголовка «A -> ...»). Список = g_ctl_keys[] в порядке словаря
+ * (По умолчанию, 0..9, *, #, софт, C, стрелки); курсор стартует на
+ * ТЕКУЩЕМ значении кнопки. Возвращает выбранный NOJME_BTNK_* или -1
+ * (B/EXIT — отмена). Окно VISIBLE_ROWS строк со скроллом (как браузер),
+ * двухфазный тап — как во всех списках фронтенда. */
+static int ctl_pick_screen(int btn_idx, int cur) {
+    int sel = (cur > 0 && cur < NOJME_BTNK_COUNT) ? cur : 0;
+    int scroll = 0;
+    if (sel >= VISIBLE_ROWS) scroll = sel - VISIBLE_ROWS + 1;
+    uint64_t last_draw = 0;
+    for (;;) {
+        unsigned keys = sdl_switch_ui_pump_keys();
+        if (keys & SWK_MINUS) switch_lang_toggle();
+        {
+            /* тап: двухфазный, ряды пикера ROW_H от LIST_Y */
+            int ttx = 0, tty = 0;
+            if (sdl_switch_touch_tap(&ttx, &tty)) {
+                if (switch_ui_badge_hit(ttx, tty, 8)) {
+                    keys |= SWK_MINUS;
+                } else if (tty >= LIST_Y &&
+                           tty < LIST_Y + VISIBLE_ROWS * ROW_H) {
+                    int row = scroll + (tty - LIST_Y) / ROW_H;
+                    if (row >= 0 && row < NOJME_BTNK_COUNT) {
+                        if (sel == row) keys |= SWK_A;
+                        else            sel = row;
+                    }
+                }
+            }
+        }
+        if (keys & SWK_B || keys & SWK_EXIT) return -1;
+        int prev_sel = sel;
+        if (keys & SWK_UP)   { sel--; if (sel < 0) { sel = NOJME_BTNK_COUNT - 1; } }
+        if (keys & SWK_DOWN) { sel++; if (sel >= NOJME_BTNK_COUNT) sel = 0; }
+        if (sel != prev_sel) {
+            cursor_anim_arm((float)(prev_sel - scroll), sel - scroll,
+                            LIST_Y, ROW_H);
+            if (sel < scroll) scroll = sel;
+            if (sel >= scroll + VISIBLE_ROWS) scroll = sel - VISIBLE_ROWS + 1;
+        }
+
+        uint64_t now = sdl_switch_ui_ticks_ms();
+        if (now - last_draw >= 16) {
+            last_draw = now;
+            uint32_t* cv = sdl_switch_ui_canvas();
+            if (cv) {
+                int cw = SWITCH_UI_WIDTH;
+                /* фон: тёмная непрозрачная плашка поверх живого кадра —
+                 * пикер модальный, читаемость важнее кадра */
+                int bg_ok = 0;
+                {
+                    extern int sdl_switch_ui_game_frame_bg(uint32_t*, int, int)
+                        __attribute__((weak));
+                    if (&sdl_switch_ui_game_frame_bg)
+                        bg_ok = sdl_switch_ui_game_frame_bg(cv, cw, SWITCH_UI_HEIGHT);
+                }
+                if (bg_ok)
+                    blend_rect(cv, cw, SWITCH_UI_HEIGHT, 0, 0, cw,
+                               SWITCH_UI_HEIGHT, 0x10131Au, 0xD0);
+                else
+                    fill_rect(cv, cw, SWITCH_UI_HEIGHT, 0, 0, cw,
+                              SWITCH_UI_HEIGHT, COL_BG);
+                {
+                    char title[96];
+                    snprintf(title, sizeof(title), "%s: %s",
+                             switch_text(ST_CTL_PICK_TITLE),
+                             switch_ctl_btn_name(btn_idx));
+                    draw_header(cv, cw, title, NULL);
+                }
+                g_row_text_shadow = 1;
+                s_hl_y_override =
+                    cursor_anim_highlight_top(LIST_Y, ROW_H, sel - scroll);
+                draw_hl_bar_underlay(cv, cw, ROW_H);
+                for (int i = 0; i < VISIBLE_ROWS; i++) {
+                    int row = scroll + i;
+                    if (row < 0 || row >= NOJME_BTNK_COUNT) break;
+                    draw_row(cv, cw, LIST_Y + i * ROW_H,
+                             switch_btnk_display_name(row), NULL,
+                             row == sel, row, NOJME_BTNK_COUNT, ROW_H);
+                }
+                g_row_text_shadow = 0;
+                s_hl_y_override = -1;
+                draw_scrollbar(cv, cw, NOJME_BTNK_COUNT, sel);
+                draw_footer(cv, cw, switch_text(ST_CTL_PICK_FOOTER));
+                switch_ui_batt_badge_draw(cv, cw, SWITCH_UI_HEIGHT,
+                                          switch_settings_get()->battery_display);
+                sdl_switch_ui_present();
+            }
+        } else {
+            sdl_switch_ui_wait(4);
+        }
+        if (keys & SWK_A) return sel; /* выбор (после отрисовки кадра) */
+    }
+}
+
+/* v36.87: сам экран «Управление» — см. блок-комментарий выше. */
+void switch_ui_controls_screen(const char* jar_path) {
+    if (WILDGUARD_SKIP(jar_path, "ctl:jar")) return; /* [WILDGUARD] v36.50 */
+    SwitchPerGameSettings pg;
+    switch_pergame_load(jar_path, &pg);
+    ctl_apply_live(&pg); /* экран открыт из паузы — синхронизировать слой ввода */
+    enum { CTL_ROWS = 2 + NOJME_CTL_BTN_COUNT + 1 }; /* diag, swap, кнопки, сброс */
+    int sel = 0;
+    uint64_t last_draw = 0;
+    sw_trace("ctl: open");
+    for (;;) {
+        unsigned keys = sdl_switch_ui_pump_keys();
+        if (keys & SWK_MINUS) switch_lang_toggle();
+        {
+            /* тап: 13 строк SET_ROW_H от LIST_Y (134 + 13*38 = 628) */
+            int ttx = 0, tty = 0;
+            if (sdl_switch_touch_tap(&ttx, &tty)) {
+                if (switch_ui_badge_hit(ttx, tty, 8)) {
+                    keys |= SWK_MINUS;
+                } else if (tty >= LIST_Y &&
+                           tty < LIST_Y + CTL_ROWS * SET_ROW_H) {
+                    int row = (tty - LIST_Y) / SET_ROW_H;
+                    if (row >= 0 && row < CTL_ROWS) {
+                        if (sel == row) keys |= SWK_A;
+                        else            sel = row;
+                    }
+                }
+            }
+        }
+        if (keys & SWK_B || keys & SWK_EXIT) break;
+        int prev_sel = sel;
+        if (keys & SWK_UP)   { sel--; if (sel < 0) sel = CTL_ROWS - 1; }
+        if (keys & SWK_DOWN) { sel++; if (sel >= CTL_ROWS) sel = 0; }
+        if (sel != prev_sel) cursor_anim_arm((float)prev_sel, sel, LIST_Y, SET_ROW_H);
+
+        /* строки 0/1 — циклические значения (как в per-game экране),
+         * строки 2..11 — пикер, строка 12 — сброс. Всё ЖИВО + сейв. */
+        if (sel == 0 || sel == 1) {
+            int dir = 0;
+            if (keys & SWK_A) dir = 1;
+            else if (keys & SWK_RIGHT) dir = 1;
+            else if (keys & SWK_LEFT) dir = -1;
+            if (dir != 0) {
+                if (sel == 0) { /* диагонали: BOTH -> DIGITS -> OFF -> BOTH */
+                    pg.stick_diag =
+                        (pg.stick_diag + dir + NOJME_DIAG_COUNT) % NOJME_DIAG_COUNT;
+                } else {         /* swap: inherit -> off -> on -> inherit */
+                    pg.input_swap += dir;
+                    if (pg.input_swap > NOJME_SWAP_ON) pg.input_swap = -1;
+                    if (pg.input_swap < -1) pg.input_swap = NOJME_SWAP_ON;
+                }
+                switch_pergame_save(jar_path, &pg);
+                ctl_apply_live(&pg);
+            }
+        } else if (sel >= 2 && sel < 2 + NOJME_CTL_BTN_COUNT) {
+            if (keys & SWK_A) {
+                int bi = sel - 2;
+                int k = ctl_pick_screen(bi, pg.ctl_btn[bi]);
+                if (k >= 0) {
+                    pg.ctl_btn[bi] = k;
+                    switch_pergame_save(jar_path, &pg);
+                    ctl_apply_live(&pg);
+                }
+            }
+        } else if (sel == CTL_ROWS - 1) {
+            if (keys & SWK_A) {
+                pg.stick_diag = NOJME_DIAG_DEFAULT;
+                pg.input_swap = -1;
+                for (int i = 0; i < NOJME_CTL_BTN_COUNT; i++)
+                    pg.ctl_btn[i] = NOJME_BTNK_DEFAULT;
+                switch_pergame_save(jar_path, &pg);
+                ctl_apply_live(&pg);
+            }
+        }
+
+        uint64_t now = sdl_switch_ui_ticks_ms();
+        if (now - last_draw >= 16) {
+            last_draw = now;
+            uint32_t* cv = sdl_switch_ui_canvas();
+            if (cv) {
+                int cw = SWITCH_UI_WIDTH;
+                /* фон: живой кадр + затемнение (как per-game экран) */
+                int bg_ok = 0;
+                {
+                    extern int sdl_switch_ui_game_frame_bg(uint32_t*, int, int)
+                        __attribute__((weak));
+                    if (&sdl_switch_ui_game_frame_bg)
+                        bg_ok = sdl_switch_ui_game_frame_bg(cv, cw, SWITCH_UI_HEIGHT);
+                }
+                if (bg_ok)
+                    blend_rect(cv, cw, SWITCH_UI_HEIGHT, 0, 0, cw,
+                               SWITCH_UI_HEIGHT, 0x10131Au, 0xA0);
+                else
+                    fill_rect(cv, cw, SWITCH_UI_HEIGHT, 0, 0, cw,
+                              SWITCH_UI_HEIGHT, COL_BG);
+                draw_header(cv, cw, switch_text(ST_PAUSE_CONTROLS),
+                            switch_text(ST_PG_SAVED));
+                const char* diagv = pg.stick_diag == NOJME_DIAG_DIGITS
+                    ? switch_text(ST_CTL_DIAG_DIGITS)
+                    : pg.stick_diag == NOJME_DIAG_OFF
+                        ? switch_text(ST_CTL_DIAG_OFF)
+                        : switch_text(ST_CTL_DIAG_BOTH);
+                const char* swapv = pg.input_swap < 0
+                    ? switch_text(ST_SCALE_INHERIT)
+                    : switch_swap_name(pg.input_swap);
+                const char* names[CTL_ROWS];
+                const char* vals[CTL_ROWS];
+                names[0] = switch_text(ST_CTL_DIAG); vals[0] = diagv;
+                names[1] = switch_text(ST_PG_SWAP);  vals[1] = swapv;
+                for (int i = 0; i < NOJME_CTL_BTN_COUNT; i++) {
+                    names[2 + i] = switch_ctl_btn_name(i);
+                    vals[2 + i] = switch_btnk_display_name(pg.ctl_btn[i]);
+                }
+                names[CTL_ROWS - 1] = switch_text(ST_CTL_RESET);
+                vals[CTL_ROWS - 1] = NULL;
+                g_row_text_shadow = 1;
+                s_hl_y_override = cursor_anim_highlight_top(LIST_Y, SET_ROW_H, sel);
+                draw_hl_bar_underlay(cv, cw, SET_ROW_H);
+                int y = LIST_Y;
+                for (int i = 0; i < CTL_ROWS; i++)
+                    y = draw_row(cv, cw, y, names[i], vals[i],
+                                 sel == i, i, CTL_ROWS, SET_ROW_H);
+                g_row_text_shadow = 0;
+                s_hl_y_override = -1;
+                /* однострочная подсказка выделенной строки в зазоре между
+                 * списком (до 628) и футером (672): экран на 4 строки выше
+                 * полосы draw_hint_box — вместо окна одна строка scale 2 */
+                {
+                    static const int hint_ids[2] = {
+                        ST_CTL_HINT_DIAG, ST_CTL_HINT_SWAP
+                    };
+                    const char* hint = NULL;
+                    if (sel <= 1) hint = switch_text(hint_ids[sel]);
+                    else if (sel < CTL_ROWS - 1) hint = switch_text(ST_CTL_HINT_BTN);
+                    else hint = switch_text(ST_CTL_HINT_RESET);
+                    draw_text(cv, cw, SWITCH_UI_HEIGHT, 48, 634, hint,
+                              0xFFB9C2D4u, 2);
+                }
+                draw_footer(cv, cw, switch_text(ST_CTL_FOOTER));
+                switch_ui_batt_badge_draw(cv, cw, SWITCH_UI_HEIGHT,
+                                          switch_settings_get()->battery_display);
+                sdl_switch_ui_present();
+            }
+        } else {
+            sdl_switch_ui_wait(4);
+        }
+    }
+    /* Возврат — в меню паузы (тот же контракт, что у per-game экрана:
+     * вызывающий сбрасывает протечки кнопок switch_input_settle'ом). */
+    sw_trace("ctl: close");
 }
 
 /* ================= Main menu ================= */
@@ -2575,6 +3019,12 @@ static void keys_draw(uint32_t* cv) {
 
 /* ================= Top-level menu session ================= */
 
+/* v36.77 [MENU-STALL]: кадровая активность меню (draw/present за окно
+ * 5 с; печатается строкой «menu: alive»). Файловые глобалы — окно живёт
+ * дольше вызова switch_ui_pick_game (сессии меню идут одна за другой). */
+static uint32_t g_menu_alive_draws = 0;
+static uint32_t g_menu_alive_presents = 0;
+
 int switch_ui_pick_game(char* out_path, size_t path_cap) {
 
     SwitchSettings st = *switch_settings_get();
@@ -2598,6 +3048,18 @@ int switch_ui_pick_game(char* out_path, size_t path_cap) {
 
     ui_log("menu session start\n");
     sw_trace("menu: session start"); /* v34.91 */
+    /* v36.81 [MENU-FIRST]: вооружить бейкон первого present меню —
+     * напечатает sdl_switch_ui_present с таймингами и адресами (полевой
+     * лог v36.80 обрывался сразу после первого present при выходе из
+     * игры; теперь первый кадр меню самопрезентирует своё состояние). */
+    {
+        extern volatile int g_sw_menu_first_probe; /* sdl_graphics.c */
+        g_sw_menu_first_probe = 1;
+    }
+    /* v36.77 [MENU-STALL]: счётчики кадровой активности меню — обнуляются
+     * на каждом входе (строка «menu: alive» раз в 5 с печатает дельты). */
+    g_menu_alive_draws = 0;
+    g_menu_alive_presents = 0;
     /* v34.91 autotest session semantics:
      * DEFAULT (no NOJME_SWITCH_AUTOTEST_SESSIONS) — v34.90 behavior: the
      * script position SURVIVES sessions. A session that ends mid-script
@@ -2641,9 +3103,39 @@ int switch_ui_pick_game(char* out_path, size_t path_cap) {
     }
 
     for (;;) {
+        /* v36.76 [MENU-STALL]: маркеры этапов цикла меню — полевой класс
+         * «возврат в меню → картинка стоит → ввод мёртв → лог молчит»
+         * (v36.75: после btn=15 ни одной icon-stat строки). Сторож
+         * таймера теперь видит цикл меню и назовёт этап зависания. */
+        SW_DIAG_STAGE("menu:pump");
+        g_sd_loop_ms = sdl_switch_ui_ticks_ms();
         unsigned keys = sdl_switch_ui_pump_keys();
         unsigned held = sdl_switch_ui_held_keys();
         keys |= at_keys();
+
+        /* v36.77 [MENU-STALL]: живая строка меню. Полевой лог v36.76
+         * закончился ПОЛНОЙ тишиной после «menu: session start» при
+         * ЧЁРНОМ экране — цикл, возможно, был жив, но маркеры
+         * menu:pump/draw/present — только stage-метки, их НИКТО не
+         * печатает (sw_diag_tick не вызывается в меню), а diag-строка
+         * игры не работает между сессиями. Теперь раз в 5 с меню
+         * печатает собственное состояние: сколько кадров нарисовано,
+         * сколько презентовано и сколько ui-презентов упало — следующий
+         * полевой лог однозначно разделит «цикл умер» (STUCK + нули),
+         * «рисуем, но текстура бита» (draw растёт, uipf растёт) и
+         * «всё живо» (draw=present, uipf=0). */
+        {
+            static uint64_t s_menu_alive_next = 0;
+            uint64_t nowa = sdl_switch_ui_ticks_ms();
+            if (nowa >= s_menu_alive_next) {
+                s_menu_alive_next = nowa + 5000;
+                sw_trace("menu: alive draw=%u present=%u uipf=%u",
+                         g_menu_alive_draws, g_menu_alive_presents,
+                         (unsigned)sdl_switch_ui_present_fails());
+                g_menu_alive_draws = 0;
+                g_menu_alive_presents = 0;
+            }
+        }
 
         /* [PATHGUARD] v36.51: раз в 2 с — скан всех зарегистрированных
          * slab-путей: ядовитые слоты (байты пути в позиции указателя),
@@ -2978,6 +3470,8 @@ int switch_ui_pick_game(char* out_path, size_t path_cap) {
         uint64_t now = sdl_switch_ui_ticks_ms();
         if (now - last_draw >= 16) {
             last_draw = now;
+            SW_DIAG_STAGE("menu:draw");
+            g_menu_alive_draws++; /* v36.77 [MENU-STALL] */
             uint32_t* cv = sdl_switch_ui_canvas();
             if (WILDGUARD_SKIP(cv, "ui:canvas")) cv = NULL; /* [WILDGUARD] v36.50 */
             if (cv) {
@@ -3046,6 +3540,8 @@ int switch_ui_pick_game(char* out_path, size_t path_cap) {
                  * до сохранения (это превью, а не применение). */
                 switch_ui_batt_badge_draw(cv, SWITCH_UI_WIDTH, SWITCH_UI_HEIGHT,
                                           st.battery_display);
+                SW_DIAG_STAGE("menu:present");
+                g_menu_alive_presents++; /* v36.77 [MENU-STALL] */
                 sdl_switch_ui_present();
             }
         } else {
@@ -3054,6 +3550,9 @@ int switch_ui_pick_game(char* out_path, size_t path_cap) {
     }
 
 done:
+    /* v36.76 [MENU-STALL]: меню закрыто — сторож снова слеп до следующей
+     * сессии (между состояниями ни один цикл не должен репортиться). */
+    SW_DIAG_STAGE(NULL);
     browse_free(&br.list);
     ui_log("menu session end (result=%d)\n", result);
     sw_trace("menu: session end (%d)", result); /* v34.91 */

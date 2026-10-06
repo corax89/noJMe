@@ -1403,7 +1403,11 @@ static JavaClass* create_stub_class(JVM* jvm, const char* name, const char* supe
             
             /* Thread() - default constructor, sets priority to 5 (NORM_PRIORITY) */
             /* Code: aload_0, invokespecial Object.<init>, aload_0, iconst_5, putfield priority, return */
-            uint8_t* init_default_code = malloc(10);
+            /* [STUB-LEAK] v36.85: было heap-malloc(10/16/16/21) — create_stub_method
+             * КОПИРУЕТ байткод, буферы никто не освобождал: линейная утечка
+             * 67 байт/сессию (LSan-соук). Стек-массивы — как во всех остальных
+             * заглушках этого файла. */
+            uint8_t init_default_code[10];
             init_default_code[0] = 0x2A; /* aload_0 */
             init_default_code[1] = 0xB7; /* invokespecial */
             init_default_code[2] = (super_init_ref >> 8) & 0xFF;
@@ -1418,7 +1422,7 @@ static JavaClass* create_stub_class(JVM* jvm, const char* name, const char* supe
             
             /* Thread(String name) */
             /* Code: aload_0, invokespecial Object.<init>, aload_0, iconst_5, putfield priority, aload_0, aload_1, putfield name, return */
-            uint8_t* init_string_code = malloc(16);
+            uint8_t init_string_code[16];
             init_string_code[0] = 0x2A; /* aload_0 */
             init_string_code[1] = 0xB7; /* invokespecial */
             init_string_code[2] = (super_init_ref >> 8) & 0xFF;
@@ -1439,7 +1443,7 @@ static JavaClass* create_stub_class(JVM* jvm, const char* name, const char* supe
             
             /* Thread(Runnable target) */
             /* Code: aload_0, invokespecial Object.<init>, aload_0, iconst_5, putfield priority, aload_0, aload_1, putfield target, return */
-            uint8_t* init_runnable_code = malloc(16);
+            uint8_t init_runnable_code[16];
             init_runnable_code[0] = 0x2A; /* aload_0 */
             init_runnable_code[1] = 0xB7; /* invokespecial */
             init_runnable_code[2] = (super_init_ref >> 8) & 0xFF;
@@ -1461,7 +1465,7 @@ static JavaClass* create_stub_class(JVM* jvm, const char* name, const char* supe
             /* Thread(Runnable target, String name) */
             /* Code: aload_0, invokespecial Object.<init>, aload_0, iconst_5, putfield priority, 
                      aload_0, aload_1, putfield target, aload_0, aload_2, putfield name, return */
-            uint8_t* init_runnable_string_code = malloc(21);
+            uint8_t init_runnable_string_code[21];
             init_runnable_string_code[0] = 0x2A; /* aload_0 */
             init_runnable_string_code[1] = 0xB7; /* invokespecial */
             init_runnable_string_code[2] = (super_init_ref >> 8) & 0xFF;
@@ -3384,13 +3388,22 @@ int init_stub_classes(JVM* jvm) {
                 clazz->instance_size = sizeof(ObjectHeader) + sizeof(JavaValue) * 2;
             }
             
-            /* Add interfaces: Player and Controllable */
-            clazz->interfaces_count = 2;
-            clazz->interfaces = (uint16_t*)calloc(2, sizeof(uint16_t));
-            if (clazz->interfaces) {
-                clazz->interfaces[0] = add_class_ref(clazz, "javax/microedition/media/Player");
-                clazz->interfaces[1] = add_class_ref(clazz, "javax/microedition/media/Controllable");
-                CLASS_DEBUG(" Added interfaces to PlayerImpl: Player, Controllable\n");
+            /* Add interfaces: Player and Controllable.
+             * v36.85 [STUB-LEAK2]: БЕЗУСЛОВНАЯ перезапись здесь осирочивала
+             * interfaces-блок первого прохода (stub_add_known_interfaces уже
+             * подключил те же два интерфейса сразу после создания класса) —
+             * LSan-соук ловил ровно один осиротевший calloc(4) за сессию,
+             * стек: stub_add_known_interfaces <- init_stub_classes. Теперь
+             * третий проход уважает уже подключённые интерфейсы (гвард как
+             * в самом stub_add_known_interfaces). */
+            if (clazz->interfaces_count == 0 || !clazz->interfaces) {
+                clazz->interfaces_count = 2;
+                clazz->interfaces = (uint16_t*)calloc(2, sizeof(uint16_t));
+                if (clazz->interfaces) {
+                    clazz->interfaces[0] = add_class_ref(clazz, "javax/microedition/media/Player");
+                    clazz->interfaces[1] = add_class_ref(clazz, "javax/microedition/media/Controllable");
+                    CLASS_DEBUG(" Added interfaces to PlayerImpl: Player, Controllable\n");
+                }
             }
             
             CLASS_DEBUG(" Added fields to javax/microedition/media/PlayerImpl\n");

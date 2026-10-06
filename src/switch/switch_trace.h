@@ -100,6 +100,7 @@ int  sw_logging_enabled(void);
 /* Counters (incremented from multiple threads; relaxed atomics via GCC
  * builtins — values are diagnostics, torn/racy reads are acceptable). */
 extern volatile uint32_t g_sd_loop, g_sd_pr, g_sd_skip, g_sd_pump;
+extern volatile uint32_t g_sd_pds; /* v36.77 [PERF-PRESENT]: present-ы, пропущенные по требованию */
 extern volatile uint32_t g_sd_stl_ms, g_sd_sr_ms, g_sd_fl;
 extern volatile uint32_t g_sd_vs;
 

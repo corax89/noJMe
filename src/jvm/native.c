@@ -18,6 +18,9 @@
 #include <stdint.h>  /* For uint32_t, uint8_t */
 #include <inttypes.h>  /* For PRIu64 portable format macros */
 #include "utils/battery.h" /* [BATFIX] v36.41: заряд для системных свойств */
+#ifndef _WIN32
+#include "threadpool.h"   /* v36.73 [VM-THREADPOOL]: worker pool for Thread.start */
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -3198,9 +3201,138 @@ static jint dis_read_byte(JVM* jvm, JavaObject* dis_obj) {
             }
         }
     }
-    
+
     return val & 0xFF;
 }
+
+/* v36.74 [STREAM-BATCH]: resolve a DataInputStream's underlying
+ * ByteArrayInputStream ONCE per native call — the shared chain-chase of
+ * dis_read_byte (in -> ... -> BAIS buf/pos/count, ~5 name-based field
+ * lookups PER BYTE through the native dispatch path).
+ *
+ * FIELD EVIDENCE (Bounce Tales v36.73 host repro, /tmp/tbtstall): the
+ * startup state machine re-parses lang.xx ~25,000 times before the menu
+ * accepts input — 121 MILLION dis_read_byte dispatches in 45+ s wall
+ * (td t2 stm=pos/4757/4757 r=121130407), heap +3-6 MB per 5 s diag
+ * window from the re-parse garbage. Every skipBytes(n) was n full
+ * chain-chases; every readShort was 2. The reference emulator runs the
+ * same bytecode to an interactive menu in ~2 s.
+ *
+ * Returns 1 with out_bais / out_buf / out_pos / out_count set on success
+ * (pos/count freshly read; buf validated), 0 when the chain has no BAIS
+ * (the caller falls back to the byte path / EOF semantics). */
+static int dis_resolve_bais(JavaObject* dis_obj,
+                            JavaObject** out_bais, JavaArray** out_buf,
+                            jint* out_pos, jint* out_count) {
+    if (!dis_obj) return 0;
+    JavaObject* in_stream = (JavaObject*)native_get_field_value(dis_obj, "in").ref;
+    if (!in_stream) return 0;
+    JavaObject* stream = in_stream;
+    JavaArray* buf = NULL;
+    jint pos = 0, count = 0;
+    for (int hop = 0; hop < 4 && stream; hop++) {
+        JavaClass* sc = stream->header.clazz;
+        const char* sname = (sc && sc->class_name) ? sc->class_name : NULL;
+        if (!sname) break;
+        if (strcmp(sname, "java/io/ByteArrayInputStream") == 0) {
+            buf = (JavaArray*)native_get_field_value(stream, "buf").ref;
+            pos = native_get_field_value(stream, "pos").i;
+            count = native_get_field_value(stream, "count").i;
+            in_stream = stream;
+            break;
+        }
+        stream = (JavaObject*)native_get_field_value(stream, "in").ref;
+    }
+    if (!buf) return 0;
+    /* v22 SELF-HEAL twin (see dis_read_byte): a wrong-class wrapper may
+     * carry a NULL/garbage buf while the real BAIS is one "in" hop down. */
+    int heal_hops = 0;
+    while ((!buf || !is_heap_ptr_check(buf)) && heal_hops < 4) {
+        JavaObject* inner = (JavaObject*)native_get_field_value(in_stream, "in").ref;
+        if (!inner || inner == in_stream) break;
+        JavaClass* ic = inner->header.clazz;
+        if (!ic || !ic->class_name ||
+            strcmp(ic->class_name, "java/io/ByteArrayInputStream") != 0) break;
+        JavaArray* ib = (JavaArray*)native_get_field_value(inner, "buf").ref;
+        if (ib && is_heap_ptr_check(ib)) {
+            in_stream = inner;
+            buf = ib;
+            pos = native_get_field_value(inner, "pos").i;
+            count = native_get_field_value(inner, "count").i;
+            break;
+        }
+        in_stream = inner;
+        heal_hops++;
+    }
+    if (!buf || !is_heap_ptr_check(buf)) return 0;
+    if (out_bais) *out_bais = in_stream;
+    if (out_buf) *out_buf = buf;
+    if (out_pos) *out_pos = pos;
+    if (out_count) *out_count = count;
+    return 1;
+}
+
+/* v36.74 [STREAM-BATCH]: bulk advance of a resolved BAIS — skip n bytes /
+ * memcpy n bytes out in ONE field write. Keeps the v36.06 shadow
+ * (stm=pos/count/len r=+) and the v36.08 EOF-spin detector semantics:
+ * r counts BYTES moved (was: one per dis_read_byte call), EOF still
+ * ticks the detector. Returns the number of bytes actually available. */
+static jint dis_bais_avail(jint pos, jint count) {
+    return (pos >= count) ? 0 : (count - pos);
+}
+static void dis_bais_advance(JavaThread* thread,
+                             JavaObject* bais, JavaArray* buf,
+                             jint pos, jint count, jint take) {
+    JavaValue new_pos = { .i = pos + take };
+    native_set_field_value(bais, "pos", new_pos);
+    if (thread) {
+        thread->last_stm_pos = pos + take;
+        thread->last_stm_count = count;
+        thread->last_stm_len = buf ? (jint)buf->length : -1;
+        if (take > 0) {
+            thread->last_stm_reads += take;
+            native_stm_eof_reset(thread);
+        }
+    }
+}
+
+/* v36.74 [STREAM-BATCH]: fixed-size bulk read for the readShort/readInt/
+ * readLong/readFloat/readDouble/readUTF family — ONE chain-chase + ONE
+ * pos write instead of n byte dispatches. EOF semantics match the old
+ * byte loop: the bytes that WERE available are consumed (pos advances
+ * to count) and 0 is returned so the caller throws its EOFException.
+ * Return: 1 = n bytes copied; 0 = EOF (partial consumed); -1 = no BAIS
+ * chain (byte path fallback needed — only for exotic wrapped streams). */
+static int dis_read_bulk(JVM* jvm, JavaObject* dis_obj, uint8_t* out, jint n) {
+    JavaObject* bais = NULL;
+    JavaArray* buf = NULL;
+    jint pos = 0, count = 0;
+    if (!dis_resolve_bais(dis_obj, &bais, &buf, &pos, &count)) {
+        return -1;
+    }
+    JavaThread* stm_self = thread_current(jvm);
+    jint avail = dis_bais_avail(pos, count);
+    if (avail <= 0) {
+        if (stm_self) {
+            stm_self->last_stm_pos = pos;
+            stm_self->last_stm_count = count;
+            stm_self->last_stm_len = (jint)buf->length;
+            stm_self->last_stm_reads++;
+        }
+        native_stm_eof_tick(jvm, stm_self, pos, count, (jint)buf->length);
+        return 0;
+    }
+    if (avail < n) {
+        /* Consume the tail (the old loop read them before hitting EOF). */
+        dis_bais_advance(stm_self, bais, buf, pos, count, avail);
+        native_stm_eof_tick(jvm, stm_self, count, count, (jint)buf->length);
+        return 0;
+    }
+    if (out) memcpy(out, (uint8_t*)array_data(buf) + pos, (size_t)n);
+    dis_bais_advance(stm_self, bais, buf, pos, count, n);
+    return 1;
+}
+
 
 /* DataInputStream.read() - reads a single byte */
 static JavaValue native_datainputstream_read(JVM* jvm, JavaThread* thread,
@@ -3233,21 +3365,35 @@ static JavaValue native_datainputstream_read_array(JVM* jvm, JavaThread* thread,
         native_throw_npe(jvm, thread);
         return NATIVE_RETURN_INT(-1);
     }
-    
-    uint8_t* data = (uint8_t*)array_data(buffer);
-    int max_read = buffer->length;
-    int bytes_read = 0;
-    
-    for (int i = 0; i < max_read; i++) {
-        jint b = dis_read_byte(jvm, obj);
-        if (b < 0) {
-            break;
+
+    /* v36.74 [STREAM-BATCH]: bulk memcpy read (see dis_resolve_bais) —
+     * the byte loop cost a full chain-chase per byte; the lang.xx parse
+     * reads whole resources per state-machine iteration. */
+    {
+        JavaObject* bais = NULL;
+        JavaArray* buf = NULL;
+        jint pos = 0, count = 0;
+        if (dis_resolve_bais(obj, &bais, &buf, &pos, &count)) {
+            JavaThread* stm_self = thread_current(jvm);
+            jint avail = dis_bais_avail(pos, count);
+            if (avail <= 0) {
+                if (stm_self) {
+                    stm_self->last_stm_pos = pos;
+                    stm_self->last_stm_count = count;
+                    stm_self->last_stm_len = (jint)buf->length;
+                    stm_self->last_stm_reads++;
+                }
+                native_stm_eof_tick(jvm, stm_self, pos, count, (jint)buf->length);
+                return NATIVE_RETURN_INT(-1);
+            }
+            jint take = (buffer->length < avail) ? (jint)buffer->length : avail;
+            memcpy((uint8_t*)array_data(buffer),
+                   (uint8_t*)array_data(buf) + pos, (size_t)take);
+            dis_bais_advance(stm_self, bais, buf, pos, count, take);
+            return NATIVE_RETURN_INT(take);
         }
-        data[i] = (uint8_t)b;
-        bytes_read++;
     }
-    
-    return NATIVE_RETURN_INT(bytes_read > 0 ? bytes_read : -1);
+    return NATIVE_RETURN_INT(-1);
 }
 
 /* DataInputStream.read(byte[], int, int) - reads with offset/length */
@@ -3269,7 +3415,33 @@ static JavaValue native_datainputstream_read_offset(JVM* jvm, JavaThread* thread
         native_throw_aioobe(jvm, thread, offset);
         return NATIVE_RETURN_INT(-1);
     }
-    
+
+    /* v36.74 [STREAM-BATCH]: bulk memcpy read (see dis_resolve_bais). */
+    {
+        JavaObject* bais = NULL;
+        JavaArray* buf = NULL;
+        jint pos = 0, count = 0;
+        if (dis_resolve_bais(obj, &bais, &buf, &pos, &count)) {
+            JavaThread* stm_self = thread_current(jvm);
+            jint avail = dis_bais_avail(pos, count);
+            if (avail <= 0) {
+                if (stm_self) {
+                    stm_self->last_stm_pos = pos;
+                    stm_self->last_stm_count = count;
+                    stm_self->last_stm_len = (jint)buf->length;
+                    stm_self->last_stm_reads++;
+                }
+                native_stm_eof_tick(jvm, stm_self, pos, count, (jint)buf->length);
+                return NATIVE_RETURN_INT(-1);
+            }
+            jint take = (length < avail) ? length : avail;
+            uint8_t* data = (uint8_t*)array_data(buffer);
+            memcpy(data + offset, (uint8_t*)array_data(buf) + pos, (size_t)take);
+            dis_bais_advance(stm_self, bais, buf, pos, count, take);
+            return NATIVE_RETURN_INT(take);
+        }
+    }
+
     uint8_t* data = (uint8_t*)array_data(buffer);
     int bytes_read = 0;
     
@@ -3295,15 +3467,34 @@ static JavaValue native_datainputstream_skip(JVM* jvm, JavaThread* thread,
     if (!obj || n <= 0) {
         return NATIVE_RETURN_LONG(0);
     }
-    
-    long skipped = 0;
-    for (int i = 0; i < n; i++) {
-        jint b = dis_read_byte(jvm, obj);
-        if (b < 0) break;
-        skipped++;
+
+    /* v36.74 [STREAM-BATCH]: bulk skip (twin of skipBytes — the long form
+     * had the same per-byte chain-chase cost). */
+    {
+        JavaObject* bais = NULL;
+        JavaArray* buf = NULL;
+        jint pos = 0, count = 0;
+        if (dis_resolve_bais(obj, &bais, &buf, &pos, &count)) {
+            JavaThread* stm_self = thread_current(jvm);
+            jint avail = dis_bais_avail(pos, count);
+            if (avail <= 0) {
+                if (stm_self) {
+                    stm_self->last_stm_pos = pos;
+                    stm_self->last_stm_count = count;
+                    stm_self->last_stm_len = (jint)buf->length;
+                    stm_self->last_stm_reads++;
+                }
+                native_stm_eof_tick(jvm, stm_self, pos, count, (jint)buf->length);
+                return NATIVE_RETURN_LONG(0);
+            }
+            jlong takej = (n < (jlong)avail) ? n : (jlong)avail;
+            jint take = (jint)takej;
+            dis_bais_advance(stm_self, bais, buf, pos, count, take);
+            return NATIVE_RETURN_LONG(take);
+        }
     }
-    
-    return NATIVE_RETURN_LONG(skipped);
+    native_stm_eof_tick(jvm, thread_current(jvm), 0, 0, -1);
+    return NATIVE_RETURN_LONG(0);
 }
 
 /* DataInputStream.available() - returns bytes available */
@@ -3409,16 +3600,31 @@ static JavaValue native_datainputstream_readUTF(JVM* jvm, JavaThread* thread,
     }
     
     /* Read length (unsigned short) */
-    jint b1 = dis_read_byte(jvm, obj);
-    jint b2 = dis_read_byte(jvm, obj);
-    
-    if (b1 < 0 || b2 < 0) {
-        jvm_throw_by_name(jvm, "java/io/EOFException", NULL);
-        thread->pending_exception = jvm_exception_pending(jvm);
-        return NATIVE_RETURN_NULL();
+    /* v36.74 [STREAM-BATCH]: bulk path — one chain-chase for the length,
+     * one for the body (was 2 + utf_length byte dispatches). */
+    jint utf_length = -1;
+    {
+        uint8_t lb[2];
+        int rc = dis_read_bulk(jvm, obj, lb, 2);
+        if (rc > 0) {
+            utf_length = ((jint)lb[0] << 8) | lb[1];
+        } else if (rc == 0) {
+            jvm_throw_by_name(jvm, "java/io/EOFException", NULL);
+            thread->pending_exception = jvm_exception_pending(jvm);
+            return NATIVE_RETURN_NULL();
+        }
     }
-    
-    jint utf_length = (b1 << 8) | b2;
+    if (utf_length < 0) {
+        jint b1 = dis_read_byte(jvm, obj);
+        jint b2 = dis_read_byte(jvm, obj);
+        
+        if (b1 < 0 || b2 < 0) {
+            jvm_throw_by_name(jvm, "java/io/EOFException", NULL);
+            thread->pending_exception = jvm_exception_pending(jvm);
+            return NATIVE_RETURN_NULL();
+        }
+        utf_length = (b1 << 8) | b2;
+    }
     
     if (utf_length == 0) {
         JavaString* empty = jvm_new_string(jvm, "");
@@ -3431,6 +3637,19 @@ static JavaValue native_datainputstream_readUTF(JVM* jvm, JavaThread* thread,
         native_throw_oome(jvm, thread);
         return NATIVE_RETURN_NULL();
     }
+
+    /* v36.74 [STREAM-BATCH]: bulk body read (one chain-chase). */
+    {
+        int rc = dis_read_bulk(jvm, obj, utf_bytes, utf_length);
+        if (rc == 0) {
+            free(utf_bytes);
+            jvm_throw_by_name(jvm, "java/io/EOFException", NULL);
+            thread->pending_exception = jvm_exception_pending(jvm);
+            return NATIVE_RETURN_NULL();
+        }
+        if (rc > 0) goto utf_body_done;
+        /* rc < 0: no BAIS chain — byte fallback below. */
+    }
     
     for (int i = 0; i < utf_length; i++) {
         jint b = dis_read_byte(jvm, obj);
@@ -3442,6 +3661,7 @@ static JavaValue native_datainputstream_readUTF(JVM* jvm, JavaThread* thread,
         }
         utf_bytes[i] = (uint8_t)b;
     }
+utf_body_done:
     
     /* Null-terminate the string! */
     utf_bytes[utf_length] = '\0';
@@ -3597,6 +3817,21 @@ static JavaValue native_datainputstream_readshort(JVM* jvm, JavaThread* thread,
         native_throw_npe(jvm, thread);
         return NATIVE_RETURN_INT(0);
     }
+
+    /* v36.74 [STREAM-BATCH]: one chain-chase instead of two. */
+    {
+        uint8_t b[2];
+        int rc = dis_read_bulk(jvm, obj, b, 2);
+        if (rc > 0) {
+            return NATIVE_RETURN_INT((jshort)((b[0] << 8) | b[1]));
+        }
+        if (rc == 0) {
+            jvm_throw_by_name(jvm, "java/io/EOFException", NULL);
+            thread->pending_exception = jvm_exception_pending(jvm);
+            return NATIVE_RETURN_INT(0);
+        }
+        /* rc < 0: no BAIS chain — byte fallback below. */
+    }
     
     jint b1 = dis_read_byte(jvm, obj);
     jint b2 = dis_read_byte(jvm, obj);
@@ -3620,6 +3855,22 @@ JavaValue* args, int arg_count) {
     if (!obj) {
         native_throw_npe(jvm, thread);
         return NATIVE_RETURN_INT(0);
+    }
+
+    /* v36.74 [STREAM-BATCH]: one chain-chase instead of four. */
+    {
+        uint8_t b[4];
+        int rc = dis_read_bulk(jvm, obj, b, 4);
+        if (rc > 0) {
+            jint val = ((uint32_t)(b[0]) << 24) | ((uint32_t)b[1] << 16) |
+                       ((uint32_t)b[2] << 8) | b[3];
+            return NATIVE_RETURN_INT(val);
+        }
+        if (rc == 0) {
+            jvm_throw_by_name(jvm, "java/io/EOFException", NULL);
+            thread->pending_exception = jvm_exception_pending(jvm);
+            return NATIVE_RETURN_INT(0);
+        }
     }
     
     /* Read 4 bytes sequentially, each call advances position */
@@ -3656,6 +3907,22 @@ static JavaValue native_datainputstream_readlong(JVM* jvm, JavaThread* thread,
         native_throw_npe(jvm, thread);
         return NATIVE_RETURN_LONG(0);
     }
+
+    /* v36.74 [STREAM-BATCH]: one chain-chase instead of eight. */
+    {
+        uint8_t b[8];
+        int rc = dis_read_bulk(jvm, obj, b, 8);
+        if (rc > 0) {
+            jlong val = 0;
+            for (int i = 0; i < 8; i++) val = (val << 8) | b[i];
+            return NATIVE_RETURN_LONG(val);
+        }
+        if (rc == 0) {
+            jvm_throw_by_name(jvm, "java/io/EOFException", NULL);
+            thread->pending_exception = jvm_exception_pending(jvm);
+            return NATIVE_RETURN_LONG(0);
+        }
+    }
     
     jlong val = 0;
     for (int i = 0; i < 8; i++) {
@@ -3686,6 +3953,30 @@ static JavaValue native_datainputstream_readfully(JVM* jvm, JavaThread* thread,
     uint8_t* data = (uint8_t*)array_data(buffer);
     if (!data) {
         return NATIVE_RETURN_VOID();
+    }
+
+    /* v36.74 [STREAM-BATCH]: bulk memcpy (see dis_resolve_bais). EOF still
+     * throws after consuming what was there (byte-loop parity). */
+    {
+        JavaObject* bais = NULL;
+        JavaArray* buf = NULL;
+        jint pos = 0, count = 0;
+        if (dis_resolve_bais(obj, &bais, &buf, &pos, &count)) {
+            JavaThread* stm_self = thread_current(jvm);
+            jint avail = dis_bais_avail(pos, count);
+            jint want = (jint)buffer->length;
+            jint take = (want < avail) ? want : avail;
+            if (take > 0) {
+                memcpy(data, (uint8_t*)array_data(buf) + pos, (size_t)take);
+                dis_bais_advance(stm_self, bais, buf, pos, count, take);
+            }
+            if (take < want) {
+                native_stm_eof_tick(jvm, stm_self, count, count, (jint)buf->length);
+                jvm_throw_by_name(jvm, "java/io/EOFException", NULL);
+                thread->pending_exception = jvm_exception_pending(jvm);
+            }
+            return NATIVE_RETURN_VOID();
+        }
     }
     
     for (int i = 0; i < (int)buffer->length; i++) {
@@ -3750,15 +4041,43 @@ static JavaValue native_datainputstream_skipbytes(JVM* jvm, JavaThread* thread,
     if (!obj || n <= 0) {
         return NATIVE_RETURN_INT(0);
     }
-    
-    int skipped = 0;
-    for (int i = 0; i < n; i++) {
-        jint b = dis_read_byte(jvm, obj);
-        if (b < 0) break;
-        skipped++;
+
+    /* v36.74 [STREAM-BATCH]: resolve the BAIS chain ONCE and skip in bulk.
+     * The old loop paid a full field-lookup chain PER BYTE (skipBytes(3000)
+     * = 3000 x ~5 name-based lookups through the native dispatcher) — the
+     * measured hot spot of the Bounce Tales 45-second startup "freeze"
+     * (121M byte dispatches on the host repro). Semantics preserved from
+     * the real CLDC contract: skipBytes "may skip fewer"; the partial
+     * count at EOF is what the game's `skipped = skipBytes(n-skipped)`
+     * loop tolerates on a real handset (where the underlying skip usually
+     * completes in one call for in-memory streams). */
+    {
+        JavaObject* bais = NULL;
+        JavaArray* buf = NULL;
+        jint pos = 0, count = 0;
+        if (dis_resolve_bais(obj, &bais, &buf, &pos, &count)) {
+            JavaThread* stm_self = thread_current(jvm);
+            jint avail = dis_bais_avail(pos, count);
+            if (avail <= 0) {
+                /* EOF: record + feed the spin detector (same as before). */
+                if (stm_self) {
+                    stm_self->last_stm_pos = pos;
+                    stm_self->last_stm_count = count;
+                    stm_self->last_stm_len = (jint)buf->length;
+                    stm_self->last_stm_reads++;
+                }
+                native_stm_eof_tick(jvm, stm_self, pos, count, (jint)buf->length);
+                return NATIVE_RETURN_INT(0);
+            }
+            jint take = (n < avail) ? n : avail;
+            dis_bais_advance(stm_self, bais, buf, pos, count, take);
+            return NATIVE_RETURN_INT(take);
+        }
     }
-    
-    return NATIVE_RETURN_INT(skipped);
+
+    /* No BAIS chain: the byte path never resolved either — EOF semantics. */
+    native_stm_eof_tick(jvm, thread_current(jvm), 0, 0, -1);
+    return NATIVE_RETURN_INT(0);
 }
 
 /* DataInputStream.readFloat() */
@@ -9333,6 +9652,29 @@ static const char* sysprop_dynamic(JVM* jvm, const char* key) {
         snprintf(s_dyn_buf, sizeof(s_dyn_buf), "%zu", v);
         return s_dyn_buf;
     }
+    /* v36.73 [VM-THREADPOOL]: живая статистика пула воркеров — Java-код
+     * (selftest, диагностика из игры) может проверить, что последовательные
+     * Thread.start ПЕРЕИСПОЛЬЗУЮТ припаркованных воркеров, а не плодят
+     * pthread'ы: nojme.pool.workers должен оставаться постоянным (равным
+     * пику одновременности), nojme.pool.idle расти после join(). */
+    if (strcmp(key, "nojme.pool.workers") == 0) {
+#ifndef _WIN32
+        extern int vm_pool_worker_count(void);
+        snprintf(s_dyn_buf, sizeof(s_dyn_buf), "%d", vm_pool_worker_count());
+        return s_dyn_buf;
+#else
+        return NULL;
+#endif
+    }
+    if (strcmp(key, "nojme.pool.idle") == 0) {
+#ifndef _WIN32
+        extern int vm_pool_idle_count(void);
+        snprintf(s_dyn_buf, sizeof(s_dyn_buf), "%d", vm_pool_idle_count());
+        return s_dyn_buf;
+#else
+        return NULL;
+#endif
+    }
     return NULL;
 }
 
@@ -9716,6 +10058,31 @@ static JavaValue native_system_getProperties(JVM* jvm, JavaThread* thread,
  * java.io.PrintStream native methods
  */
 
+/* v36.75 [MWINFIX] [SYSOUT]-В-ПОЛЕВОЙ-ЛОГ: на устройстве stderr не попадает
+ * в log.txt (класс [YSFIX2] v36.40), поэтому println-спам мидлетов (TT
+ * печатает СВОЙ статус из paint/key-обработчиков) был невидим — а это
+ * готовая телеметрия игры. Дублируем в sw_trace с тротлингом (первые 40,
+ * дальше каждая 200-я — лог-бюджет 1 МБ дороже). NOJME_SYSOUT_TRACE=0 — выкл. */
+static void sysout_field_trace(const char* kind, const char* s) {
+    static int n = 0, on = -1;
+    if (on < 0) {
+        const char* e = getenv("NOJME_SYSOUT_TRACE");
+        on = (e && e[0] == '0') ? 0 : 1;
+    }
+    if (!on) return;
+    int i = ++n;
+    if (i <= 40 || (i % 200) == 0) {
+        extern void sw_trace_force(const char* fmt, ...) __attribute__((weak));
+        if (sw_trace_force) {
+            if (s && s[0]) {
+                sw_trace_force("[SYSOUT] #%d %s %s", i, kind, s);
+            } else {
+                sw_trace_force("[SYSOUT] #%d %s (empty)", i, kind);
+            }
+        }
+    }
+}
+
 /* PrintStream.println(String) - print to stderr for debugging
  * NOTE: args[0]=this (PrintStream), args[1]=String argument for instance methods */
 static JavaValue native_printstream_println(JVM* jvm, JavaThread* thread,
@@ -9725,13 +10092,17 @@ static JavaValue native_printstream_println(JVM* jvm, JavaThread* thread,
     if (arg_count >= 2 && args[1].ref) {
         const char* s = native_get_string_utf8(jvm, args + 1, 0);
         if (s && s[0] != '\0') {
+            sysout_field_trace("println", s);
             fprintf(stderr, "[SYSOUT] %s\n", s);
         } else {
+            sysout_field_trace("println", "");
             fprintf(stderr, "[SYSOUT] (empty string)\n");
         }
     } else if (arg_count >= 2 && !args[1].ref) {
+        sysout_field_trace("println", "null");
         fprintf(stderr, "[SYSOUT] null\n");
     } else {
+        sysout_field_trace("println", "");
         fprintf(stderr, "[SYSOUT]\n");
     }
     return NATIVE_RETURN_VOID();
@@ -9741,6 +10112,7 @@ static JavaValue native_printstream_println(JVM* jvm, JavaThread* thread,
 static JavaValue native_printstream_println_empty(JVM* jvm, JavaThread* thread,
                                                    JavaValue* args, int arg_count) {
     (void)jvm; (void)thread; (void)args; (void)arg_count;
+    sysout_field_trace("println()", "");
     fprintf(stderr, "\n");
     return NATIVE_RETURN_VOID();
 }
@@ -9750,6 +10122,11 @@ static JavaValue native_printstream_println_int(JVM* jvm, JavaThread* thread,
                                                 JavaValue* args, int arg_count) {
     (void)jvm; (void)thread;
     int val = (arg_count >= 2) ? args[1].i : 0;
+    {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%d", val);
+        sysout_field_trace("println(I)", buf);
+    }
     fprintf(stderr, "[SYSOUT] %d\n", val);
     return NATIVE_RETURN_VOID();
 }
@@ -9761,6 +10138,7 @@ static JavaValue native_printstream_print(JVM* jvm, JavaThread* thread,
     if (arg_count >= 2 && args[1].ref) {
         const char* s = native_get_string_utf8(jvm, args + 1, 0);
         if (s) {
+            sysout_field_trace("print", s);
             fprintf(stderr, "%s", s);
         }
     }
@@ -10349,11 +10727,19 @@ static JavaValue native_thread_currentThread(JVM* jvm, JavaThread* thread,
     return NATIVE_RETURN_OBJECT(thread ? thread->thread_object : NULL);
 }
 
+/* v36.84 [ZPERF-PSC]: счётчик Thread.sleep, укороченных clamp'ом окна
+ * paint (см. блок в native_thread_sleep + switch_trace.c поле psc= в
+ * 5-с диагностике). Слабо-читается диагностикой — в белых хост-тестах
+ * без неё просто не печатается. */
+volatile uint32_t g_zperf_psc_clamps = 0;
+/* v36.85 [TURBO-FF]: счётчик сон-дилатаций раннера в турбо (diag tff=). */
+volatile uint32_t g_turbo_ff_sleep_dilates = 0;
+
 static JavaValue native_thread_sleep(JVM* jvm, JavaThread* thread,
                                      JavaValue* args, int arg_count) {
     (void)arg_count;
     jlong millis = args[0].j;
-    
+
     static int sleep_log_count = 0;
     sleep_log_count++;
     /* v36.37 DIAG (Alien Shooter 3D 4-fps report): NOJME_SCHED_TRACE=1 —
@@ -10409,7 +10795,123 @@ static JavaValue native_thread_sleep(JVM* jvm, JavaThread* thread,
     
     /* Cap sleep time */
     if (millis > 10000) millis = 10000;
-    
+
+    /* v36.84 [ZPERF-PSC]: paint-sleep clamp.
+     *
+     * ПОЛЕВОЙ КОРЕНЬ (Zombie Infection [240x320] K800i, v36.83): Gameloft-
+     * идиома `paint(){ render; Thread.sleep(20); yield; }` в нашей насосной
+     * модели исполняется НА ФРОНТЕНД-ПОТОКЕ (v35.02 SINGLE-PUMP: paint
+     * крутит только фронтенд, VM-раннер стоит в serviceRepaints и ждёт
+     * окончания насоса). Сон на телефоне отдавал единственный CPU второму
+     * потоку игры — в эмуляторе потоки НАСТОЯЩИЕ (4 ядра), фронтендный сон
+     * НИКОМУ ничего не отдаёт: 20 мс каждого кадра фронтенд стоит, раннер
+     * спит в poll-цикле, ввод/таймеры/present задержаны. На устройстве
+     * (интерпретатор ~24M insn/s) это ровно половина 40-мс бюджета кадра —
+     * «крайне медленно даже в турбо».
+     *
+     * ЛЕКАРСТВО: в АКТИВНОМ ОКНЕ paint (midp_paint_window_active, оба
+     * насосных вызова обёрнуты inc/dec с v36.83 ZFENCE-PAINT) на НЕ-раннер
+     * потоке (фронтенд) сон >= 10 мс укорачивается до cap (дефолт 5 мс).
+     * Сны < 10 мс — хореография (фейды и т.п.) — не трогаем. Раннеры и
+     * фолбэк-насос раннера (250-мс bailout) сохраняют телефонную
+     * семантику целиком. Темп КОРРЕКТНЫХ игр не меняется: собственный
+     * лимитер кадра (у Zombie — spin до 40 мс в run()) и vsync-пейсинг
+     * serviceRepaints (v50) держат частоту; убыстряются только игры,
+     * чей пейсинг ЖИЛ исключительно на фронтендном сне в paint — для них
+     * NOJME_PAINT_SLEEP_MS=0 возвращает старое поведение байт-в-байт. */
+    {
+        extern int midp_paint_window_active(void) __attribute__((weak));
+        static long s_psc_cap_ms = -1;
+        if (s_psc_cap_ms < 0) {
+            const char* e = getenv("NOJME_PAINT_SLEEP_MS");
+            s_psc_cap_ms = (e && atol(e) >= 0) ? atol(e) : 5;
+        }
+        if (s_psc_cap_ms > 0 && millis >= 10 && millis > s_psc_cap_ms &&
+            &midp_paint_window_active && midp_paint_window_active()) {
+            extern int jvm_current_os_thread_is_vm_runner(void);
+            if (!jvm_current_os_thread_is_vm_runner()) {
+                static int s_psc_traced = 0;
+                if (!s_psc_traced) {
+                    s_psc_traced = 1;
+                    {
+                        extern void sw_trace_force(const char* fmt, ...)
+                            __attribute__((weak));
+                        if (&sw_trace_force && sw_trace_force)
+                            sw_trace_force("[ZPERF] paint-sleep clamp %ld -> %ld ms "
+                                           "(frontend paint window; NOJME_PAINT_SLEEP_MS=0 отключает)",
+                                           (long)millis, s_psc_cap_ms);
+                    }
+                    LOG_SAFE("[ZPERF] paint-sleep clamp %ld -> %ld ms (paint window)\n",
+                             (long)millis, s_psc_cap_ms);
+                }
+                g_zperf_psc_clamps++;
+                /* v36.85 [TURBO-FF]: в турбо кап ещё жёстче — сон фронтенда
+                 * внутри paint это чистая потеря кадра; NOJME_PAINT_SLEEP_TURBO_MS
+                 * (дефолт 1) ужимает его до миллисекунды. Берётся МЕНЬШИЙ
+                 * из обычного и турбо-капа. */
+                {
+                    static long s_psc_turbo_ms = -2;
+                    long cap = s_psc_cap_ms;
+                    if (s_psc_turbo_ms == -2) {
+                        const char* te = getenv("NOJME_PAINT_SLEEP_TURBO_MS");
+                        s_psc_turbo_ms = (te && te[0]) ? atol(te) : 1;
+                    }
+                    if (s_psc_turbo_ms > 0) {
+                        extern long g_jvm_thread_budget; /* 0 = turbo */
+                        if (g_jvm_thread_budget == 0 && cap > s_psc_turbo_ms)
+                            cap = s_psc_turbo_ms;
+                    }
+                    millis = cap;
+                }
+            }
+        }
+        /* v36.85 [TURBO-FF] сон-дилатация раннера: в турбо собственный
+         * лимитер кадра ИГРЫ (Thread.sleep(20..40) в главном цикле
+         * run()) — главный тормоз: бюджет ВМ уже снят (0), а сон всё
+         * равно держит телефонный темп. Классический fast-forward
+         * эмулятора ускоряет ИГРОВОЕ время: сны раннера >= 8 мс делятся
+         * на делитель (NOJME_TURBO_SLEEP_DIV, дефолт 4; 0 = выкл).
+         * НЕ трогаем: сны < 8 мс (хореография фейдов), сны фронтенда
+         * (не-раннер — там свой кламп выше), сны в окне паузы меню
+         * (g_frontend_pause_active учтён в цикле сна ниже). Побочный
+         * эффект — таймеры/анимации игры ускоряются вместе с логикой:
+         * это и есть семантика турбо-режима. */
+        {
+            static long s_turbo_div = -2;
+            if (s_turbo_div == -2) {
+                const char* de = getenv("NOJME_TURBO_SLEEP_DIV");
+                s_turbo_div = (de && de[0]) ? atol(de) : 4;
+            }
+            if (s_turbo_div > 0 && millis >= 8) {
+                extern long g_jvm_thread_budget; /* 0 = turbo */
+                extern int jvm_current_os_thread_is_vm_runner(void);
+                if (g_jvm_thread_budget == 0 &&
+                    jvm_current_os_thread_is_vm_runner()) {
+                    jlong diluted = millis / s_turbo_div;
+                    if (diluted < 1) diluted = 1;
+                    if (diluted < millis) {
+                        static int s_td_traced = 0;
+                        if (!s_td_traced) {
+                            s_td_traced = 1;
+                            {
+                                extern void sw_trace_force(const char* fmt, ...)
+                                    __attribute__((weak));
+                                if (&sw_trace_force && sw_trace_force)
+                                    sw_trace_force("[TURBO-FF] runner sleep %ld -> %ld ms "
+                                                   "(turbo; NOJME_TURBO_SLEEP_DIV=0 отключает)",
+                                                   (long)millis, (long)diluted);
+                            }
+                            LOG_SAFE("[TURBO-FF] runner sleep %ld -> %ld ms (turbo)\n",
+                                     (long)millis, (long)diluted);
+                        }
+                        g_turbo_ff_sleep_dilates++;
+                        millis = diluted;
+                    }
+                }
+            }
+        }
+    }
+
     /* ИСПРАВЛЕНО: Для pthread-based threading НЕ обрабатываем таймеры и repaints
      * внутри sleep, потому что это вызывает рекурсивное выполнение байт-кода.
      * Таймеры и repaints должны обрабатываться только в главном цикле.
@@ -10446,6 +10948,16 @@ static JavaValue native_thread_sleep(JVM* jvm, JavaThread* thread,
              * остаток сна сохраняется точь-в-точь. */
             if (g_frontend_pause_active) {
                 jvm_frontend_pause_park();
+                /* v36.63 [SPIN-BREAK-PAUSE-FRESH]: парковка — НЕ спин;
+                 * возраст нативов после неё начинается заново (парность
+                 * с execute.c:1400), иначе длительное меню накопило бы
+                 * ложный возраст для спин-брейкера. v36.88: сюда же
+                 * сброс аккумулятора работы (гейт [SPIN-BREAK-ICOUNT]). */
+                if (thread && thread->last_native_ms) {
+                    extern int64_t jvm_exec_now_ms(void);
+                    thread->last_native_ms = (jlong)jvm_exec_now_ms();
+                    thread->spin_instr = 0;
+                }
             }
             /* v36.30 [EXIT-FENCE]: спящие/ждущие раннеры тоже уважают окно
              * фрейм-потока (destroyApp и т.п.) — иначе проснувшись посреди
@@ -10684,6 +11196,7 @@ void native_threads_registry_reset(void) {
 void jvm_note_native_call(JavaThread* thread, const char* cls, const char* mth) {
     if (!thread) return;
     thread->last_native_ms = (jlong)GetTickCount64();
+    thread->spin_instr = 0; /* v36.88 [SPIN-BREAK-ICOUNT] */
     if (cls && mth) {
         snprintf(thread->last_native, sizeof(thread->last_native), "%.60s.%.30s", cls, mth);
     } else {
@@ -10862,7 +11375,88 @@ void native_threads_registry_reset(void) {
         g_pthread_running[i] = false;
     }
     g_live_count = 0;
-    LOG_SAFE("[THREAD] registry reset (session boundary)\n");
+    /* v36.73 [VM-THREADPOOL]: the pool workers SURVIVE the session boundary
+     * (they park, they do not exit) — keep their permanent slots visible
+     * as idle entries so the census / td dumps stay coherent; the next
+     * claim re-points them via pool_claim_registry. Without this, slots
+     * above a stale g_live_count would be invisible until some later
+     * claim grew the count again. */
+    {
+        extern int vm_pool_worker_count(void);
+        int n = vm_pool_worker_count();
+        if (n > MAX_PTHREADS) n = MAX_PTHREADS;
+        if (n > 0) {
+            g_live_count = n;   /* entries stay NULL/not-running = idle */
+        }
+    }
+    LOG_SAFE("[THREAD] registry reset (session boundary, pool workers=%d)\n",
+             g_live_count);
+}
+
+/* v36.63 [SPIN-BREAK-PAUSE-FRESH]: обновить last_native_ms каждого живого
+ * pthread-раннера. Вызывается ТОЛЬКО из threads.c (spin_break_pause_fresh_all)
+ * в момент снятия frontend-паузы: время, проведённое под меню оверлея, — не
+ * чисто-Java спин, и спин-брейкер (execute.c v36.57) не должен стрелять по
+ * возрасту, накопленному за меню. Раннеры, качавшие байткод в паузе, и так
+ * освежают возраст на выходе своих парковок (execute.c:1400, sleep-цикл
+ * ниже); этот проход закрывает ОСТАЛЬНЫЕ (ждавшие в monitor_wait, в чужих
+ * нативах и т.п.). last_native_ms==0 не трогаем — брейкер для такого потока
+ * ещё ни разу не вооружался (см. execute.c:1660). Racy-читки не нужны:
+ * вызов однопоточно делает поток фронтенда. */
+void jvm_spin_break_pause_fresh_runners(void) {
+    extern int64_t jvm_exec_now_ms(void); /* execute.c — те же CLOCK_MONOTONIC */
+    jlong now = (jlong)jvm_exec_now_ms();
+#ifdef _WIN32
+    for (int i = 0; i < MAX_PTHREADS; i++) {
+        if (g_pthread_running[i] && g_win_live_jt[i] &&
+            g_win_live_jt[i]->last_native_ms) {
+            g_win_live_jt[i]->last_native_ms = now;
+            g_win_live_jt[i]->spin_instr = 0; /* v36.88 [SPIN-BREAK-ICOUNT] */
+        }
+    }
+#else
+    for (int i = 0; i < g_live_count && i < MAX_PTHREADS; i++) {
+        if (g_live_running[i] && g_live_threads[i] &&
+            g_live_threads[i]->last_native_ms) {
+            g_live_threads[i]->last_native_ms = now;
+            g_live_threads[i]->spin_instr = 0; /* v36.88 [SPIN-BREAK-ICOUNT] */
+        }
+    }
+#endif
+}
+
+/* v36.83 [SPIN-BREAK-SIBLING]: есть ли у потока ХОТЯ БЫ ОДИН «свободный»
+ * живой сосед (pthread-раннер, не ждущий монитор и недавно делавший
+ * натив-вызовы)? Нужно спин-брейкеру (execute.c v36.57): чисто-Java спин
+ * на потоке, чей сосед свободно работает, — это почти всегда
+ * МЕЖПОТОЧНОЕ ОЖИДАНИЕ игровой логики (Gameloft-загрузка Zombie Infection:
+ * paint крутит `while (!groupDone) tick();`, а время скрипта тикает ВТОРОЙ
+ * поток), а не зависание — исключение брейкера здесь ломает корректную
+ * игру (unwind мимо игрового гарда повторного входа в paint). ГД-кейс
+ * (спин держит монитор, сосед висит на mon_enter) соседом НЕ считается —
+ * там брейкеру стрелять нужно как раньше. Регистр главного java-потока
+ * (tid=1, живёт на фронтенд-потоке) сюда не входит — для спиннера-раннера
+ * соседей нет и порог остаётся базовым (семантика v36.57 не меняется).
+ * Racy-читки полей допустимы: решение диагностическое. */
+int jvm_threads_have_free_sibling(int except_tid) {
+    extern int64_t jvm_exec_now_ms(void); /* execute.c — CLOCK_MONOTONIC */
+    jlong now = (jlong)jvm_exec_now_ms();
+#ifdef _WIN32
+    for (int i = 0; i < MAX_PTHREADS; i++) {
+        JavaThread* t = g_win_live_jt[i];
+        if (!g_pthread_running[i] || !t || t->id == except_tid) continue;
+        if (t->mon_enter_wait) continue;
+        if (t->last_native_ms && now - t->last_native_ms <= 1200) return 1;
+    }
+#else
+    for (int i = 0; i < g_live_count && i < MAX_PTHREADS; i++) {
+        JavaThread* t = g_live_threads[i];
+        if (!g_live_running[i] || !t || t->id == except_tid) continue;
+        if (t->mon_enter_wait) continue;
+        if (t->last_native_ms && now - t->last_native_ms <= 1200) return 1;
+    }
+#endif
+    return 0;
 }
 
 /* v36.13 HARD-KILL ("прибить все при выходе из мидлета"): the registry IS
@@ -10908,6 +11502,39 @@ void native_threads_kill_all(void) {
              names_n > 0 ? " " : "",
              names_n > 0 ? names[0] : "", names_n > 1 ? ", " : "",
              names_n > 1 ? names[1] : "");
+}
+
+/* v36.75 [MWINFIX]: счётчик и трейс exec-окон ГЛАВНОГО потока. Корень:
+ * полевой лог v36.74 (TT, сессия 3) показывал «td m nat=PrintStream.println
+ * age=42655» при ЖИВОМ m — обфусцированные обёртки мидлета (len<=7, ни
+ * одного нативного вызова) не обновляют last_native_ms, и возраст натива
+ * рос бесконечно, посылая расследование по ложному следу «m завис в
+ * println». Хост-репро (bt.jar + switchui-verify) доказал: [KEYDIAG]
+ * keyPressed(53) executed on o ret=0 len=7 — окна открываются и мгновенно
+ * закрываются, это НОРМА архитектуры BT/TT (вся логика в t2).
+ * Теперь каждое окно m инкрементирует mwin= (diag) и при СМЕНЕ сайта —
+ * трейсит [MWIN] имя+длину: полевой лог одним взглядом отличает
+ * «m жив, крутит заглушки» (mwin>0, сайты меняются) от «m мёртв»
+ * (mwin=0, сайт и возраст замерли). Тротлинг: первые 60 смен сайта,
+ * дальше каждая 200-я. */
+void jvm_mwin_note(const char* cls, const char* mth, int len) {
+    extern volatile uint32_t g_sd_mwin;
+    __sync_fetch_and_add(&g_sd_mwin, 1);
+    static char s_last[64] = "";
+    static unsigned s_logs = 0;
+    char site[64];
+    snprintf(site, sizeof(site), "%.28s.%.28s",
+             cls ? cls : "?", mth ? mth : "?");
+    if (strcmp(site, s_last) != 0) {
+        unsigned n = ++s_logs;
+        if (n <= 60 || (n % 200) == 0) {
+            extern void sw_trace_force(const char* fmt, ...) __attribute__((weak));
+            if (sw_trace_force) {
+                sw_trace_force("[MWIN] #%u %s len=%d", n, site, len);
+            }
+        }
+        snprintf(s_last, sizeof(s_last), "%s", site);
+    }
 }
 
 void jvm_dump_all_threads(void) {
@@ -11054,6 +11681,23 @@ void jvm_threads_dump_snprint(JVM* jvm, char* buf, size_t cap, int deep) {
             off += (size_t)snprintf(buf + off, cap - off, " | %.48s",
                                     mt->jsite);
         }
+        /* v36.74 [TSTART-E] DIAG: jsite + main-exec flag ALWAYS on the m
+         * line (deep dumps are rare in the field). A stale jsite with a
+         * growing native age and exec=0 says the main fiber has not run a
+         * single opcode since; exec=1 with age growing says it IS running
+         * pure Java (spin) — different fixes. */
+        {
+            extern volatile int g_jvm_main_thread_executing;
+            if (mt->jsite[0] && off + 72 < cap) {
+                off += (size_t)snprintf(buf + off, cap - off,
+                                        " js=%.40s exec=%d",
+                                        mt->jsite,
+                                        g_jvm_main_thread_executing ? 1 : 0);
+            } else if (off + 24 < cap) {
+                off += (size_t)snprintf(buf + off, cap - off, " exec=%d",
+                                        g_jvm_main_thread_executing ? 1 : 0);
+            }
+        }
         off += (size_t)snprintf(buf + off, cap - off, "\n");
     }
 
@@ -11199,6 +11843,9 @@ void jvm_note_native_call(JavaThread* thread, const char* cls, const char* mth) 
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     thread->last_native_ms = (jlong)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    thread->spin_instr = 0; /* v36.88 [SPIN-BREAK-ICOUNT]: натив — точка
+     * «свежести» и для гейта: работа с последнего натива отсчитывается
+     * заново (см. JavaThread::spin_instr, execute.c slow-check). */
     if (cls && mth) {
         snprintf(thread->last_native, sizeof(thread->last_native), "%.60s.%.30s", cls, mth);
     } else {
@@ -11328,8 +11975,13 @@ static DWORD WINAPI win_thread_runner(LPVOID arg) {
     return 0;
 }
 #else
-/* POSIX thread runner */
-static void* pthread_thread_runner(void* arg) {
+/* POSIX thread runner — v36.73 [VM-THREADPOOL]: this is now the JOB BODY
+ * executed by a pooled worker (see threadpool.c), not a pthread entry.
+ * Everything inside is per-JavaThread; the worker that runs it is reused
+ * for the next Thread.start, so the tail MUST leave zero thread-local
+ * residue (TLS current-thread, vm-runner flag, frame pool, TLAB — the
+ * last two already flushed below before the park). */
+static void pthread_job_body(void* arg) {
     PthreadRunArgs* args = (PthreadRunArgs*)arg;
     int thread_id = args->java_thread->id;
     
@@ -11361,11 +12013,28 @@ static void* pthread_thread_runner(void* arg) {
 #endif /* !__SWITCH__ */
     }
     
-    /* v34.9: register in the watchdog live-thread registry */
-    if (g_live_count < MAX_PTHREADS) {
-        g_live_threads[g_live_count] = args->java_thread;
-        g_live_running[g_live_count] = true;
-        g_live_count++;
+    /* v34.9: register in the watchdog live-thread registry.
+     * v36.73 [VM-THREADPOOL]: the worker's registry SLOT is permanent —
+     * the claim (native_thread_start -> vm_pool_submit on_claim) already
+     * re-pointed it while this worker was still parked, so the GC census
+     * has seen us since before we could execute anything. Re-assert here
+     * (idempotent, same values) for the grow-path newborn case. */
+    {
+        int slot = vm_pool_current_slot();
+        if (slot >= 0 && slot < MAX_PTHREADS) {
+            g_live_threads[slot] = args->java_thread;
+            g_live_running[slot] = true;
+            /* Slots are handed out in increasing order; a concurrent
+             * claim of a higher slot must not lose the count. CAS-max. */
+            int seen = g_live_count;
+            while (slot >= seen &&
+                   !__atomic_compare_exchange_n(&g_live_count, &seen,
+                                                slot + 1, 0,
+                                                __ATOMIC_ACQ_REL,
+                                                __ATOMIC_ACQUIRE)) {
+                /* seen reloaded by the CAS failure; retry */
+            }
+        }
     }
     
     /* v34.95 CENSUS-WINDOW FIX: a GC that computed its safepoint census
@@ -11464,12 +12133,26 @@ static void* pthread_thread_runner(void* arg) {
     g_pthread_running[thread_id] = false;
     
 
-    /* v34.9: mark as finished in the watchdog registry */
-    for (int i = 0; i < g_live_count && i < MAX_PTHREADS; i++) {
-        if (g_live_threads[i] == args->java_thread) {
-            g_live_running[i] = false;
-            break;
+    /* v34.9: mark as finished in the watchdog registry.
+     * v36.73 [VM-THREADPOOL]: this thread's PERMANENT slot goes idle — the
+     * entry keeps pointing at the (GC-inert) JavaThread shell so the td dump
+     * can still say "t%d: done" for it until the next claim re-points it. */
+    {
+        int slot = vm_pool_current_slot();
+        if (slot >= 0 && slot < MAX_PTHREADS) {
+            g_live_running[slot] = false;
         }
+    }
+    /* v36.73 [COOP-REAP]: mark the coop-table entry TERMINATED so
+     * scheduler ids recycle and the coop reaper (thread_create's
+     * table-full compaction) frees this shell's arenas (256 KB Java stack
+     * + 64 KB allocator) instead of accumulating them per dead thread
+     * until jvm_destroy — pthread-backed corpses were NEVER reaped
+     * before (the coop TERMINATED state was only set by ucontext fibers),
+     * so a >128-thread game hit "Thread.start silently fails". */
+    {
+        extern void jvm_thread_mark_coop_terminated(JavaThread* jt);
+        jvm_thread_mark_coop_terminated(args->java_thread);
     }
     /* CRITICAL: Memory barrier before signaling completion.
      * This ensures all writes done by this thread (including field modifications)
@@ -11484,20 +12167,34 @@ static void* pthread_thread_runner(void* arg) {
     pthread_cond_broadcast(&g_pthread_cond[thread_id]);
     pthread_mutex_unlock(&g_pthread_mutex);
     
-    /* Clear TLS before exiting */
+    /* Clear TLS before parking — a reused worker must enter its next job
+     * with zero residue from this one (v36.73). */
     pthread_set_current_thread(NULL);
-    /* v36.12: return this pthread's frame pool to the heap before it dies
-     * (the pool is _Thread_local and would otherwise leak with the thread —
-     * see jvm_frame_pool_flush in execute.c). */
+    {
+        extern __thread int tls_os_thread_is_vm_runner;
+        tls_os_thread_is_vm_runner = 0;
+    }
+    /* v36.12: return this pthread's frame pool to the heap before it parks
+     * (the pool is _Thread_local; without the flush the worker would carry
+     * the dead run()'s frames into the next job — see jvm_frame_pool_flush
+     * in execute.c). The TLAB was already flushed above (v34.59) — the
+     * flush is idempotent, nothing allocates in between. */
     {
         extern void jvm_frame_pool_flush(void);
         jvm_frame_pool_flush();
     }
+    /* Clear the slow-check diagnostics shadow so the next run starts clean. */
+    args->java_thread->last_native[0] = '\0';
+    args->java_thread->last_native_ms = 0;
+    args->java_thread->spin_instr = 0; /* v36.88 [SPIN-BREAK-ICOUNT] */
+    args->java_thread->park_why[0] = '\0';
+    args->java_thread->jsite[0] = '\0';
+    args->java_thread->last_stm_len = 0;
     
     /* Free the args */
     free(args);
-    
-    return NULL;
+    /* NOT returning/exiting: the pool worker parks here and waits for the
+     * next Thread.start (vm_worker_main in threadpool.c). */
 }
 #endif
 
@@ -11540,6 +12237,31 @@ int native_threads_wait_idle(int timeout_ms) {
     }
 }
 
+#ifndef _WIN32
+/* v36.73 [VM-THREADPOOL]: registry re-point callback — runs inside the
+ * pool's claim critical section (fast path: worker parked, signal has not
+ * fired yet; grow path: worker not yet created). Marks the worker's
+ * PERMANENT slot as running THIS JavaThread; the census therefore counts
+ * the newcomer from the first instant it can execute — no create->register
+ * window at all (see the v34.95 CENSUS-WINDOW comment in pthread_job_body
+ * for what that window used to cost). */
+static void pool_claim_registry(void* ctx, int slot) {
+    JavaThread* jt = (JavaThread*)ctx;
+    if (slot < 0 || slot >= MAX_PTHREADS) return;
+    g_live_threads[slot] = jt;
+    g_live_running[slot] = true;
+    /* Keep g_live_count covering the slot (CAS-max: concurrent claims of
+     * different workers must not lose the highest slot). */
+    int seen = g_live_count;
+    while (slot >= seen &&
+           !__atomic_compare_exchange_n(&g_live_count, &seen, slot + 1,
+                                         0, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE)) {
+        /* seen reloaded by the failed CAS; retry */
+    }
+}
+#endif /* !_WIN32 (pool_claim_registry) */
+
 static JavaValue native_thread_start(JVM* jvm, JavaThread* thread,
                                      JavaValue* args, int arg_count) {
     (void)arg_count;
@@ -11566,11 +12288,40 @@ static JavaValue native_thread_start(JVM* jvm, JavaThread* thread,
     LOG_SAFE("[THREAD] Thread.start() (#%d): %s\n", 
             thread_start_count, run_class && run_class->class_name ? run_class->class_name : "?");
     
+    /* v36.73 [TSTART]: phase-stamp every Thread.start — the v36.72 field
+     * log showed the MAIN thread inside this native for 17+ s and nothing
+     * in the trace could say WHICH phase ate it (resolve / thread_create
+     * mallocs / pthread_create). These stamps make the NEXT field log
+     * self-explanatory. Phase 0 starts at the bridge entry. */
+    long long ts_t0 = (long long)native_monotonic_ms();
+
+    /* v36.74 [TSTART-E] DIAG: enter/exit brackets — the field logs (v36.72,
+     * v36.73) only proved td m age growth INSIDE this native, never whether
+     * the native RETURNED. Enter/exit lines + per-phase stamps settle it in
+     * ONE field log: enter with no exit = blocked inside (phase stamps then
+     * name the phase); enter+exit adjacent + age STILL growing = the block
+     * lives in pure-Java bytecode after return. */
+    {
+        extern void sw_trace_force(const char* fmt, ...) __attribute__((weak));
+        if (&sw_trace_force && sw_trace_force) {
+            sw_trace_force("[TSTART-E] enter #%d '%s' (caller tid=%d)",
+                           thread_start_count,
+                           run_class && run_class->class_name ? run_class->class_name : "?",
+                           thread ? thread->id : -1);
+        }
+    }
+
     /* Find run() method */
     JavaMethod* run_method = jvm_resolve_method(jvm, run_class, "run", "()V");
     if (!run_method) {
+        {
+            extern void sw_trace_force(const char* fmt, ...) __attribute__((weak));
+            if (&sw_trace_force && sw_trace_force)
+                sw_trace_force("[TSTART-E] exit  #%d (resolve failed)", thread_start_count);
+        }
         return NATIVE_RETURN_VOID();
     }
+    long long ts_resolve = (long long)native_monotonic_ms();
     
     /* Get thread name from Java field */
     char thread_name[64];
@@ -11590,8 +12341,14 @@ static JavaValue native_thread_start(JVM* jvm, JavaThread* thread,
     
     JavaThread* new_java_thread = thread_create(jvm, thread_name, priority, thread_obj);
     if (!new_java_thread) {
+        {
+            extern void sw_trace_force(const char* fmt, ...) __attribute__((weak));
+            if (&sw_trace_force && sw_trace_force)
+                sw_trace_force("[TSTART-E] exit  #%d (thread_create failed)", thread_start_count);
+        }
         return NATIVE_RETURN_VOID();
     }
+    long long ts_create = (long long)native_monotonic_ms();
     
     new_java_thread->is_alive = true;
     
@@ -11609,6 +12366,9 @@ static JavaValue native_thread_start(JVM* jvm, JavaThread* thread,
 #ifdef _WIN32
     /* Windows thread creation */
     win_thread_init();
+    /* v36.73 [TSTART] stamps are POSIX-only (the pool is POSIX-only);
+     * silence them here — MinGW builds with -Wall -Wextra. */
+    (void)ts_t0; (void)ts_resolve; (void)ts_create;
     
     /* Create event for join() */
     g_win_thread_events[new_java_thread->id] = CreateEvent(NULL, TRUE, FALSE, NULL);
@@ -11644,34 +12404,78 @@ static JavaValue native_thread_start(JVM* jvm, JavaThread* thread,
     /* Give the new thread a chance to start */
     Sleep(1);
 #else
-    /* POSIX thread creation */
-    pthread_t pthread_id;
-    
-    /* v9 FIX: set the running flag BEFORE pthread_create (see the Windows
-     * branch comment) so a concurrent shutdown can never miss this thread. */
+    /* POSIX: v36.73 [VM-THREADPOOL] — no pthread_create here.
+     * Thread.start claims a PARKED worker from the pool (condvar signal)
+     * or grows the pool by one worker; the worker runs pthread_job_body
+     * and parks again when run() returns. What this removes from the
+     * gameplay path, per Thread.start:
+     *   - pthread_create with a 2 MB stack carved from the malloc arena
+     *     (the Switch leak source; pool stacks are allocated once)
+     *   - pthread_detach — a NO-OP on libnx (the leak itself)
+     *   - usleep(1000) on the CALLING game thread (v9's "give it a
+     *     chance" — the pool handoff needs no grace period)
+     *   - reaper pthread_join latency at teardown (v36.72 phonestacks) */
+
+    /* v9 FIX (kept): the running flag is set BEFORE the job can start, so
+     * a concurrent shutdown can never miss this thread. */
     g_pthread_running[new_java_thread->id] = true;
-    
-    /* v17 FIX: request an explicit stack size instead of the process default
-     * (RLIMIT_STACK, often 2-8 MB). The interpreter needs several KB of native
-     * stack per Java frame; see the Windows comment above for the full story. */
-    pthread_attr_t thread_attr;
-    int use_attr = (pthread_attr_init(&thread_attr) == 0 &&
-                    pthread_attr_setstacksize(&thread_attr, JAVA_NATIVE_STACK_SIZE) == 0);
-    int rc = pthread_create(&pthread_id, use_attr ? &thread_attr : NULL,
-                            pthread_thread_runner, pthread_args);
-    if (use_attr) pthread_attr_destroy(&thread_attr);
-    if (rc != 0) {
+
+    /* Registry re-point executed INSIDE the claim critical section (the
+     * worker cannot run until it returns) — the GC census sees the
+     * newcomer from the first instant it could execute. */
+    long long ts_submit = (long long)native_monotonic_ms();
+    {
+        extern void sw_trace_force(const char* fmt, ...) __attribute__((weak));
+        if (&sw_trace_force && sw_trace_force)
+            sw_trace_force("[TSTART-E] submit #%d '%s' phases r=%lld c=%lld",
+                           thread_start_count, thread_name,
+                           ts_resolve - ts_t0, ts_create - ts_resolve);
+    }
+    if (vm_pool_submit(pthread_job_body, pthread_args,
+                       pool_claim_registry, new_java_thread) != 0) {
+        /* Pool at hard cap or shutting down — the old pthread_create-failed
+         * path: silent no-op start (identical v36.63 semantics). */
         free(pthread_args);
         g_pthread_running[new_java_thread->id] = false;
         new_java_thread->is_alive = false;
+        {
+            extern void sw_trace_force(const char* fmt, ...) __attribute__((weak));
+            if (&sw_trace_force && sw_trace_force)
+                sw_trace_force("[TSTART-E] exit  #%d (submit failed)", thread_start_count);
+        }
         return NATIVE_RETURN_VOID();
     }
-    
-    /* Detach the thread so it cleans up automatically */
-    pthread_detach(pthread_id);
-    
-    /* Give the new thread a chance to start */
-    usleep(1000);  /* 1ms */
+
+    /* v36.73 [TSTART]: slow-start trace (device log.txt). Threshold 50 ms
+     * catches the 17 s-class stalls without flooding. */
+    {
+        long long ts_now = (long long)native_monotonic_ms();
+        long long total = ts_now - ts_t0;
+        if (total > 50) {
+            extern void sw_trace_force(const char* fmt, ...)
+                __attribute__((weak));
+            if (&sw_trace_force && sw_trace_force) {
+                sw_trace_force("[TSTART] Thread.start('%s') took %lld ms: "
+                               "resolve=%lld create=%lld submit=%lld "
+                               "pool=%dw/%di",
+                               thread_name, total,
+                               ts_resolve - ts_t0,
+                               ts_create - ts_resolve,
+                               ts_now - ts_submit,
+                               vm_pool_worker_count(),
+                               vm_pool_idle_count());
+            }
+        }
+        /* v36.74 [TSTART-E]: success exit bracket (see the enter block). */
+        {
+            extern void sw_trace_force(const char* fmt, ...)
+                __attribute__((weak));
+            if (&sw_trace_force && sw_trace_force) {
+                sw_trace_force("[TSTART-E] exit  #%d '%s' ok total=%lld ms",
+                               thread_start_count, thread_name, total);
+            }
+        }
+    }
 #endif
     
     return NATIVE_RETURN_VOID();

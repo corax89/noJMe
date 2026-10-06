@@ -22,10 +22,20 @@ void switch_scaling_game_rect(int scale_mode,
  * box averaging, then apply `passes` 3x3 box-blur rounds on the small
  * buffer. dst is uploaded as a texture and linearly stretched to the
  * whole screen by the presenter — the classic "blurred background fill"
- * behind a letterboxed game. Cost: O(dst pixels) per frame, tiny. */
+ * behind a letterboxed game. v36.86 [BLUR-NEON]: on aarch64, uniform
+ * 8x-block mappings (src == 8*dst in both axes) take a NEON kernel that
+ * is bit-exact with the scalar reference; every other mapping and every
+ * non-ARM host use the universal scalar path. Frame-thread-only. */
 void switch_scaling_blur_bg(const uint32_t* src, int src_w, int src_h,
                             uint32_t* dst, int dst_w, int dst_h,
                             int passes);
+
+/* v36.86: scalar reference of the same contract — the unit test diffs it
+ * bit-for-bit against switch_scaling_blur_bg on aarch64 (where the public
+ * entry dispatches to NEON for uniform 8x sizes). */
+void switch_scaling_blur_bg_scalar(const uint32_t* src, int src_w, int src_h,
+                                   uint32_t* dst, int dst_w, int dst_h,
+                                   int passes);
 
 /* Recommended background buffer dimensions for a game canvas: ~1/8 of the
  * canvas, min 8x8. */

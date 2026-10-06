@@ -28,6 +28,14 @@ void switch_ui_jaricons_reset(void);
  * menu); returns on B. */
 void switch_ui_pergame_screen(const char* jar_path);
 
+/* v36.87 [PG-CONTROLS]: in-game per-MIDlet CONTROLS screen (pause menu
+ * item «Управление»): stick diagonals ([STICK-DIAG]), stick/D-pad swap
+ * (moved here from the per-game screen) and per-button key assignment
+ * (btn.A=.. in the same pergame ini). Same contract as the per-game
+ * screen: own pump loop, VM stays parked by the pause-menu brackets,
+ * everything applies LIVE; returns on B. */
+void switch_ui_controls_screen(const char* jar_path);
+
 /* v36.26 [TOUCH-UI]: hit box of the language badge (top-left corner).
  * y_off — 8 in the menu headers (draw_lang_badge), 24 in the pause
  * overlay. A tap on the badge acts as MINUS (language toggle). */

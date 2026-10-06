@@ -71,12 +71,12 @@ void switch_scaling_rotate90(const uint32_t* src, int w, int h,
     }
 }
 
-void switch_scaling_blur_bg(const uint32_t* src, int src_w, int src_h,
-                            uint32_t* dst, int dst_w, int dst_h,
-                            int passes) {
-    if (!src || !dst || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0)
-        return;
-
+/* v36.86 [BLUR-NEON]: pass 1 вынесен в отдельную функцию — теперь есть
+ * ДВА потребителя: скалярный эталон (бит-в-бит прежняя семантика произвольных
+ * окон) и NEON-путь для равномерных 8x-блоков ниже. Разделение НЕ меняет
+ * поведение: код перенесён дословно. */
+static void blur_downsample_scalar(const uint32_t* src, int src_w, int src_h,
+                                   uint32_t* dst, int dst_w, int dst_h) {
     /* ---- Pass 1: box-average downsample (area averaging) ----
      * For each destination pixel, average the source rectangle it covers.
      * Integer accumulation; alpha forced opaque. */
@@ -107,20 +107,24 @@ void switch_scaling_blur_bg(const uint32_t* src, int src_w, int src_h,
                     ((rs / n) << 16) | ((gs / n) << 8) | (bs / n);
         }
     }
+}
 
-    /* ---- Pass 2: 3x3 box blur rounds (in place, two saved source rows) ----
-     * Operating on the tiny dst buffer. Row y-1 must be read in its
-     * ORIGINAL (pre-blur) form while dst row y is being overwritten, so
-     * the two previous source rows are kept in side buffers; row y+1 is
-     * still untouched in dst at the time row y is computed. */
-    if (passes <= 0) return;
+/* ---- Pass 2: 3x3 box blur rounds (in place, two saved source rows) ----
+ * Operating on the tiny dst buffer. Row y-1 must be read in its
+ * ORIGINAL (pre-blur) form while dst row y is being overwritten, so
+ * the two previous source rows are kept in side buffers; row y+1 is
+ * still untouched in dst at the time row y is computed.
+ * Returns 0 on allocation failure (blur is cosmetic — flat downsample
+ * is acceptable), 1 on success. */
+static int blur_box3x3(uint32_t* dst, int dst_w, int dst_h, int passes) {
+    if (passes <= 0) return 1;
 
     uint32_t* prev_orig = (uint32_t*)malloc((size_t)dst_w * sizeof(uint32_t));
     uint32_t* cur_orig = (uint32_t*)malloc((size_t)dst_w * sizeof(uint32_t));
     uint32_t* out = (uint32_t*)malloc((size_t)dst_w * sizeof(uint32_t));
     if (!prev_orig || !cur_orig || !out) {
         free(prev_orig); free(cur_orig); free(out);
-        return; /* blur is cosmetic — flat downsample is acceptable */
+        return 0; /* blur is cosmetic — flat downsample is acceptable */
     }
 
     for (int p = 0; p < passes; p++) {
@@ -161,6 +165,105 @@ void switch_scaling_blur_bg(const uint32_t* src, int src_w, int src_h,
         }
     }
     free(prev_orig); free(cur_orig); free(out);
+    return 1;
+}
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+
+/* v36.86 [BLUR-NEON]: равномерная 8x8-блочная версия pass 1 для AArch64.
+ *
+ * ЗАЧЕМ: [BLUR-EVERYFRAME] (sdl_graphics.c) вернул пересчёт блюр-фона на
+ * КАЖДЫЙ present — в обычном режиме это 60 пересчётов/с полного даунсемпла
+ * кадра. Скалярный проход читает весь кадр с ~10 операциями на пиксель —
+ * на A57 это порядка миллисекунды за present. NEON-версия жмёт блок 8x8
+ * до трёх горизонтальных сумм на окно (vld4_u8 деинтерлив + vaddvq_u16)
+ * и накапливает их вертикально в u32-аккумулятор — примерно 2 операции на
+ * пиксель, в ~5 раз дешевле скаляря.
+ *
+ * БИТ-В-БИТ ЭКВИВАЛЕНТ скалярному эталону: оба считают ЦЕЛЫЕ суммы тех же
+ * 64 пикселей окна и делят на то же n=64 — целочисленное сложение
+ * ассоциативно, порядок накопления не влияет на результат. Эквивалентность
+ * проверяется юнит-тестом (scripts/test_switch_scaling.c) на aarch64-сборке.
+ *
+ * Скретч-аккумулятор (dst_w*3 u32) — статический с ростом по потребности:
+ * единственный вызывающий — поток презентации (как у s2x_pad_* выше);
+ * юнит-тест тоже однопоточный. Возвращает 0 при отказе malloc — вызывающий
+ * откатывается на скалярный путь. */
+static uint32_t* blur_acc = NULL;
+static int blur_acc_cap = 0;
+
+static int blur_downsample_neon8(const uint32_t* src, int src_w,
+                                 uint32_t* dst, int dst_w, int dst_h) {
+    if (blur_acc_cap < dst_w * 3) {
+        int cap = blur_acc_cap ? blur_acc_cap : 256;
+        while (cap < dst_w * 3) cap *= 2;
+        uint32_t* na = (uint32_t*)realloc(blur_acc, (size_t)cap * sizeof(uint32_t));
+        if (!na) return 0; /* старый буфер валиден — вызывающий идёт в скаляр */
+        blur_acc = na;
+        blur_acc_cap = cap;
+    }
+
+    for (int by = 0; by < dst_h; by++) {
+        uint32_t* a = blur_acc;
+        memset(a, 0, (size_t)dst_w * 3 * sizeof(uint32_t));
+        for (int r = 0; r < 8; r++) {
+            /* ARGB8888 в u32 на little-endian: байт0=B (младший), байт1=G,
+             * байт2=R, байт3=A — vld4_u8 расщепляет 8 пикселей на четыре
+             * u8x8-плоскости именно в этом порядке. (Первая версия путала
+             * порядок и падала эквивалентностью на aarch64/qemu — потому
+             * тест и гоняется под эмуляцией, см. test_blur_equivalence.) */
+            const uint8_t* row = (const uint8_t*)
+                (src + (size_t)(by * 8 + r) * src_w);
+            for (int j = 0; j < dst_w; j++) {
+                uint8x8x4_t px = vld4_u8(row + (size_t)j * 32);
+                a[j * 3 + 0] += (uint32_t)vaddvq_u16(vmovl_u8(px.val[2])); /* R */
+                a[j * 3 + 1] += (uint32_t)vaddvq_u16(vmovl_u8(px.val[1])); /* G */
+                a[j * 3 + 2] += (uint32_t)vaddvq_u16(vmovl_u8(px.val[0])); /* B */
+            }
+        }
+        uint32_t* drow = dst + (size_t)by * dst_w;
+        for (int j = 0; j < dst_w; j++) {
+            drow[j] = 0xFF000000u |
+                ((a[j * 3 + 0] / 64u) << 16) |
+                ((a[j * 3 + 1] / 64u) << 8) |
+                (a[j * 3 + 2] / 64u);
+        }
+    }
+    return 1;
+}
+#endif /* aarch64 / NEON */
+
+void switch_scaling_blur_bg(const uint32_t* src, int src_w, int src_h,
+                            uint32_t* dst, int dst_w, int dst_h,
+                            int passes) {
+    if (!src || !dst || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0)
+        return;
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
+    /* Равномерные 8x-блоки (все канвасы, кратные 8: 240x320, 320x240,
+     * 128x128, 176x208...) — NEON-путь; всё остальное (например 176x220
+     * -> 22x27, окна смешанной ширины) — универсальный скаляр. */
+    if (src_w == dst_w * 8 && src_h == dst_h * 8 &&
+        blur_downsample_neon8(src, src_w, dst, dst_w, dst_h)) {
+        if (passes > 0) blur_box3x3(dst, dst_w, dst_h, passes);
+        return;
+    }
+#endif
+    blur_downsample_scalar(src, src_w, src_h, dst, dst_w, dst_h);
+    if (passes > 0) blur_box3x3(dst, dst_w, dst_h, passes);
+}
+
+/* Публичный скалярный эталон: цель для проверки эквивалентности NEON-пути
+ * в юнит-тесте (на не-ARM хостах совпадает с switch_scaling_blur_bg
+ * тривиально — там оба скалярные). */
+void switch_scaling_blur_bg_scalar(const uint32_t* src, int src_w, int src_h,
+                                   uint32_t* dst, int dst_w, int dst_h,
+                                   int passes) {
+    if (!src || !dst || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0)
+        return;
+    blur_downsample_scalar(src, src_w, src_h, dst, dst_w, dst_h);
+    if (passes > 0) blur_box3x3(dst, dst_w, dst_h, passes);
 }
 
 /* ================= v36.14 Scale2x (NEON + scalar reference) =================
@@ -259,8 +362,8 @@ static void s2x_scale2x_neon(const uint32_t* src, int w, int h, uint32_t* dst) {
                 vbslq_u32(vandq_u32(guard, vceqq_u32(Hv, Fv)), Hv, Ev);
 
             { /* interleave E0,E1 / E2,E3 into the two dst rows */
-                uint32x4x2_t top = {E0, E1};
-                uint32x4x2_t bot = {E2, E3};
+                uint32x4x2_t top = {{E0, E1}};
+                uint32x4x2_t bot = {{E2, E3}};
                 vst2q_u32(d0 + 2 * x, top);
                 vst2q_u32(d1 + 2 * x, bot);
             }

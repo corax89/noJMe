@@ -125,6 +125,61 @@
 #define NOJME_DEADZONE_STEP 5
 #define NOJME_DEADZONE_DEFAULT 50
 
+/* ---- v36.87 [STICK-DIAG]: диагонали ЦИФРОВОГО пути ввода -> ITU-T 1/3/7/9 ----
+ * Полевой запрос: «диагонали стика должны эмулировать нажатия кнопок
+ * 1 3 7 9». На реальном телефоне диагональ = ОДНА клавиша кейпада
+ * (7 = вверх-влево и т.д.); до v36.87 отклонение стика по диагонали
+ * посылало ТОЛЬКО пару ортогональных цифр (2+4), которую игры,
+ * ожидающие 1/3/7/9, не понимали вовсе. Режимы (per-game настройка
+ * «Диагонали стика», применяется к ТОМУ пути, который шлёт цифры:
+ * swap OFF — стик, swap ON — крестовина):
+ *   BOTH (default) - диагональная зона шлёт цифру 1/3/7/9 ПЛЮС орто-
+ *                   гональную пару (2+4): getGameAction-игры сохраняют
+ *                   диагональное движение (обе стрелки), «кейпадные» —
+ *                   получают свою 7. Надёжный дефолт: ничего не ломает.
+ *   DIGITS         - ЧИСТЫЙ кейпад: в любой момент активна РОВНО ОДНА
+ *                   цифра (диагональ = только 1/3/7/9, ортогонали —
+ *                   только 2/4/6/8). Для игр, где 2/4-пара даёт двойную
+ *                   реакцию поверх 7.
+ *   OFF            - прежнее поведение v36.36..v36.86 (только пары).
+ * Стрелочный путь (второй из пары стик/крестовина) не затронут: там
+ * диагонали остаются парой стрелок — у MIDP нет game action для 1/3/7/9. */
+#define NOJME_DIAG_BOTH   0
+#define NOJME_DIAG_DIGITS 1
+#define NOJME_DIAG_OFF    2
+#define NOJME_DIAG_COUNT  3
+#define NOJME_DIAG_DEFAULT NOJME_DIAG_BOTH
+
+/* ---- v36.87 [PG-CONTROLS]: словарь целевых клавиш для НАЗНАЧЕНИЯ кнопок ----
+ * Пер-MIDlet remap кнопок консоли (A/B/X/Y/L/R/ZL/ZR/L3/R3) на клавиши
+ * телефона. Значения — собственный словарь (НЕ SDL-коды): switch_common.h
+ * не включает SDL, а слой UI (switch_ui.c) не знает SDL-констант.
+ * sdl_graphics.c переводит NOJME_BTNK_* в SDL_Keycode (см. g_btnk_sdl[]).
+ * DEFAULT = встроенная раскладка эмулятора (см. switch_joy_button_to_keycode). */
+#define NOJME_BTNK_DEFAULT 0  /* встроенная раскладка этой кнопки */
+#define NOJME_BTNK_0    1
+#define NOJME_BTNK_1    2
+#define NOJME_BTNK_2    3
+#define NOJME_BTNK_3    4
+#define NOJME_BTNK_4    5
+#define NOJME_BTNK_5    6
+#define NOJME_BTNK_6    7
+#define NOJME_BTNK_7    8
+#define NOJME_BTNK_8    9
+#define NOJME_BTNK_9    10
+#define NOJME_BTNK_STAR   11  /* '*' — L (встроенная) */
+#define NOJME_BTNK_HASH   12  /* '#' — R (встроенная) */
+#define NOJME_BTNK_SOFT1  13  /* левая софт (-6) — X/ZL/L3 (встроенные) */
+#define NOJME_BTNK_SOFT2  14  /* правая софт (-7) — B (встроенная) */
+#define NOJME_BTNK_CLEAR  15  /* GAME_C/clear (-8) — Y (встроенная) */
+#define NOJME_BTNK_UP     16  /* Nokia-стрелка -1 (UP) */
+#define NOJME_BTNK_DOWN   17  /* Nokia-стрелка -2 (DOWN) */
+#define NOJME_BTNK_LEFT   18  /* Nokia-стрелка -3 (LEFT) */
+#define NOJME_BTNK_RIGHT  19  /* Nokia-стрелка -4 (RIGHT) */
+#define NOJME_BTNK_COUNT  20
+/* Порядок кнопок в таблице remap (индексы ctl_btn[]): */
+#define NOJME_CTL_BTN_COUNT 10  /* A,B,X,Y,L,R,ZL,ZR,L3,R3 */
+
 /* ---- UI language (v34.90): MINUS toggles RU/EN in every frontend screen.
  * Persisted as lang=ru|en in settings.ini; NOJME_SWITCH_LANG env overrides
  * for host verification builds. ---- */
@@ -195,7 +250,33 @@ typedef struct {
     int input_swap;          /* v36.37: -1 = inherit global setting, else
                               * NOJME_SWAP_* . Read at INPUT time (every
                               * stick/D-pad event), so the override applies
-                              * LIVE from the PLUS/pause settings screen. */
+                              * LIVE from the PLUS/pause settings screen.
+                              * v36.87 [PG-CONTROLS]: строка «Стик и D-pad»
+                              * ПЕРЕНЕСЕНА из per-game экрана в новый экран
+                              * «Управление» (все настройки ввода вместе);
+                              * ini-ключ swap= и семантика не изменились. */
+    int stick_diag;          /* v36.87 [STICK-DIAG]: NOJME_DIAG_* (дефолт
+                              * BOTH — наследовать нечего, глобальной
+                              * настройки нет). Читается при каждом событии
+                              * цифрового пути (стик/крестовина), поэтому
+                              * применяется ЖИВО из экрана «Управление». */
+    int ctl_btn[NOJME_CTL_BTN_COUNT]; /* v36.87 [PG-CONTROLS]: назначение
+                              * кнопок A/B/X/Y/L/R/ZL/ZR/L3/R3 — значения
+                              * NOJME_BTNK_* (DEFAULT = встроенная раскладка).
+                              * Читается при каждом нажатии кнопки — ремап
+                              * применяется ЖИВО, без перезапуска игры. */
+    /* v36.81 [PERGAME-RENDER] поле render → УДАЛЕНО в v36.82 [SW-ONLY]:
+                              * выбора рендерера больше не существует — он
+                              * всегда программный. Причины ликвидации
+                              * аппаратного пути: (1) хронический клин
+                              * драйвера GLES2 (аплоады «успешны», пиксели
+                              * не доезжают — игра 1-2 fps, меню паузы
+                              * невидимо, настройки чёрные; пересоздания
+                              * внутри GL не лечили); (2) рантайм-
+                              * переключение GLES2<->software крушало
+                              * приложение. Полное описание — у
+                              * sdl_switch_renderer_create (sdl_graphics.c).
+                              * Ключ render= старых ini игнорируется. */
 } SwitchPerGameSettings;
 
 #define NOJME_PERGAME_DIR "pergame"
@@ -489,6 +570,39 @@ enum {
      * пользователя — плашка перекрывала игру при старте. Строки
      * справки и поле настроек убраны; ini-ключ keyhint= по-прежнему
      * молча принимается (старые файлы настроек на устройствах). */
+    /* v36.82 [SW-ONLY]: строки «Рендер» per-game настроек (ST_PG_RENDER,
+     * ST_PG_RENDER_SW, ST_HINT_PG_RENDER — v36.81 [PERGAME-RENDER])
+     * УДАЛЕНЫ по запросу пользователя: рендерер один (программный) —
+     * клин GLES2 и вылеты при переключении режимов устранены удалением
+     * самого аппаратного пути. Записи шли последними в enum, индексы
+     * остальных строк не сдвинуты; ключ render= старых ini молча
+     * игнорируется. */
+    /* v36.87 [STICK-DIAG] + [PG-CONTROLS]: пункт «Управление» в меню
+     * паузы (4-й пункт), экран «Управление» (диагонали стика + перенос
+     * «Стик и D-pad» из per-game экрана + назначение кнопок A..R3 +
+     * «Сбросить всё») и пикер целевой клавиши. Добавлены В КОНЕЦ
+     * enum/таблиц — старые id не сдвинуты. */
+    ST_PAUSE_CONTROLS,       /* пункт меню паузы «Управление» */
+    ST_CTL_DIAG,             /* строка «Диагонали стика» */
+    ST_CTL_DIAG_BOTH,        /* значение «Пара + 1-3-7-9» */
+    ST_CTL_DIAG_DIGITS,      /* значение «Только 1-3-7-9» */
+    ST_CTL_DIAG_OFF,         /* значение «Только пары» */
+    ST_CTL_RESET,            /* строка «Сбросить всё» */
+    ST_CTL_FOOTER,           /* подсказка экрана управления */
+    ST_CTL_PICK_TITLE,       /* заголовок пикера «Назначение кнопки» */
+    ST_CTL_PICK_FOOTER,     /* подсказка пикера */
+    ST_CTL_K_DEFAULT,        /* «По умолчанию» */
+    ST_CTL_K_SOFT1,          /* «Софт левая» */
+    ST_CTL_K_SOFT2,          /* «Софт правая» */
+    ST_CTL_K_CLEAR,          /* «C (очистка)» */
+    ST_CTL_K_UP,             /* «Стрелка вверх» */
+    ST_CTL_K_DOWN,           /* «Стрелка вниз» */
+    ST_CTL_K_LEFT,           /* «Стрелка влево» */
+    ST_CTL_K_RIGHT,          /* «Стрелка вправо» */
+    ST_CTL_HINT_DIAG,        /* однострочная подсказка про диагонали */
+    ST_CTL_HINT_SWAP,        /* подсказка про стик/D-pad (короткая) */
+    ST_CTL_HINT_BTN,         /* подсказка про назначение кнопки */
+    ST_CTL_HINT_RESET,       /* подсказка про сброс */
     ST_TEXT_COUNT
 };
 

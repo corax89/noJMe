@@ -362,7 +362,20 @@ static int push_frame(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 
     /* [DUMP-FENCE] v36.48: вход в exec-окно (внешний кадр) — обновить
      * снапшот сайта; вложенные вызовы обновит yield-гранулярность ниже. */
-    if (!frame->prev) jvm_thread_note_site(thread, frame);
+    if (!frame->prev) {
+        jvm_thread_note_site(thread, frame);
+        /* v36.75 [MWINFIX]: окно ГЛАВНОГО потока = доказательство жизни m
+         * независимо от нативов (обфусцированные обёртки BT/TT len<=7 не
+         * зовут ни одного натива — last_native_ms не обновляется, и
+         * «td m nat=... age=42s» лжёт о «зависшем» m; см. jvm_mwin_note). */
+        if (thread && thread->id == 1 && frame->method) {
+            extern void jvm_mwin_note(const char*, const char*, int);
+            jvm_mwin_note(
+                (frame->clazz && frame->clazz->class_name) ? frame->clazz->class_name : "?",
+                frame->method->name ? frame->method->name : "?",
+                frame->method->code.code ? (int)frame->method->code.code_length : 0);
+        }
+    }
 
     EXEC_DEBUG("Pushed frame, depth now: %d", 
                thread->current_frame ? 
@@ -468,6 +481,34 @@ static int jvm_frame_fence_arm(void) {
     if (tls_os_thread_is_vm_runner || g_vm_fiber_fence ||
         g_jvm_main_thread_executing) {
         return 0;
+    }
+    /* v36.83 [ZFENCE-PAINT]: a paint()-driven Java window must NOT hold the
+     * fence. Gameloft loading idiom (Zombie Infection K800i, field hang
+     * v36.82): paint() busy-waits `while (!groupDone) scriptTick();` for a
+     * script clock that ONLY the game's second thread (g.run(), a VM
+     * runner) advances. Fencing the runners for the whole paint freezes
+     * that clock: the wait never exits, the 2.5 s fence cap trickles
+     * 16k-instruction bursts (minutes-scale loading), and the 1.5 s
+     * spin-breaker kills paint before even that — leaving the game's
+     * paint-reentrance guard stuck (permanent loading-screen freeze, the
+     * field report). Exit-path windows (destroyApp/keys/timers) keep the
+     * fence — paint is not that path; paint/runner concurrency was the
+     * pre-v36.30 norm (heap safety rides the heap lock + GC safepoints,
+     * unchanged). NOJME_ZFENCE_PAINT=0 restores the old behavior (A/B and
+     * a field kill-switch, same pattern as NOJME_SPIN_BREAK_MS).
+     * See midp_paint_window_active() in display.c. */
+    {
+        static int s_zfence_on = -1;
+        if (s_zfence_on < 0) {
+            const char* e = getenv("NOJME_ZFENCE_PAINT");
+            s_zfence_on = (e && e[0] == '0') ? 0 : 1;
+        }
+        if (s_zfence_on) {
+            extern int midp_paint_window_active(void);
+            if (midp_paint_window_active()) {
+                return 0;
+            }
+        }
     }
     g_vm_fiber_fence = 1;
     memory_barrier();
@@ -1374,6 +1415,14 @@ continue_execution:
             frame->pc = f_pc;
             frame->stack_top = (int16_t)st;
             g_slowcheck_fires++;  /* v34.26 BENCH calibration */
+            /* v36.88 [SPIN-BREAK-ICOUNT]: аккумулятор РАБОТЫ потока для
+             * гейта спин-брейкера — +64 команды за каждый пожар (каденс
+             * SLOW_CHECK_INTERVAL; см. поле JavaThread::spin_instr).
+             * Одна TLS-читка + запись на 64 инструкции — холодный путь. */
+            {
+                JavaThread* self_bump = thread_current(jvm);
+                if (self_bump) self_bump->spin_instr += SLOW_CHECK_INTERVAL;
+            }
             if (g_gc_safepoint_request) {
                 jvm_gc_safepoint_park();
                 /* v36.57 [SPIN-BREAK]: парковка — НЕ спин; возраст
@@ -1381,7 +1430,7 @@ continue_execution:
                  * не воспринималась брейкером как чисто-Java цикл. */
                 {
                     JavaThread* sp = thread_current(jvm);
-                    if (sp) sp->last_native_ms = jvm_exec_now_ms();
+                    if (sp) { sp->last_native_ms = jvm_exec_now_ms(); sp->spin_instr = 0; }
                 }
             }
             /* v34.81 FRONTEND PAUSE: одна volatile-читка на 64 инструкции
@@ -1397,7 +1446,7 @@ continue_execution:
                      * взводить брейкер — после парковки bytecode свежий. */
                     {
                         JavaThread* sp = thread_current(jvm);
-                        if (sp) sp->last_native_ms = jvm_exec_now_ms();
+                        if (sp) { sp->last_native_ms = jvm_exec_now_ms(); sp->spin_instr = 0; }
                     }
                 }
             }
@@ -1411,7 +1460,7 @@ continue_execution:
                 /* v36.57 [SPIN-BREAK]: fence — событийная парковка. */
                 {
                     JavaThread* sp = thread_current(jvm);
-                    if (sp) sp->last_native_ms = jvm_exec_now_ms();
+                    if (sp) { sp->last_native_ms = jvm_exec_now_ms(); sp->spin_instr = 0; }
                 }
             }
             /* v41 PERF: pthread VM-thread budget (see the block comment near
@@ -1660,7 +1709,80 @@ continue_execution:
                     if (self_sb && self_sb->last_native_ms) {
                         int64_t sb_now = jvm_exec_now_ms();
                         int64_t sb_age = sb_now - (int64_t)self_sb->last_native_ms;
-                        if (sb_age > (int64_t)s_spin_break_ms) {
+                        /* v36.83 [SPIN-BREAK-SIBLING]: свободный живой сосед
+                         * (pthread-раннер без монитора, свежие натив-вызовы)
+                         * = вероятное МЕЖПОТОЧНОЕ ОЖИДАНИЕ, а не зависание:
+                         * Gameloft-загрузки крутят чисто-Java wait в paint,
+                         * который корректно разрешается вторым потоком.
+                         * Порог ×8 (12 с при дефолтных 1.5 с): честные
+                         * загрузки кончаются за секунды, а вечный спин при
+                         * живом соседе всё равно будет прерван. ГД-кейс не
+                         * задет: там сосед висит на mon_enter — соседом не
+                         * считается, порог базовый (см. native.c хелпер). */
+                        int64_t sb_threshold = (int64_t)s_spin_break_ms;
+                        {
+                            extern int jvm_threads_have_free_sibling(int);
+                            if (jvm_threads_have_free_sibling(self_sb->id))
+                                sb_threshold *= 8;
+                        }
+                        if (sb_age > sb_threshold) {
+                            /* v36.88 [SPIN-BREAK-ICOUNT]: гейт «работа
+                             * подтверждает спин». ПОЛЕВОЙ КОРЕНЬ (Zombie
+                             * Infection, v36.87, лог 2026-10-06): выход
+                             * кнопкой HOME в меню консоли = полный фриз
+                             * процесса на ~1.7 с (тишина в логе 81.7-84.4
+                             * с, замерли ВСЕ потоки); возврат — и первый
+                             * slow-check живого кадра (a.b PC=0) увидел
+                             * age=1714 > 1500 при РЕАЛЬНОЙ работе в
+                             * считанные сотни команд с последнего натива
+                             * (Math.max за миг ДО сна). Выстрел отравил
+                             * кадр, Gameloft-каркас поймал исключение и
+                             * ушёл в вечный паркинг: «игра зависла,
+                             * осталась работать только музыка» (аудио-
+                             * поток исключение не получал). v36.63 уже
+                             * лечил этот класс для меню паузы фронтенда
+                             * (parking проходит через pause_fresh), но
+                             * сон ОС НЕ проходит ни через одну парковку —
+                             * детерминированного события «нас разбудили»
+                             * интерпретатору нет (SDL2-порт не доставляет
+                             * applet-события до первого насоса, а выстрел
+                             * случается раньше). Поэтому гейт в САМОЙ
+                             * точке выстрела: возраст без ИНСТРУКЦИЙ — не
+                             * спин, а долг сна/фриза; стреляем только
+                             * когда spin_instr (работа с последнего
+                             * натива, execute.c slow-check аккумулятор)
+                             * подтверждает реальное вращение. Порог
+                             * NOJME_SPIN_BREAK_INSTR (по умолчанию
+                             * 200000 команд, 0 = гейт выкл = поведение
+                             * v36.87). Настоящие спины (ГД: ~6.6 млн
+                             * команд/с) пересекают порог за десятки мс —
+                             * задержка выстрела незаметна; ложно-
+                             * положительный кадр после сна не наберёт и
+                             * тысячи. Порог не сбрасывает возраст: если
+                             * после пробуждения поток РЕАЛЬНО закрутится,
+                             * выстрел состоится, как только работа
+                             * пересечёт порог. */
+                            static long s_spin_break_instr = -1;
+                            if (s_spin_break_instr < 0) {
+                                const char* e = getenv("NOJME_SPIN_BREAK_INSTR");
+                                s_spin_break_instr = (e && atol(e) >= 0)
+                                    ? atol(e) : 200000L;
+                            }
+                            if (s_spin_break_instr > 0 &&
+                                self_sb->spin_instr <
+                                    (uint64_t)s_spin_break_instr) {
+                                /* Сон ОС/фриз: возраст — долг ожидания,
+                                 * НЕ работа. Подавляем выстрел, возраст НЕ
+                                 * трогаем (реальный пост-пробужденческий
+                                 * спин наберёт порог и выстрелит). */
+                                static uint64_t s_gate_reports = 0;
+                                if ((s_gate_reports++ & 1023ULL) == 0) {
+                                    LOG_SAFE("[SPIN-GATE] tid=%d wall-age %lld ms but only %llu instrs of work since last native — suspend/freeze debt, shot suppressed (NOJME_SPIN_BREAK_INSTR=%ld)\n",
+                                             self_sb->id, (long long)sb_age,
+                                             (unsigned long long)self_sb->spin_instr,
+                                             s_spin_break_instr);
+                                }
+                            } else {
                             extern void sw_trace_force(const char* fmt, ...)
                                 __attribute__((weak));
                             const char* sb_site =
@@ -1676,6 +1798,7 @@ continue_execution:
                              * порог (catch-обработчик исполняет байткод,
                              * нативов может всё ещё не быть) */
                             self_sb->last_native_ms = sb_now;
+                            self_sb->spin_instr = 0;
                             jvm->instr_count = icount;
                             frame->pc = f_pc;
                             frame->stack_top = (int16_t)st;
@@ -1687,6 +1810,7 @@ continue_execution:
                              * catch в том же методе, что и спин (как в GD-подобных
                              * циклах и в TestSpinBreak), работает как на JVM. */
                             tls_sb_inject = 1;
+                            }
                         }
                     }
                 }

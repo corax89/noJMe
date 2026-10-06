@@ -28,6 +28,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <unistd.h>   /* v36.73 [MON-NULL] DIAG: raw write(2) on the failure path */
+#include <errno.h>
+#endif
+#ifndef _WIN32
+#include <sched.h>   /* v36.73 [MON-INIT-RACE]: sched_yield in the init wait */
+#endif
 #include <stdarg.h>
 #include <time.h>
 #include <errno.h>
@@ -399,6 +406,28 @@ static void reap_terminated_threads(void) {
         g_terminated_pending = 0;
         LOG_SAFE("[THREADS] Reaped %d terminated thread(s), scheduler table %d/%d\n",
                  dropped, scheduler.thread_count, MAX_COOP_THREADS);
+    }
+}
+
+/* v36.73 [COOP-REAP]: mark a pthread-backed JavaThread's coop-table entry
+ * TERMINATED from the pool worker's job tail (native.c pthread_job_body).
+ * Before the pool, pthread runners NEVER transitioned their coop entry out
+ * of NEW — the corpses piled up and thread_create() returned NULL forever
+ * after ~128 creations ("Thread.start silently fails"), and each dead
+ * thread's arenas (256 KB Java stack + 64 KB allocator + 64 KB ucontext
+ * stack, all malloc'd by thread_create) stayed allocated until jvm_destroy.
+ * With the mark, the existing reap_terminated_threads() compaction (the
+ * table-full path in thread_create) frees them and recycles the ids. */
+void jvm_thread_mark_coop_terminated(JavaThread* jt) {
+    if (!jt) return;
+    for (int i = 0; i < scheduler.thread_count; i++) {
+        if (scheduler.threads[i] && scheduler.threads[i]->java_thread == jt) {
+            if (scheduler.threads[i]->state != THREAD_STATE_TERMINATED) {
+                scheduler.threads[i]->state = THREAD_STATE_TERMINATED;
+                g_terminated_pending++;
+            }
+            return;
+        }
     }
 }
 
@@ -1566,7 +1595,15 @@ static long long mon_wait_mono_ms(void) {
 
 static CoopMonitor* monitor_create(void) {
     CoopMonitor* mon = (CoopMonitor*)calloc(1, sizeof(CoopMonitor));
-    if (!mon) return NULL;
+    if (!mon) {
+        /* v36.73 DIAG: monitor_enter has NO NULL guard downstream — a NULL
+         * here detonates as pthread_mutex_lock(0x28). Name it at the source. */
+        char msg[96];
+        int n = snprintf(msg, sizeof(msg),
+            "[MON-FAIL] monitor_create calloc failed errno=%d\n", errno);
+        if (n > 0) { ssize_t w = write(2, msg, (size_t)n); (void)w; }
+        return NULL;
+    }
 #ifndef _WIN32
     pthread_mutex_init(&mon->mutex, NULL);
     pthread_cond_init(&mon->entry_cond, NULL);
@@ -1610,13 +1647,41 @@ static void mon_table_grow(void) {
 
 static void init_monitors(void) {
     if (atomic_cas_int(&g_monitors_initialized, 0, 1)) {
-        mon_table_grow();  /* allocates the initial 1024-entry table */
+        /* v36.73 [MON-INIT-RACE] FIX: allocate the initial table UNDER the
+         * table lock. The old order published g_monitors_initialized=1
+         * BEFORE the table existed and grew it WITHOUT the lock: a loser
+         * (first monitorenter of a freshly pooled worker — the pool hands
+         * the job off in microseconds, pthread_create took milliseconds)
+         * sailed past init, found capacity==0 in the slow path, ran the
+         * insert loop ZERO times and returned the "unreachable" NULL —
+         * monitor_enter's unguarded pthread_mutex_lock(&mon->mutex) then
+         * detonated as a wild SEGV (addr=0x28, MonLeakTest soak 1-of-3).
+         * With the grow under MON_TABLE_LOCK, a loser's slow path BLOCKS
+         * on the same mutex until the winner's table is fully published.
+         * (mon_table_grow itself stays lock-free — the insert path calls
+         * it with the lock already held.) */
+        MON_TABLE_LOCK();
+        if (g_mon_capacity == 0) {
+            mon_table_grow();  /* allocates the initial 1024-entry table */
+        }
+        MON_TABLE_UNLOCK();
         {
             const char* e = getenv("NOJME_WAIT_CHUNK_MS");
             if (e && e[0] >= '0' && e[0] <= '9') {
                 long v = atol(e);
                 if (v >= 1 && v <= 10000) g_wait_chunk_ms = (jlong)v;
             }
+        }
+    }
+    /* v36.73 [MON-INIT-RACE]: losers must not proceed until the winner has
+     * published a non-zero capacity — the acquire-load pairs with the
+     * release-stores in mon_table_grow. Bounded spin (the winner needs one
+     * calloc; 1024 entries ~16 KB — microseconds), yields between probes. */
+    {
+        int spins = 0;
+        while (MON_LOAD_ACQ(&g_mon_capacity) == 0 && spins < 2000) {
+            sched_yield();
+            spins++;
         }
     }
     memory_barrier_acquire();
@@ -1778,6 +1843,24 @@ static CoopMonitor* get_monitor(JavaObject* obj) {
     return NULL; /* unreachable: growth keeps load under 75% */
 }
 
+/* v36.73 [MON-NULL] DIAG: get_monitor returning NULL detonates in
+ * monitor_enter's unguarded pthread_mutex_lock(&mon->mutex) as a wild
+ * SEGV (addr=0x28). Every NULL return must be named — temporary field
+ * diagnostic, cheap (only on the failure path). */
+static CoopMonitor* get_monitor_named(JavaObject* obj, const char* site) {
+    CoopMonitor* mon = get_monitor(obj);
+    if (!mon) {
+        char msg[160];
+        int n = snprintf(msg, sizeof(msg),
+            "[MON-NULL] get_monitor(obj=%p) returned NULL at %s "
+            "(cap=%zu count=%zu init=%d)\n",
+            (void*)obj, site, g_mon_capacity, g_mon_count,
+            (int)g_monitors_initialized);
+        if (n > 0) { ssize_t w = write(2, msg, (size_t)n); (void)w; }
+    }
+    return mon;
+}
+
 /* v36.57 [PAINT-BUDGET]: ограниченное ожидание монитора для PUMP-потока.
  * Корень фриза Gravity Defied (полевой лог v36.54-goffix1): игровой поток
  * (Thread-2) заклинивает в чисто-Java цикле депенетрации физики ВНУТРИ
@@ -1937,7 +2020,10 @@ int monitor_enter(JVM* jvm, JavaObject* obj) {
     (void)jvm;
     if (!obj) return JNI_ERR;
     
-    CoopMonitor* mon = get_monitor(obj);
+    CoopMonitor* mon = get_monitor_named(obj, "monitor_enter");
+    /* v36.73 [MON-NULL] FIX: the missing guard — get_monitor can fail
+     * (calloc OOM, init race); the old code locked &mon->mutex = 0x28. */
+    if (!mon) return JNI_ERR;
     
 #ifndef _WIN32
     pthread_t self = pthread_self();
@@ -1995,9 +2081,41 @@ int monitor_enter(JVM* jvm, JavaObject* obj) {
             long long mon_now = mon_wait_mono_ms();
             /* v36.57 [PAINT-BUDGET]: истёк бюджет pump-потока — уходим без
              * монитора (вызывающая сторона бросит исключение и прервёт
-             * paint). Не логируем как MON-WAIT — это штатный отказ. */
+             * paint). Не логируем как MON-WAIT — это штатный отказ.
+             * v36.73 [PAINT-LOCK]: устройство-строка с ИМЕНЕМ жертвы и
+             * владельца — полевой лог v36.72 показывал «paint-lock budget
+             * exceeded» без единого имени (stderr-строки на устройстве
+             * невидимы, а [PAINT-BUDGET] в display.c не знает, ЧЬЙ монитор
+             * держал кадр). Эта строка знает оба конца: сайт входа
+             * (tls_mon_site, пишет op_monitorenter) и владельца (monitor
+             * owner_thread + его jsite + возраст его последнего натива). */
             if (tls_paint_lock_deadline_ms && mon_now >= tls_paint_lock_deadline_ms) {
                 tls_paint_lock_aborted = 1;
+                {
+                    extern void sw_trace_force(const char* fmt, ...)
+                        __attribute__((weak));
+                    if (&sw_trace_force && sw_trace_force) {
+                        JavaThread* holder = mon->owner_thread;
+                        long long h_age = -1;
+                        if (holder && holder->last_native_ms) {
+                            h_age = mon_now - (long long)holder->last_native_ms;
+                        }
+                        sw_trace_force("[PAINT-LOCK] pump gave up after %lld ms: "
+                                       "site=%.60s monitor=%s held by t%d "
+                                       "(nat=%.32s age=%lldms why=%.15s)",
+                                       (long long)(mon_now - mon_t0),
+                                       tls_mon_site[0] ? tls_mon_site : "?",
+                                       (obj && obj->header.clazz &&
+                                        obj->header.clazz->class_name)
+                                           ? obj->header.clazz->class_name : "?",
+                                       holder ? holder->id : -1,
+                                       (holder && holder->last_native[0])
+                                           ? holder->last_native : "(none)",
+                                       h_age,
+                                       (holder && holder->park_why[0])
+                                           ? holder->park_why : "-");
+                    }
+                }
                 pthread_mutex_unlock(&mon->mutex);
                 mon->entry_wait_count--;
                 if (self_jt) { self_jt->mon_enter_wait = 0; self_jt->mon_enter_ms = 0; }
@@ -2129,6 +2247,9 @@ int monitor_exit(JVM* jvm, JavaObject* obj) {
     if (!obj) return JNI_ERR;
     
     CoopMonitor* mon = get_monitor(obj);
+    /* v36.73 [MON-NULL]: get_monitor can fail (see init race) — guard the
+     * deref (monitor_enter/tryenter already had theirs). */
+    if (!mon) return JNI_ERR;
     
 #ifndef _WIN32
     pthread_t self = pthread_self();
@@ -2421,6 +2542,53 @@ static uint64_t pause_now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 }
 
+/* v36.63 [SPIN-BREAK-PAUSE-FRESH]: конец frontend-паузы = свежий возраст
+ * для спин-брейкера (execute.c v36.57). ПОЛЕВОЙ КОРЕНЬ (Splinter Cell
+ * Conviction 360x640, v36.62): меню паузы 2.5 с, закрыли — главный
+ * Java-поток (файбер на потоке фронтенда) всё это время СТОЯЛ в цикле
+ * оверлея, не исполняя байткода и не вызывая нативов; его last_native_ms
+ * состарился на всю длительность меню. Первый же slow-check после
+ * закрытия (первые 64 инструкции очередного paint) видел age = 2531 мс >
+ * порога 1500 — [SPIN-BREAK] вбрасывал RuntimeException в k.paint,
+ * игра ловила её своим catch и навсегда замирала («после выхода из меню
+ * не продолжает выполнение»: paint пустой 0.0 мс, рендер-поток только
+ * спит). Потоки, качавшие байткод ПОД паузой, обновляются на выходе
+ * своих парковок (execute.c:1400; sleep-цикл native.c с v36.63); этот
+ * проход закрывает всех остальных — прежде всего main, который не
+ * проходит НИ через одну парковку. Время меню — не спин ни для кого;
+ * реальный спин переживёт отсрочку ровно в один порог (execute.c
+ * re-arm). Однопоточно: зовёт поток фронтенда в момент снятия. */
+static void spin_break_pause_fresh_all(void) {
+    if (scheduler.initialized && scheduler.jvm && scheduler.jvm->main_thread &&
+        scheduler.jvm->main_thread->last_native_ms) {
+        scheduler.jvm->main_thread->last_native_ms =
+            (jlong)pause_now_ms();
+        scheduler.jvm->main_thread->spin_instr = 0; /* v36.88 [SPIN-BREAK-ICOUNT] */
+    }
+    {
+        extern void jvm_spin_break_pause_fresh_runners(void); /* native.c */
+        jvm_spin_break_pause_fresh_runners();
+    }
+}
+
+/* v36.88 [AWAKE-FRESH]: публичная обёртка для фронтенда. Сон консоли по
+ * кнопке HOME (Horizon замораживает ВЕСЬ процесс — полевой лог v36.87,
+ * Zombie Infection: 1.7 с полной тишины в логе) не проходит ни через одну
+ * парковку VM, и после возврата last_native_ms всех потоков состарен на
+ * длительность сна. Первый гейт — [SPIN-BREAK-ICOUNT] в самой точке
+ * выстрела (execute.c, детерминирован); этот проход — второй пояс:
+ * сторож слепых окон ввода (sdl_graphics.c [PUMP-GAP]) при разрыве
+ * > 1.2 с (масштаб сна консоли, не шевеления загрузки) освежает возрасты
+ * всем живым потокам. Вызывается потоком фронтенда на первом же насосе
+ * после пробуждения — как v36.63 pause_fresh, только триггер — не меню
+ * паузы, а детектированный фриз. Безопасность для реальных спинов: спин
+ * на main-файбере глушит насос сам (PUMP-GAP виден только ПОСЛЕ конца
+ * спина), спин раннера насос не трогает — в обоих случаях освежение не
+ * может отложить выстрел. */
+void jvm_spin_break_awake_fresh(void) {
+    spin_break_pause_fresh_all();
+}
+
 /* Полная проверка stall + переходы состояния. Вызывается eval-потоком и
  * park-циклами (не из горячего пути интерпретатора). Переходы защищены
  * CAS: двойного начисления g_pause_total_ms при гонке двух вызывателей
@@ -2431,6 +2599,7 @@ static void jvm_frontend_pause_eval(uint64_t now) {
         if (g_pause_state == 1) {
             if (__sync_bool_compare_and_swap(&g_pause_state, 1, 0)) {
                 g_frontend_pause_active = 0;
+                spin_break_pause_fresh_all(); /* v36.63 [SPIN-BREAK-PAUSE-FRESH] */
             }
         }
         return;
@@ -2442,6 +2611,7 @@ static void jvm_frontend_pause_eval(uint64_t now) {
             g_pause_total_ms += now - g_pause_started_ms;
             g_frontend_pause_active = 0;
             g_pause_suppress_until_ms = now + (uint64_t)g_pause_suppress_ms;
+            spin_break_pause_fresh_all(); /* v36.63 [SPIN-BREAK-PAUSE-FRESH]: пауза снята — возрасты не должны нести её длительность */
             LOG_SAFE("[FE-PAUSE-FORCE-LIFT] pause episode lasted %llu ms with no lifter on the frontend thread — lifting, stall re-arm suppressed for %u s\n",
                      (unsigned long long)(now - g_pause_started_ms),
                      (unsigned)(g_pause_suppress_ms / 1000));
@@ -2462,6 +2632,7 @@ static void jvm_frontend_pause_eval(uint64_t now) {
         if (__sync_bool_compare_and_swap(&g_pause_state, 1, 0)) {
             g_pause_total_ms += now - g_pause_started_ms;
             g_frontend_pause_active = 0;
+            spin_break_pause_fresh_all(); /* v36.63 [SPIN-BREAK-PAUSE-FRESH] */
         }
     }
 }
@@ -2592,6 +2763,7 @@ void jvm_frontend_pause_end(void) {
         uint64_t now = pause_now_ms();
         g_pause_total_ms += (now > g_pause_started_ms) ? now - g_pause_started_ms : 0;
         g_frontend_pause_active = 0;
+        spin_break_pause_fresh_all(); /* v36.63 [SPIN-BREAK-PAUSE-FRESH]: главное меню-паузы закрыто — main-файбер не проходил ни через одну парковку, его возраст состарился бы на всю длительность меню и первый slow-check в paint получил бы ложный [SPIN-BREAK] (Splinter Cell Conviction: «после выхода из меню игра не продолжает выполнение») */
         LOG_SAFE("[FE-PAUSE] end (explicit overlay)\n");
     }
     /* Цикл сейчас продолжится: свежий таймстамп кадра + active=1, чтобы
@@ -2821,6 +2993,9 @@ static int monitor_wait_impl(JVM* jvm, JavaObject* obj, jlong timeout, bool time
     }
 
     CoopMonitor* mon = get_monitor(obj);
+    /* v36.73 [MON-NULL]: get_monitor can fail (see init race) — guard the
+     * deref (monitor_enter/tryenter already had theirs). */
+    if (!mon) return JNI_ERR;
     
 #ifndef _WIN32
     /* Pthread-based wait for Linux/Unix */
@@ -3403,6 +3578,9 @@ int monitor_notify(JVM* jvm, JavaObject* obj) {
     }
 
     CoopMonitor* mon = get_monitor(obj);
+    /* v36.73 [MON-NULL]: get_monitor can fail (see init race) — guard the
+     * deref (monitor_enter/tryenter already had theirs). */
+    if (!mon) return JNI_ERR;
     
 #ifndef _WIN32
     /* Pthread-based notify for Linux/Unix */
@@ -3454,6 +3632,9 @@ int monitor_notify_all(JVM* jvm, JavaObject* obj) {
     if (!obj) return JNI_ERR;
     
     CoopMonitor* mon = get_monitor(obj);
+    /* v36.73 [MON-NULL]: get_monitor can fail (see init race) — guard the
+     * deref (monitor_enter/tryenter already had theirs). */
+    if (!mon) return JNI_ERR;
     
 #ifndef _WIN32
     /* Pthread-based notify all for Linux/Unix */

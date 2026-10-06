@@ -314,6 +314,19 @@ void jvm_destroy(JVM* jvm) {
         }
     }
 
+    /* v36.73 [VM-THREADPOOL]: every job has finished — poison the pool
+     * workers and JOIN them here, before any VM memory is freed (they run
+     * bytecode against this memory). Workers park instead of exiting after
+     * each run(), so this is the one place their stacks are released; the
+     * joined count lands in log.txt via [VMPOOL]. Safe iff
+     * native_threads_wait_idle() above returned success — a worker still
+     * INSIDE a job would block this join (that case aborted teardown
+     * above with the VM leaked to the OS). */
+    {
+        extern void vm_pool_shutdown_join(void);
+        vm_pool_shutdown_join();
+    }
+
     /* v35.12: every runner has exited — clear the process-global pthread
      * registries so the next session cannot inherit dangling JavaThread*
      * entries (garbage "td t6684680" ids, tid probes into freed memory). */

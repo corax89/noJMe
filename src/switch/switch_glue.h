@@ -48,6 +48,11 @@ int  sdl_switch_touch_state(int* x, int* y, int* down, int* moved);
 /* Upload the menu canvas and flip. */
 void sdl_switch_ui_present(void);
 
+/* v36.77 [MENU-STALL]: счётчик отказов ui-презентации (для menu alive-
+ * строки — полевой лог v36.76 был слеп к чёрному экрану меню: цикл жив,
+ * текстура битая, ошибок никто не считал). */
+uint32_t sdl_switch_ui_present_fails(void);
+
 /* v36.17: live background of the per-game settings screen — copy the
  * LAST game frame (same single-source as the normal present, rotation
  * and current effective scale applied) into the menu canvas with a

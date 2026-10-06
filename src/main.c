@@ -1508,6 +1508,8 @@ int main(int argc, char** argv) {
             extern int g_pg_filter;
             extern int g_pg_rotation; /* v36.15: defined in sdl_graphics.c */
             extern int g_pg_input_swap; /* v36.37: defined in sdl_graphics.c */
+            extern int g_pg_stick_diag; /* v36.87 [STICK-DIAG]: sdl_graphics.c */
+            extern int g_pg_btn[]; /* v36.87 [PG-CONTROLS]: sdl_graphics.c */
             extern int g_pg_flip;     /* v36.16: defined in sdl_graphics.c */
             extern int g_nojme_flip_mode; /* v35.03: defined in mobile3d.c */
             SwitchPerGameSettings pg;
@@ -1515,6 +1517,16 @@ int main(int argc, char** argv) {
             snprintf(g_switch_current_jar, sizeof(g_switch_current_jar), "%s", jar_path);
             g_pg_scale = pg.scale_mode;
             g_pg_filter = pg.filter;
+            /* v36.81 [PERGAME-RENDER] → v36.82 [SW-ONLY]: per-game выбор
+             * рендерера (g_pg_render = pg.render) УДАЛЁН — рендерер один
+             * (программный), выбора не существует. Аппаратный путь GLES2
+             * отключён навсегда: прогрессирующий клин драйвера (аплоады
+             * «успешны», пиксели не доезжают: 1-2 fps, невидимое меню
+             * паузы, чёрные настройки) + вылет при рантайм-переключении
+             * режимов; подробности — комментарий [SW-ONLY] у
+             * sdl_switch_renderer_create (src/sdl/sdl_graphics.c). Ключ
+             * render= в pergame ini (если остался от v36.81) молча
+             * игнорируется парсером. */
             /* v36.15: per-game поворот экрана (презентационный, 0/1/2).
              * Печатается в геометрию сессии при game_begin (текстуры под
              * повёрнутый кадр) — применяется с этого запуска игры. */
@@ -1527,6 +1539,14 @@ int main(int argc, char** argv) {
              * достаточно проставить здесь один раз; PLUS-меню обновляет
              * ЖИВО. Дефолт: стик — цифры 2/4/6/8, крестовина — стрелки. */
             g_pg_input_swap = pg.input_swap;
+            /* v36.87 [STICK-DIAG]: диагонали цифрового пути (стик при
+             * swap OFF / крестовина при swap ON). Читается при каждом
+             * событии ввода — экран «Управление» обновляет ЖИВО. */
+            g_pg_stick_diag = pg.stick_diag;
+            /* v36.87 [PG-CONTROLS]: назначение кнопок A..R3 (NOJME_BTNK_*).
+             * Читается при каждом нажатии — ремап живой. */
+            for (int i = 0; i < NOJME_CTL_BTN_COUNT; i++)
+                g_pg_btn[i] = pg.ctl_btn[i];
             {
                 const SwitchSettings* std_ = switch_settings_get();
                 int eff_swap = (g_pg_input_swap >= 0) ? g_pg_input_swap
@@ -1537,6 +1557,13 @@ int main(int argc, char** argv) {
                          pg.input_swap, std_->input_swap);
                 LOG_SAFE("[SWITCH] stick dead zone: %d%%\n",
                          std_->stick_deadzone);
+                /* v36.87: какая зона цифрового пути шлёт диагонали кейпада */
+                LOG_SAFE("[SWITCH] diagonals: %s (per-game diag=%d; digits path: %s)\n",
+                         g_pg_stick_diag == NOJME_DIAG_DIGITS ? "only 1/3/7/9" :
+                         g_pg_stick_diag == NOJME_DIAG_OFF    ? "off (pairs)" :
+                                                                "pair + 1/3/7/9",
+                         pg.stick_diag,
+                         eff_swap ? "dpad" : "stick");
             }
             /* v35.03: эффективный режим глобального флипа 3D — per-game
              * override побеждает глобальную настройку; наследуется в M3G
@@ -1913,6 +1940,30 @@ int main(int argc, char** argv) {
         }
 #endif
         LOG_SAFE("[SWITCH] session complete — back to menu\n");
+        /* [LSAN-SESS] v36.85: принудительный leak-чек ПОСЛЕ teardown каждой
+         * сессии (только ASan-сборки, гейт NOJME_LSAN_CHECK). Обычный LSan-
+         * отчёт не работает: выход эмулятора — _exit(0) (v35.11), atexit не
+         * зовётся. __lsan_do_recoverable_leak_check() печатает отчёт о
+         * недостижимых блоках НА МЕСТЕ и продолжает выполнение — многодельный
+         * soak (реальная игра x N сессий) теперь сам называет утечки по
+         * сессиям. Точка вызова — меню фронтенда, VM мертва, раннеры в
+         * парке: живые блоки (кэш иконок, пул потоков, аудио-мьютексы) LSan
+         * не трогает, в отчёт попадает только реально потерянное. */
+#if defined(__SANITIZE_ADDRESS__)
+        if (getenv("NOJME_LSAN_CHECK")) {
+            static int s_lsan_sess_no = 0;
+            /* слабая ссылка: объявлена здесь, определена в рантайме ASan */
+            extern int __lsan_do_recoverable_leak_check(void) __attribute__((weak));
+            if (&__lsan_do_recoverable_leak_check &&
+                __lsan_do_recoverable_leak_check()) {
+                LOG_SAFE("[LSAN-SESS] session %d: LEAKS FOUND (see report above)\n",
+                         ++s_lsan_sess_no);
+            } else {
+                LOG_SAFE("[LSAN-SESS] session %d: no leaks\n",
+                         ++s_lsan_sess_no);
+            }
+        }
+#endif
         /* v36.60 [ICON-CACHE-KEEP]: кэш иконок браузера БОЛЬШЕ НЕ
          * сбрасывается на границе сессии. Инвалидация и так точная
          * (path+mtime+fsize), а сброс заставлял браузер после КАЖДОЙ

@@ -43,7 +43,7 @@
 #  include <SDL.h>
 #endif
 
-#define TRACE_LINE_CAP 320
+#define TRACE_LINE_CAP 512   /* v36.75 [MWINFIX]: 320 обрезал хвост diag-строки (chf/chg/chb) ещё до добавления mwin=/swh= */
 #define TRACE_LOG_CAP  (1024 * 1024)   /* v34.95: 1 MB — the per-second thread dump eats budget */
 
 /* ========================================================================
@@ -81,6 +81,10 @@ void sw_logging_set(int on) {
 
 /* --- diag counters (see switch_trace.h for semantics) --- */
 volatile uint32_t g_sd_loop = 0, g_sd_pr = 0, g_sd_skip = 0, g_sd_pump = 0;
+/* v36.77 [PERF-PRESENT]: present'ы, ПРОПУЩЕННЫЕ по требованию (settled-seq
+ * не двигался и heartbeat 250 мс не горел) — вместе с pr и fl показывает
+ * эффективность on-demand вывода: pd + pr == полное число циклов с решением. */
+volatile uint32_t g_sd_pds = 0;
 volatile uint32_t g_sd_stl_ms = 0, g_sd_sr_ms = 0, g_sd_fl = 0;
 volatile uint32_t g_sd_vs = 0;
 volatile uint32_t g_sd_pv_ms = 0, g_sd_pv_ms_max = 0, g_sd_pw_ms_max = 0;
@@ -113,6 +117,20 @@ volatile uint32_t g_sd_utf = 0, g_sd_rcf = 0, g_sd_ch = 0, g_sd_chf = 0; /* v36.
  * «5 second(s)», блюр-поля живут») требует РАЗДЕЛЬНЫХ ответов: единый ch
  * не отличает «весь композит жив» от «жив только угол/фон». */
 volatile uint32_t g_sd_chg = 0, g_sd_chb = 0;
+/* v36.75 [MWINFIX]: mwin = exec-окНА главного потока за период (доказательство
+ * жизни m независимО от нативов — обфусцированные обёртки BT/TT len<=7 их не
+ * содержат, и «td m nat=... age=42s» вел полевых расследований по ложному
+ * следу при живом m); swh = сколько раз КОНТЕНТ settled-кадра реально
+ * менялся (seq++ может копировать один и тот же кадр: swh>0 при chg=0 =
+ * слой потерь НИЖЕ settled — аплоад/Scale2x; swh=0 = сама игра не рисует
+ * нового — полевой случай TT v36.74, сессия 3). */
+/* v36.81 [LINK-FIX]: определения g_sd_mwin/g_sd_swh ПЕРЕНЕСЕНЫ в
+ * display.c — их инкрементят display.c/native.c из игровых путей, а
+ * цели headless/libretro НЕ линкуют switch_trace.c (остались
+ * неопределённые ссылки + textrel в PIE; у Switch-NRO/verify всё было
+ * живо — switch_trace.c в их списке). Здесь остаются extern-объявления
+ * (читает/сбрасывает diag). */
+extern volatile uint32_t g_sd_mwin, g_sd_swh; /* v36.75 [MWINFIX] */
 volatile const char* g_sd_loop_stage = NULL;
 volatile uint64_t g_sd_loop_ms = 0;
 
@@ -207,8 +225,10 @@ static uint32_t g_sd_top_hwm = 0;
 
 static void diag_emit(void) {
     uint32_t loop = g_sd_loop, pr = g_sd_pr, skip = g_sd_skip, pump = g_sd_pump;
+    uint32_t pds = g_sd_pds;
     uint32_t stl = g_sd_stl_ms, sr = g_sd_sr_ms, fl = g_sd_fl, vs = g_sd_vs;
     g_sd_loop = 0; g_sd_pr = 0; g_sd_skip = 0; g_sd_pump = 0;
+    g_sd_pds = 0;
     g_sd_stl_ms = 0; g_sd_sr_ms = 0; g_sd_fl = 0; g_sd_vs = 0;
 
     uint32_t gc = 0;
@@ -276,10 +296,40 @@ static void diag_emit(void) {
         g_sd_tj_ms_max = 0; g_sd_rj_ms_max = 0; g_sd_sj_ms_max = 0;
         uint32_t lvc = g_sd_lvc, dset = g_sd_dset;   /* v35.06 */
         g_sd_lvc = 0; g_sd_dset = 0;
+        uint32_t mwin = g_sd_mwin, swh = g_sd_swh;   /* v36.75 [MWINFIX] */
+        g_sd_mwin = 0; g_sd_swh = 0;
         uint32_t utf = g_sd_utf, rcf = g_sd_rcf, ch = g_sd_ch, chf = g_sd_chf;
         g_sd_utf = 0; g_sd_rcf = 0; g_sd_ch = 0; g_sd_chf = 0; /* v36.43 */
         uint32_t chg = g_sd_chg, chb = g_sd_chb;
         g_sd_chg = 0; g_sd_chb = 0; /* v36.44 [SPLIT-PROBE] */
+        /* v36.84 [ZPERF-PSC]: сколько Thread.sleep укорочено clamp'ом окна
+         * paint за период (native.c). Слабый символ: белые тесты без ядра
+         * печатать не будут. */
+        uint32_t psc = 0;
+        {
+            extern volatile uint32_t g_zperf_psc_clamps __attribute__((weak));
+            if (&g_zperf_psc_clamps) {
+                psc = g_zperf_psc_clamps;
+                g_zperf_psc_clamps = 0;
+            }
+        }
+        /* v36.85 [TURBO-FF]: tff = турбо-ускорения за период — сколько
+         * serviceRepaints ушли без vsync-ожидания + сколько снов раннера
+         * разбавлено. Живая подпись того, что турбо-режим ДЕЙСТВУЕТ
+         * (нулевые значения при «Скорость ВМ: Турбо» = что-то не так). */
+        uint32_t tff = 0;
+        {
+            extern unsigned g_turbo_ff_vsync_skips __attribute__((weak));
+            extern volatile uint32_t g_turbo_ff_sleep_dilates __attribute__((weak));
+            if (&g_turbo_ff_vsync_skips) {
+                tff += g_turbo_ff_vsync_skips;
+                g_turbo_ff_vsync_skips = 0;
+            }
+            if (&g_turbo_ff_sleep_dilates) {
+                tff += g_turbo_ff_sleep_dilates;
+                g_turbo_ff_sleep_dilates = 0;
+            }
+        }
         /* v35.03: GC-паузы — gms = последняя сборка, мс; gxm = худшая за
          * период. gc=0 всю сессию + первая сборка на границе круга =
          * кандидат в «внезапный 1 fps»: пара строк в логе это докажут
@@ -293,10 +343,23 @@ static void diag_emit(void) {
                 g_gc_worst_ms = 0;
             }
         }
-        sw_trace_force("diag: loop=%u pr=%u stl=%u vs=%u gc=%u heap=%u top=%u skip=%u pump=%u sr=%u fl=%u sb=%u bn=%u bd=%u tn=%d ta=%lld/t%d tw=%d ma=%u pv=%u pk=%u pw=%u mx=%u pp=%u psk=%u cs=%u lvc=%u dset=%u gms=%u gxm=%u tj=%u rj=%u sj=%u utf=%u rcf=%u ch=%u chf=%u chg=%u chb=%u",
+        sw_trace_force("diag: loop=%u pr=%u stl=%u vs=%u gc=%u heap=%u top=%u skip=%u pump=%u sr=%u fl=%u sb=%u bn=%u bd=%u tn=%d ta=%lld/t%d tw=%d ma=%u pv=%u pk=%u pw=%u mx=%u pp=%u psk=%u cs=%u lvc=%u dset=%u mwin=%u swh=%u gms=%u gxm=%u tj=%u rj=%u sj=%u utf=%u rcf=%u ch=%u chf=%u chg=%u chb=%u pd=%u psc=%u tff=%u",
                        loop, pr, stl, vs, gc, heap, top, skip, pump, sr, fl, sb, bn, bd,
-                       tn, ta, tatid, tw, ma, pv, pk, pw, mx, pp, psk, cs, lvc, dset, gms, gxm,
-                       tj, rj, sj, utf, rcf, ch, chf, chg, chb);
+                       tn, ta, tatid, tw, ma, pv, pk, pw, mx, pp, psk, cs, lvc, dset, mwin, swh, gms, gxm,
+                       tj, rj, sj, utf, rcf, ch, chf, chg, chb, pds, psc, tff);
+    }
+    /* v36.81 [TEX-DIAG]: адреса/размеры/счётчики всех текстур выдачи —
+     * то, о чём просил пользователь («адреса текстур?»). Печатается в
+     * том же 5-с такте, что и diag (чтение+сброс счётчиков в одном
+     * вызове). Слабый символ: белые хост-тесты без графики молчат. */
+    {
+        extern int sdl_switch_tex_diag_line(char* buf, size_t cap)
+            __attribute__((weak));
+        if (&sdl_switch_tex_diag_line && sdl_switch_tex_diag_line) {
+            char texbuf[512];
+            if (sdl_switch_tex_diag_line(texbuf, sizeof(texbuf)) > 0)
+                sw_trace_force("%s", texbuf);
+        }
     }
 }
 
@@ -324,10 +387,12 @@ void sw_diag_session_reset(void) {
     g_sd_top_sample = 0;
     g_sd_loop = 0; g_sd_pr = 0; g_sd_skip = 0; g_sd_pump = 0;
     g_sd_stl_ms = 0; g_sd_sr_ms = 0; g_sd_fl = 0; g_sd_vs = 0;
+    g_sd_pds = 0; /* v36.77 [PERF-PRESENT] */
     g_sd_pv_ms = 0; g_sd_pv_ms_max = 0; g_sd_pw_ms_max = 0;
     g_sd_iter_ms_max = 0;
     g_sd_tj_ms_max = 0; g_sd_rj_ms_max = 0; g_sd_sj_ms_max = 0; /* v35.04 */
     g_sd_lvc = 0; g_sd_dset = 0; /* v35.06 */
+    g_sd_mwin = 0; g_sd_swh = 0; /* v36.75 [MWINFIX] */
     g_sd_utf = 0; g_sd_rcf = 0; g_sd_ch = 0; g_sd_chf = 0; /* v36.43 */
     g_sd_chg = 0; g_sd_chb = 0; /* v36.44 [SPLIT-PROBE] */
     g_sd_loop_stage = NULL; /* no game session: the STUCK watchdog idles */
@@ -619,9 +684,17 @@ static Uint32 trace_beat_cb(Uint32 interval, void* param) {
      * checks VM-thread liveness and, when a RUN-able thread stops
      * dispatching for >5 s OR the alive-runner count drops below its
      * session high, emits a forced dump of all threads (deep=0 — legal
-     * from the timer thread; the frontend is NOT provably blocked here). */
+     * from the timer thread; the frontend is NOT provably blocked here).
+     * v36.76 [MENU-STALL]: маркеры «menu:»/«pgset:» (цикл фронтенд-меню)
+     * НЕ означают игровую сессию — JVM может быть уже разобрана между
+     * сессиями; liveness-путь для них выключен (иначе каждое меню
+     * репортило бы ложный [T-STALL] при 0 живых потоков). СТОРОЖ же
+     * (STUCK: stage=menu:* ...) для меню теперь РАБОТАЕТ — это и была
+     * слепая зона полевого класса «меню зависло, лог молчит». */
+    int menu_stage = (stage && (strncmp(stage, "menu:", 5) == 0 ||
+                                strncmp(stage, "pgset:", 6) == 0));
     int stall_alarm = 0;
-    if (stage && g_sd_jvm && !stuck) {
+    if (stage && !menu_stage && g_sd_jvm && !stuck) {
         extern void jvm_thread_liveness(void*, int*, long long*, int*, int*)
             __attribute__((weak));
         if (jvm_thread_liveness) {
@@ -888,6 +961,18 @@ static Uint32 trace_beat_cb(Uint32 interval, void* param) {
              * could not name the game method inside which the stream was
              * being read — the deep dump can. */
             int nf_deep = stuck || (s_nf_beats > 0 && (s_nf_beats % NOJME_NF_BEATS) == 0);
+            /* v36.74 [TSTART-E] DIAG: NOJME_TD_DEEP=1 — force the DEEP
+             * per-thread dump every beat (field/host hang triage; the
+             * jsite snapshot per thread names the game method each thread
+             * is parked inside, which the shallow dump cannot). */
+            {
+                static int td_deep_force = -1;
+                if (td_deep_force < 0) {
+                    const char* e = getenv("NOJME_TD_DEEP");
+                    td_deep_force = (e && e[0] && e[0] != '0') ? 1 : 0;
+                }
+                if (td_deep_force) nf_deep = 1;
+            }
             char dbuf[1024];   /* v34.96: 640 -> 1024 — wider nat names + td m3g line */
             dbuf[0] = '\0';
             jvm_threads_dump_snprint((void*)g_sd_jvm, dbuf, sizeof(dbuf), nf_deep);

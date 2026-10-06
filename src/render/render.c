@@ -1817,7 +1817,21 @@ void midp_graphics_draw_region(MidpGraphics* gfx, MidpImage* img,
                 /* reversed columns: dst[px] = src_row[-px] (src_cstep=-1) */
                 if (opaque) {
 #if RENDER_HAVE_SIMD
-                    span_copy_rev32(dst_row, src_row, cw);
+                    /* [REV32-BASE-FIX] v36.85: база спана обязана смотреть на
+                     * ЛЕВЫЙ край зеркального окна. span_copy_rev32(dst,src,n)
+                     * читает src[0..n-1] (развёрнуто), а окно зеркала здесь —
+                     * колонки [src_c0-n+1 .. src_c0] (src_row указывает на
+                     * ПРАВЫЙ край src_c0). Прежний вызов передавал src_row
+                     * как есть: SIMD читал [src_c0 .. src_c0+n-1] — на n-1
+                     * пикселей ПРАВЕЕ правильного окна, т.е. (а) чужие
+                     * пиксели вместо зеркальных и (б) выход за конец
+                     * пиксельного буфера до n-1 пикселей (ASan: чтение до
+                     * +476 байт мимо 120-пиксельного буфера; на Switch тот же
+                     * NEON-путь читал соседние аллокации кучи). База
+                     * src_row-(cw-1) выводит окно ровно на валидированный
+                     * src-прямоугольник: [x_src..x_src+w-1] гарантированно
+                     * в границах (см. проверку валидации выше). */
+                    span_copy_rev32(dst_row, src_row - (cw - 1), cw);
 #else
                     for (int px = 0; px < cw; px++) dst_row[px] = src_row[-px];
 #endif

@@ -1826,6 +1826,11 @@ static volatile uint32_t g_midp_vsync_seq = 0;
 void midp_vsync_tick(void) { g_midp_vsync_seq++; }
 uint32_t midp_vsync_count(void) { return g_midp_vsync_seq; }
 
+/* v36.85 [TURBO-FF]: диагностический счётчик турбо-ускорений — сколько
+ * serviceRepaints ушли БЕЗ vsync-ожидания (турбо). Печатается в 5-с
+ * diag-строку полей tff= (switch_trace.c). */
+unsigned g_turbo_ff_vsync_skips = 0;
+
 /* ==========================================================================
  * v34.61 (Asphalt 3 3D "rarely delivers 3D frames"): SETTLED-FRAME SCANOUT
  * BUFFER.
@@ -1952,6 +1957,7 @@ uint64_t midp_present_stable_age_ms(void) {
  * where a complete frame has just been produced (all drawing for the frame
  * is done). Safe from any thread; cheap; never blocks painters for more
  * than the memcpy. */
+static uint32_t midp_stale_sample_hash(const uint32_t* px, int w, int h); /* v36.75: swh= использует (определение ниже) */
 void midp_present_settled_snapshot(void) {
     SdlContext* ctx = sdl_get_global_context();
     if (!ctx || !ctx->framebuffer || ctx->width <= 0 || ctx->height <= 0) return;
@@ -1972,6 +1978,23 @@ void midp_present_settled_snapshot(void) {
     memcpy(g_midp_stable_pixels, ctx->framebuffer, (size_t)px * sizeof(uint32_t));
     g_midp_stable_seq++;
     g_stable_last_settle_ms = stable_mono_ms();
+    /* v36.75 [MWINFIX] swh= : продвигается ли КОНТЕНТ settled-кадра (а не
+     * только его seq). Полевой лог v36.74 (TT, сессия 3): fl=100 при
+     * chg=0 — seq рос 20/с, а вид на экране стоял. Двусмысленность
+     * («сеттлы копируют один и тот же кадр» vs «слой потери ниже settled
+     * — аплоад/Scale2x») закрывает этот счётчик: 8x8-сэмпл-хэш новой
+     * копии сравнивается с прошлой; расхождение = swh++ в diag. */
+    {
+        static uint32_t s_swh_last = 0;
+        static int s_swh_have = 0;
+        uint32_t hsh = midp_stale_sample_hash(g_midp_stable_pixels, w, h);
+        if (s_swh_have && hsh != s_swh_last) {
+            extern volatile uint32_t g_sd_swh;
+            __sync_fetch_and_add(&g_sd_swh, 1);
+        }
+        s_swh_last = hsh;
+        s_swh_have = 1;
+    }
     stable_unlock();
 }
 
@@ -2039,7 +2062,21 @@ uint32_t midp_present_stable_seq(void) {
  *       settles at paint completion before the present runs). */
 #define MIDP_STALE_SAMPLES 64
 
+/* v36.81 [LINK-FIX]: определения счётчиков mwin/swh жили в
+ * switch/switch_trace.c, а инкрементируются отсюда (swh — ниже) и из
+ * native.c (mwin); цели headless/libretro НЕ линкуют switch_trace.c и
+ * оставались с неопределёнными ссылками (Switch-NRO/verify не задет —
+ * там switch_trace.c в списке). Определение перенесено в TU, который
+ * есть во ВСЕХ целях сборки. */
+volatile uint32_t g_sd_mwin = 0, g_sd_swh = 0; /* v36.75 [MWINFIX] */
+
 extern int midp_canvas_mid_frame(void);  /* defined below (paint depth + M3G bind gate) */
+
+/* v36.74 [SETTLE-GATE] DIAG: forward decls — the gate flags live below the
+ * settle path but the probe (which sub-gate blocks delivery) needs them
+ * here. Both are plain volatile ints written by the paint/bind paths. */
+static volatile int g_midp_paint_depth;      /* defined below (4321 block) */
+extern volatile int g_m3g_target_bound_flag; /* mobile3d.c */
 
 static uint32_t midp_stale_sample_hash(const uint32_t* px, int w, int h) {
     uint32_t hash = 2166136261u;
@@ -2079,7 +2116,103 @@ int midp_present_settle_if_stale(void) {
     SdlContext* ctx;
     int stale = 0;
     if (g_midp_stable_seq == 0) return 0;   /* bootstrap: presenter shows live */
-    if (midp_canvas_mid_frame()) return 0;  /* paint()/M3G bind in flight */
+
+    /* v36.74 [LIVE-DELIVER]: stagnation override. FIELD ROOT CAUSE (Bounce
+     * Tales v36.73 host repro /tmp/tbtstall): the game draws its loading and
+     * menu screens straight into the live canvas from the game thread and
+     * NEVER completes a pump paint — the settled snapshot never advances,
+     * settle_if_stale never fires (dset=0 in the diag while lvc=102/5s), so
+     * the presenter keeps scanning out a stale frame: the composite freezes
+     * (the "static image instead of the game" class). On a real phone the
+     * canvas IS the LCD — direct writes show immediately.
+     *
+     * Policy: count consecutive presents where the settled seq did NOT
+     * advance while the live sample-hash differs from the settled one. Pump-
+     * paced games reset the counter every frame (their paints settle), so
+     * nothing changes for them. A game whose snapshot stagnates this long
+     * (default 30 presents ~ 500 ms at 60 fps, NOJME_LIVE_DELIVER_N=0 to
+     * disable) gets its live canvas delivered racy — the SAME asynchronous-
+     * scanout semantics the a!=b path below already documents, now with a
+     * bounded escape hatch for permanent mid_frame holders. */
+    {
+        static uint32_t s_stall_presents = 0;
+        static uint32_t s_stall_last_seq = 0;
+        static int s_live_deliver_n = -2;
+        if (s_live_deliver_n == -2) {
+            const char* e = getenv("NOJME_LIVE_DELIVER_N");
+            s_live_deliver_n = (e && e[0]) ? atoi(e) : 30;
+        }
+        if (s_live_deliver_n > 0) {
+            if (g_midp_stable_seq == s_stall_last_seq) {
+                s_stall_presents++;
+            } else {
+                s_stall_presents = 0;
+                s_stall_last_seq = g_midp_stable_seq;
+            }
+            if (s_stall_presents >= (uint32_t)s_live_deliver_n) {
+                /* Live canvas diverged from a frozen snapshot for half a
+                 * second — deliver it now, mid_frame or not (bounded one
+                 * frame of tearing risk vs an indefinitely frozen screen). */
+                ctx = sdl_get_global_context();
+                if (ctx && ctx->framebuffer && ctx->width > 0 && ctx->height > 0) {
+                    stable_lock_bounded("live-deliver");
+                    if (g_midp_stable_pixels &&
+                        g_midp_stable_w == ctx->width && g_midp_stable_h == ctx->height) {
+                        uint32_t a = midp_stale_sample_hash(g_midp_stable_pixels,
+                                                            ctx->width, ctx->height);
+                        uint32_t b = midp_stale_sample_hash(ctx->framebuffer,
+                                                            ctx->width, ctx->height);
+                        if (a != b) {
+                            long pxl = (long)ctx->width * (long)ctx->height;
+                            memcpy(g_midp_stable_pixels, ctx->framebuffer,
+                                   (size_t)pxl * sizeof(uint32_t));
+                            g_midp_stable_seq++;
+                            g_stable_last_settle_ms = stable_mono_ms();
+                            s_stall_last_seq = g_midp_stable_seq;
+                            s_stall_presents = 0;
+                            stale = 2;   /* delivered via the stall path */
+                            {
+                                static uint32_t s_ld_logs = 0;
+                                if (++s_ld_logs <= 10 || (s_ld_logs % 500) == 0) {
+                                    extern void sw_trace_force(const char* fmt, ...)
+                                        __attribute__((weak));
+                                    if (sw_trace_force)
+                                        sw_trace_force("[LIVE-DELIVER] snapshot "
+                                                       "stalled %u presents — live "
+                                                       "canvas delivered",
+                                                       (uint32_t)s_live_deliver_n);
+                                }
+                            }
+                        } else {
+                            s_stall_presents = 0;  /* live == settled: nothing to show */
+                        }
+                    }
+                    stable_unlock();
+                    if (stale) return stale;
+                }
+            }
+        }
+    }
+
+    if (midp_canvas_mid_frame()) {
+        /* v36.74 [SETTLE-GATE] DIAG: which sub-gate blocks the delivery —
+         * the BT host repro showed dset=0 while lvc=102/5s (live canvas
+         * animating, screen composite frozen ch=0). paint-depth leak vs a
+         * stuck M3G flag are different fixes. */
+        {
+            static uint32_t s_gate_logs = 0;
+            if (++s_gate_logs <= 40 || (s_gate_logs % 2000) == 0) {
+                extern void sw_trace_force(const char* fmt, ...) __attribute__((weak));
+                if (&sw_trace_force && sw_trace_force) {
+                    sw_trace_force("[SETTLE-GATE] mid_frame blocks delivery "
+                                   "(depth=%d m3g=%d) live keeps drawing",
+                                   g_midp_paint_depth,
+                                   g_m3g_target_bound_flag ? 1 : 0);
+                }
+            }
+        }
+        return 0;  /* paint()/M3G bind in flight */
+    }
     ctx = sdl_get_global_context();
     if (!ctx || !ctx->framebuffer || ctx->width <= 0 || ctx->height <= 0)
         return 0;
@@ -2455,7 +2588,10 @@ void midp_call_keyPressed_impl(JVM* jvm, int keycode) {
     }
 
     /* [KEYDIAG] v34.9: trace every delivered key event (first 60, then
-     * every 500th) to diagnose menu/hang key-flow issues (Bounce Tales). */
+     * every 500th) to diagnose menu/hang key-flow issues (Bounce Tales).
+     * v36.75 [MWINFIX]: дублируем в sw_trace — на устройстве stderr не
+     * попадает в log.txt (класс [YSFIX2] v36.40), и полевой лог v36.74
+     * ВЫГЛЯДЕЛ как «клавиши не доставлены», хотя доставка работала. */
     {
         static int keydiag_n = 0;
         int n = ++keydiag_n;
@@ -2464,6 +2600,15 @@ void midp_call_keyPressed_impl(JVM* jvm, int keycode) {
                      keycode,
                      (clazz->class_name && clazz->class_name[0]) ? clazz->class_name : "?",
                      game_canvas.suppress_key_events ? 1 : 0);
+            {
+                extern void sw_trace_force(const char* fmt, ...) __attribute__((weak));
+                if (sw_trace_force) {
+                    sw_trace_force("[KEYDIAG] keyPressed(%d) -> displayable=%s suppress=%d",
+                                   keycode,
+                                   (clazz->class_name && clazz->class_name[0]) ? clazz->class_name : "?",
+                                   game_canvas.suppress_key_events ? 1 : 0);
+                }
+            }
         }
     }
 
@@ -2625,6 +2770,13 @@ void midp_call_keyPressed_impl(JVM* jvm, int keycode) {
     if (!method) {
         LOG_SAFE("[KEYDIAG] keyPressed(%d): resolve FAILED on class %s\n",
                  keycode, clazz->class_name ? clazz->class_name : "?");
+        {
+            extern void sw_trace_force(const char* fmt, ...) __attribute__((weak));
+            if (sw_trace_force) {
+                sw_trace_force("[KEYDIAG] keyPressed(%d): resolve FAILED on class %s",
+                               keycode, clazz->class_name ? clazz->class_name : "?");
+            }
+        }
         return;
     }
 
@@ -2659,6 +2811,16 @@ void midp_call_keyPressed_impl(JVM* jvm, int keycode) {
                      keycode, clazz->class_name ? clazz->class_name : "?", ret,
                      (void*)method, method->access_flags,
                      method->code.code ? method->code.code_length : 0);
+            /* v36.75 [MWINFIX]: sw_trace-дубль (в поле stderr невидим) —
+             * len= метода и есть ответ на «пустые обёртки vs зависание» */
+            {
+                extern void sw_trace_force(const char* fmt, ...) __attribute__((weak));
+                if (sw_trace_force) {
+                    sw_trace_force("[KEYDIAG] keyPressed(%d) executed on %s ret=%d len=%d",
+                                   keycode, clazz->class_name ? clazz->class_name : "?", ret,
+                                   method->code.code ? (int)method->code.code_length : 0);
+                }
+            }
         }
     }
     
@@ -4038,9 +4200,19 @@ static JavaValue native_canvas_repaint(JVM* jvm, JavaThread* thread,
      * via midp_process_repaints() after timers have run.
      */
     
-    if (canvas) {
-        fprintf(stderr, "[REPAINT] repaint() called, canvas=%p class=%s\n", 
-                (void*)canvas, canvas->header.clazz && canvas->header.clazz->class_name ? canvas->header.clazz->class_name : "?");
+    /* v36.84 [ZPERF-LOG]: этот fprintf раньше писал БЕЗУСЛОВНО на каждый
+     * repaint() (24-60+/с). На консоли stderr под hbmenu — syscall в
+     * никуда, но всё равно форматирование+lock на каждом кадре; при
+     * перенаправленном stderr — запись на SD. Теперь гейт NOJME_GFX_TRACE
+     * (тот же, что у остальных gfx-трейсов). */
+    {
+        static int s_repaint_trace = -1;
+        if (s_repaint_trace < 0)
+            s_repaint_trace = getenv("NOJME_GFX_TRACE") ? 1 : 0;
+        if (s_repaint_trace && canvas) {
+            fprintf(stderr, "[REPAINT] repaint() called, canvas=%p class=%s\n",
+                    (void*)canvas, canvas->header.clazz && canvas->header.clazz->class_name ? canvas->header.clazz->class_name : "?");
+        }
     }
     
     canvas_request_repaint(canvas, true);
@@ -4168,10 +4340,38 @@ static JavaValue native_canvas_serviceRepaints(JVM* jvm, JavaThread* thread,
     /* v50: pace ONLY when (a) this OS thread is a VM runner (a game thread),
      * not the frontend/main thread, and (b) this call actually completed a
      * paint here (flags cleared) — a skipped pump (UI lock busy elsewhere)
-     * must retry immediately, and there is nothing to wait for. */
+     * must retry immediately, and there is nothing to wait for.
+     *
+     * v36.85 [TURBO-FF]: в турбо-режиме (g_jvm_thread_budget==0 — настройка
+     * «Скорость ВМ: Турбо», дефолт с v36.16) vsync-пауза ПОСЛЕ paint
+     * УБИРАЕТСЯ. Полевой отчёт («работает крайне медленно даже в режиме
+     * турбо»): кадр игры сериализован как [логика раннера] -> [ожидание
+     * насоса ~16 мс] -> [paint на фронтенде] -> [vsync-ожидание ЕЩЁ один
+     * тик = +16.7 мс] -> следующий кадр. Две из четырёх составляющих —
+     * искусственные пауcы эмулятора, и vsync-часть в турбо противопоказана
+     * по смыслу: fast-forward не обязан рисоваться каждый vblank. Гонка-
+     * «заморозка Asphalt 3D» (UI lock 100%, презентация голодала) — класс
+     * LIBRETRO-фронтенда: в SDL-модели насос и презентация — ОДИН поток
+     * (цикл качает paint и презентует по требованию), презентация не может
+     * голодать от раннера. Настройки/среда: NOJME_TURBO_VSYNC_FREE=0
+     * возвращает pacing в турбо. Не-турбо пути не тронуты. */
     if (!g_paint_pending) {
         extern int jvm_current_os_thread_is_vm_runner(void);
         if (jvm_current_os_thread_is_vm_runner() && jvm && jvm->running) {
+            static int s_turbo_vsync_free = -1;
+            int turbo_free = 0;
+            if (s_turbo_vsync_free < 0) {
+                const char* tvf = getenv("NOJME_TURBO_VSYNC_FREE");
+                s_turbo_vsync_free = (tvf && tvf[0] && atoi(tvf) == 0) ? 0 : 1;
+            }
+            if (s_turbo_vsync_free) {
+                extern long g_jvm_thread_budget; /* execute.c: 0 = turbo */
+                if (g_jvm_thread_budget == 0) {
+                    turbo_free = 1;
+                    __sync_fetch_and_add(&g_turbo_ff_vsync_skips, 1);
+                }
+            }
+            if (!turbo_free) {
             /* v34.61 FIX (Asphalt 3 3D "rarely delivers 3D frames"): wait for
              * the first presentation tick that starts AFTER the paint
              * completed. The v50 code snapshotted g_midp_vsync_seq BEFORE
@@ -4202,6 +4402,7 @@ static JavaValue native_canvas_serviceRepaints(JVM* jvm, JavaThread* thread,
                 struct timespec vs = { .tv_sec = 0, .tv_nsec = 2000000 };
                 nanosleep(&vs, NULL);
 #endif
+            }
             }
         }
     }
@@ -4314,6 +4515,28 @@ static volatile int g_midp_paint_depth = 0;
 
 static void midp_paint_depth_inc(void) { g_midp_paint_depth++; }
 static void midp_paint_depth_dec(void)  { g_midp_paint_depth--; }
+
+/* v36.83 [ZFENCE-PAINT]: TRUE while the frame/frontend thread is inside a
+ * paint()-driven Java window (both pump call sites bracket the
+ * execute_method(paint) with midp_paint_depth_inc/dec). The EXIT-FENCE
+ * (execute.c jvm_frame_fence_arm) must NOT hold VM runners through such a
+ * window: Gameloft-style loadings run a CROSS-THREAD BUSY-WAIT inside
+ * paint (Zombie Infection [240x320] K800i field hang v36.82: g.H case-117
+ * spins `while (!scriptGroupDone) tick();` whose script clock advances
+ * ONLY from the game's second thread — g.run() updating the frame-delta
+ * field ~25 Hz). With the fence armed for the whole paint, the runner is
+ * parked at its 16k-instruction poll, the clock freezes, the spin never
+ * exits; the v36.57 spin-breaker then fires at 1.5 s — BEFORE the fence's
+ * own 2.5 s cap releases the runner — and the injected exception unwinds
+ * paint without the game's re-entrance guard cleanup (g.ax stuck true):
+ * paint() becomes a permanent no-op and the loading screen freezes
+ * forever. Pre-v36.30 the emulator ran paint and runner threads
+ * concurrently the whole time; the fence was added for the EXIT path
+ * (destroyApp vs runners, "Data Abort при выходе") — paint windows are
+ * not that path. Public for the arm check. */
+int midp_paint_window_active(void) {
+    return (g_midp_paint_depth > 0) ? 1 : 0;
+}
 
 /* mobile3d.c maintains this flag alongside its bind/release target state. */
 extern volatile int g_m3g_target_bound_flag;
@@ -4700,8 +4923,65 @@ static void midp_process_repaints_impl(JVM* jvm) {
         return;
     }
     render_soft_buttons(jvm, canvas);
-    
-    /* M3G force-render: Some games (like SU-30) do M3G scene setup 
+
+    /* v36.83 [PAINT-SNAP] diag: NOJME_PAINT_SNAP_DIR=dir[,interval_ms] —
+     * dump the frontend framebuffer (what a plain-Canvas paint() drew;
+     * the v36.58 SNAP hook covers GameCanvas.flushGraphics only, useless
+     * for repaint()-driven games like Gameloft titles). Interval-gated
+     * (default 700ms) so a 90s repro stays a few hundred files. Default
+     * off, host/device diagnosis only. */
+    {
+        static int ps_on = -1;
+        static char ps_dir[256];
+        static long ps_iv = 700;
+        static uint64_t ps_last = 0;
+        static uint32_t ps_n = 0;
+        if (ps_on < 0) {
+            const char* e = getenv("NOJME_PAINT_SNAP_DIR");
+            ps_on = (e && e[0]) ? 1 : 0;
+            if (ps_on) {
+                const char* comma = strchr(e, ',');
+                size_t dl = comma ? (size_t)(comma - e) : strlen(e);
+                if (dl >= sizeof(ps_dir)) dl = sizeof(ps_dir) - 1;
+                memcpy(ps_dir, e, dl);
+                ps_dir[dl] = '\0';
+                if (comma) ps_iv = atol(comma + 1);
+                if (ps_iv < 50) ps_iv = 50;
+            }
+        }
+        if (ps_on) {
+            struct timespec ps_ts;
+            clock_gettime(CLOCK_MONOTONIC, &ps_ts);
+            uint64_t ps_now = (uint64_t)ps_ts.tv_sec * 1000ULL +
+                              (uint64_t)ps_ts.tv_nsec / 1000000ULL;
+            if (!ps_last || ps_now - ps_last >= (uint64_t)ps_iv) {
+                ps_last = ps_now;
+                SdlContext* ps_ctx = sdl_get_global_context();
+                if (ps_ctx && ps_ctx->framebuffer) {
+                    char ps_path[320];
+                    snprintf(ps_path, sizeof(ps_path), "%s/paint_%u.ppm",
+                             ps_dir, ps_n++);
+                    FILE* ps_f = fopen(ps_path, "wb");
+                    if (ps_f) {
+                        int ps_w = ps_ctx->width, ps_h = ps_ctx->height;
+                        fprintf(ps_f, "P6\n%d %d\n255\n", ps_w, ps_h);
+                        const uint32_t* ps_src = ps_ctx->framebuffer;
+                        for (int y = 0; y < ps_h; y++) {
+                            for (int x = 0; x < ps_w; x++) {
+                                uint32_t p = ps_src[y * ps_w + x];
+                                fputc((int)((p >> 16) & 0xFF), ps_f);
+                                fputc((int)((p >> 8) & 0xFF), ps_f);
+                                fputc((int)(p & 0xFF), ps_f);
+                            }
+                        }
+                        fclose(ps_f);
+                    }
+                }
+            }
+        }
+    }
+
+    /* M3G force-render: Some games (like SU-30) do M3G scene setup
      * (setCamera, setBackground, etc.) but never call bindTarget/render.
      * After paint() completes, if scene was set up but not rendered,
      * force a render cycle. */
