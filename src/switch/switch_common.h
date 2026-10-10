@@ -306,6 +306,16 @@ typedef struct {
                               * enter/exit thresholds bit-for-bit */
     int battery_display;     /* [BATFIX] v36.41: NOJME_BATT_* — индикатор
                               * заряда в правом верхнем углу (по умолч. выкл) */
+    /* v36.90 [MIDI-PERF]: рантайм-конфигурация sonivox-синтезатора.
+     * midi_polyphony 0..32 (0 = максимум сборки), filter/reverb — гейты
+     * горячих путей WT-движка (eas_wtengine.c / eas_mixer.c / midi.c).
+     * По умолчанию «быстрая» конфигурация эпохи J2ME: 24 голоса, без
+     * резонансного фильтра и без реверба. */
+    int midi_polyphony;      /* 0..32 (0 = макс. сборки) */
+    int midi_filter;         /* 1 = резонансный фильтр голоса */
+    int midi_reverb;         /* 1 = Schroeder reverb на шине */
+    int midi_gain;           /* v36.91 [MIDI-GAIN]: пост-гейн MIDI, % (100..400,
+                              * 200 = +6 дБ; выравнивает громкость с PCM) */
 } SwitchSettings;
 
 /* Defaults: fit-with-black-borders, pixel filtering, audio on, TURBO VM
@@ -603,6 +613,17 @@ enum {
     ST_CTL_HINT_SWAP,        /* подсказка про стик/D-pad (короткая) */
     ST_CTL_HINT_BTN,         /* подсказка про назначение кнопки */
     ST_CTL_HINT_RESET,       /* подсказка про сброс */
+    /* v36.105 [KEYS-ROW-MERGE]: мерж строк MINUS и PLUS экрана «Назначенные
+     * кнопки» — 12 строк игры + заголовок при row_h=44 не влезали по высоте,
+     * последняя (PLUS) обрезалась (полевой запрос). Добавлены В КОНЕЦ
+     * enum/таблиц — старые id не сдвинуты (как v36.19/v36.87). */
+    ST_KEYS_MINUSPLUS,       /* имя слитой строки «MINUS / PLUS» */
+    ST_KEYS_MINUSPLUS_V,     /* значение слитой строки «Меню паузы» */
+    /* v37.00 [RMS-WAIT] (восстановлено в v37.01): сообщение в центре
+     * экрана на время дисковых записей RMS при выходе из игры —
+     * белый прямоугольник, чёрная надпись. Добавлено В КОНЕЦ enum/таблиц
+     * (конвенция v36.19/v36.87/v36.105 — старые id не сдвинуты). */
+    ST_SAVE_WAIT,             /* «ожидается завершение сохранения» */
     ST_TEXT_COUNT
 };
 

@@ -8,6 +8,9 @@
  * hard hang or a crash). A first failure permanently disables file logging.
  */
 #include "switch/switch_trace.h"
+/* v36.104 [VM-OPS]: имена опкодов для [VM-OPS] (таблица живёт в
+ * opcodes.c; слабая линковка не нужна — ядро всегда в сборке). */
+#include "opcodes.h"
 
 #if defined(__SWITCH__) || defined(NOJME_SWITCH_TRACE)
 
@@ -29,6 +32,9 @@
  * that links this file). include/ is on the include path (-I$(INCDIR)). */
 #include "jvm.h"
 #include "heap.h"
+#define GFXPERF_NO_COUNTERS /* enum ids only — the counters are re-declared weak below */
+#include "gfxperf.h" /* v36.100 [GFX-PERF]: GFXP_* ids for the 5-s diag */
+#include "perf_debug.h" /* v36.106 [PERF-GATE]: печать телеметрии только с NOJME_PERF=1 */
 
 /* SDL headers (same discovery order as sdl_graphics.c): switch portlibs
  * expose both layouts, host pkg-config adds -I.../SDL2, the sandbox test
@@ -313,6 +319,20 @@ static void diag_emit(void) {
                 g_zperf_psc_clamps = 0;
             }
         }
+        /* v36.99 [PSC-TURBO-SMALL]: сколько МЕЛКИХ снов (2..9 мс) окна
+         * paint укорочено до 1 мс в турбо (native.c). Отдельно от psc:
+         * psc считает «большие» сны (>=10 мс, клампятся и в обычном
+         * режиме), pss — только турбо-добавку. Ненулевые pss при низком
+         * fps = в paint есть незадокументированная хореография коротких
+         * снов, съедающих кадр. */
+        uint32_t pss = 0;
+        {
+            extern volatile uint32_t g_zperf_pss_clamps __attribute__((weak));
+            if (&g_zperf_pss_clamps) {
+                pss = g_zperf_pss_clamps;
+                g_zperf_pss_clamps = 0;
+            }
+        }
         /* v36.85 [TURBO-FF]: tff = турбо-ускорения за период — сколько
          * serviceRepaints ушли без vsync-ожидания + сколько снов раннера
          * разбавлено. Живая подпись того, что турбо-режим ДЕЙСТВУЕТ
@@ -343,11 +363,152 @@ static void diag_emit(void) {
                 g_gc_worst_ms = 0;
             }
         }
-        sw_trace_force("diag: loop=%u pr=%u stl=%u vs=%u gc=%u heap=%u top=%u skip=%u pump=%u sr=%u fl=%u sb=%u bn=%u bd=%u tn=%d ta=%lld/t%d tw=%d ma=%u pv=%u pk=%u pw=%u mx=%u pp=%u psk=%u cs=%u lvc=%u dset=%u mwin=%u swh=%u gms=%u gxm=%u tj=%u rj=%u sj=%u utf=%u rcf=%u ch=%u chf=%u chg=%u chb=%u pd=%u psc=%u tff=%u",
+        sw_trace_force("diag: loop=%u pr=%u stl=%u vs=%u gc=%u heap=%u top=%u skip=%u pump=%u sr=%u fl=%u sb=%u bn=%u bd=%u tn=%d ta=%lld/t%d tw=%d ma=%u pv=%u pk=%u pw=%u mx=%u pp=%u psk=%u cs=%u lvc=%u dset=%u mwin=%u swh=%u gms=%u gxm=%u tj=%u rj=%u sj=%u utf=%u rcf=%u ch=%u chf=%u chg=%u chb=%u pd=%u psc=%u pss=%u tff=%u",
                        loop, pr, stl, vs, gc, heap, top, skip, pump, sr, fl, sb, bn, bd,
                        tn, ta, tatid, tw, ma, pv, pk, pw, mx, pp, psk, cs, lvc, dset, mwin, swh, gms, gxm,
-                       tj, rj, sj, utf, rcf, ch, chf, chg, chb, pds, psc, tff);
+                       tj, rj, sj, utf, rcf, ch, chf, chg, chb, pds, psc, pss, tff);
     }
+    /* v36.97 [VM-PERF]: телеметрия производительности ВМ — одним полевым
+     * логом отвечает «куда уходит кадр на Switch»:
+     *   vi  = скорость интерпретатора, K инструкций/с (вся ВМ, дельта за период)
+     *   vb  = бюджет раннера (-1 не разрешён, 0 = Турбо/безлимит, >0 на окно 16.6 мс)
+     *   vps = ms, которые раннеры проспали в темпе бюджета (текущее окно 10 с)
+     *   vfw = ms стояния раннеров на EXIT-FENCE за период
+     *   vvw = ms ожидания раннеров внутри serviceRepaints (handshake) за период
+     *   vbg = ms темп-сна в бюджете за период
+     *   vgc = ms мутаторов в GC-safepoint парке за период
+     * Интерпретация: vi низкий + vb>0 + vbg/vps большие = бюджет (Скорость ВМ);
+     * vfw большие = фенс; vvw большие = handshake насоса; vgc = GC-шторм;
+     * vi низкий при нулевых остальных = сырая скорость интерпретатора.
+     * v36.106 [PERF-GATE]: весь блок — только в диагностических сборках
+     * (NOJME_PERF=1); счётчики vfw/vvw/vbg/vgc копятся и без него (событийные,
+     * не на команду), но печать выключена. */
+#if NOJME_PERF_DEBUG
+    {
+        extern uint64_t jvm_perf_instr_total(void) __attribute__((weak));
+        extern long     jvm_perf_budget_value(void) __attribute__((weak));
+        extern uint32_t jvm_perf_vmpace_slept_ms(void) __attribute__((weak));
+        extern volatile uint32_t g_perf_fence_ms_acc __attribute__((weak));
+        extern volatile uint32_t g_perf_srep_ms_acc __attribute__((weak));
+        extern volatile uint32_t g_perf_budget_ms_acc __attribute__((weak));
+        extern volatile uint32_t g_perf_gcsp_ms_acc __attribute__((weak));
+        extern volatile uint32_t g_perf_sbcheck_acc __attribute__((weak)); /* v36.99 */
+        if (&jvm_perf_instr_total) {
+            static uint64_t s_perf_last_instr = 0;
+            static uint64_t s_perf_last_ms = 0;
+            uint64_t now = sdl_switch_ui_ticks_ms();
+            uint64_t total = jvm_perf_instr_total();
+            uint32_t rate_k = 0;
+            if (s_perf_last_ms && now > s_perf_last_ms) {
+                uint64_t dt = now - s_perf_last_ms;
+                uint64_t di = (total > s_perf_last_instr) ? (total - s_perf_last_instr) : 0;
+                rate_k = (uint32_t)(di / dt);   /* instr per ms == K instr/s */
+            }
+            s_perf_last_ms = now;
+            s_perf_last_instr = total;
+            uint32_t vfw = 0, vvw = 0, vbg = 0, vgc = 0, vsbc = 0;
+            if (&g_perf_fence_ms_acc && &g_perf_srep_ms_acc &&
+                &g_perf_budget_ms_acc && &g_perf_gcsp_ms_acc) {
+                vfw = g_perf_fence_ms_acc;  g_perf_fence_ms_acc = 0;
+                vvw = g_perf_srep_ms_acc;   g_perf_srep_ms_acc = 0;
+                vbg = g_perf_budget_ms_acc; g_perf_budget_ms_acc = 0;
+                vgc = g_perf_gcsp_ms_acc;   g_perf_gcsp_ms_acc = 0;
+            }
+            /* v36.99 [SBC-CADENCE]: полные проверки спин-брейкера за период
+             * (vsbc=). Сравнение с vi: v36.98 давал ~vi/64 (~300K/с на
+             * пике Zombie-загрузки), v36.99 — ~vi/1024. Живое доказательство
+             * работы гейта в поле. */
+            if (&g_perf_sbcheck_acc) {
+                vsbc = g_perf_sbcheck_acc;   g_perf_sbcheck_acc = 0;
+            }
+            /* v36.101 [CALL-TAX] -> v36.103 [IVK-TLS]: плотность вызовов за
+             * период — сумма per-thread полей (обычные инкременты без
+             * атомиков на горячем пути). ivk= все Java-вызовы
+             * (execute_method + [FAST-INVOKES] ядро), fiv= доля, взятая
+             * новым внутриядерным путём (ivk-fiv = остаток на эшафоте
+             * execute_method), ifc= IC-промахи invokeinterface (медленный
+             * путь). ivk/vi в геймплее против фазы парсинга прямо называет
+             * долю каркаса вызовов в кадре; ifc -> 0 после разогрева =
+             * [IFACE-IC] работает; fiv -> ivk = [FAST-INVOKES] работает.
+             * Сброс прямо здесь: потеря нескольких счётов на стыке окна
+             * телеметрии допустима. */
+            uint32_t vivk = 0, vifc = 0, vfiv = 0;
+            if (g_sd_jvm) {
+                /* v36.103 [IVK-TLS]: сумма per-thread полей — реализация в
+                 * execute.c (jvm_perf_call_tax_sum), идёт по JVM->threads[].
+                 * Владелец пишет счётчики без барьеров, читатель может увидеть
+                 * слегка устаревшее значение — это диагностика, не учёт
+                 * денег; сброс прямо здесь теряет несколько счётов на стыке
+                 * окна телеметрии, что допустимо. */
+                extern int jvm_perf_call_tax_sum(void* jvm, uint32_t* ivk,
+                                                 uint32_t* fiv, uint32_t* ifc)
+                                                 __attribute__((weak));
+                if (&jvm_perf_call_tax_sum && jvm_perf_call_tax_sum) {
+                    jvm_perf_call_tax_sum((void*)g_sd_jvm, &vivk, &vfiv, &vifc);
+                }
+            }
+            sw_trace_force("[VM-PERF] vi=%uK/s vb=%ld vps=%u vfw=%u vvw=%u vbg=%u vgc=%u vsbc=%u ivk=%u fiv=%u ifc=%u",
+                           rate_k,
+                           (&jvm_perf_budget_value && jvm_perf_budget_value)
+                               ? jvm_perf_budget_value() : -2L,
+                           (&jvm_perf_vmpace_slept_ms && jvm_perf_vmpace_slept_ms)
+                               ? jvm_perf_vmpace_slept_ms() : 0u,
+                           vfw, vvw, vbg, vgc, vsbc, vivk, vfiv, vifc);
+        }
+    }
+#endif /* NOJME_PERF_DEBUG */
+    /* v36.104 [VM-OPS]: гистограмма опкодов за период — систематическая
+     * 1/64 выборка позиций инструкций (каденс спин-брейкера уже читает
+     * этот байт для STALL-RING — инкремент соседнего счётчика бесплатен).
+     * Топ-8 с долями прямо называет, ЧТО грузит A57 в тяжёлых сценах —
+     * доказательная база следующего раунда ядра (спарки/специальные
+     * инструкции под реальный микс, а не под гипотезу).
+     * v36.106 [PERF-GATE]: только в диагностических сборках (NOJME_PERF=1). */
+#if NOJME_PERF_DEBUG
+    {
+        extern int jvm_perf_ops_hist_sum(void* jvm, uint32_t out[256])
+            __attribute__((weak));
+        if (g_sd_jvm && &jvm_perf_ops_hist_sum && jvm_perf_ops_hist_sum) {
+            uint32_t hist[256];
+            if (jvm_perf_ops_hist_sum((void*)g_sd_jvm, hist) == 0) {
+                uint64_t total = 0;
+                for (int b = 0; b < 256; b++) total += hist[b];
+                if (total >= 512) {   /* ~33K инструкций за окно — не шум */
+                    uint32_t cnt[8];
+                    int opc[8];
+                    int picked = 0;
+                    for (int k = 0; k < 8; k++) { cnt[k] = 0; opc[k] = -1; }
+                    for (int k = 0; k < 8; k++) {
+                        uint32_t best = 0;
+                        int bi = -1;
+                        for (int b = 0; b < 256; b++) {
+                            if (hist[b] > best) { best = hist[b]; bi = b; }
+                        }
+                        if (bi < 0) break;
+                        opc[k] = bi;
+                        cnt[k] = hist[bi];
+                        hist[bi] = 0;
+                        picked = k + 1;
+                    }
+                    char line[512];
+                    int pos = snprintf(line, sizeof(line), "[VM-OPS] n=%llu top:",
+                                       (unsigned long long)total);
+                    for (int k = 0; k < picked && pos > 0 &&
+                         pos < (int)sizeof(line) - 48; k++) {
+                        extern const OpcodeInfo opcode_table[256];
+                        const char* nm = opcode_table[opc[k]].name;
+                        pos += snprintf(line + pos, sizeof(line) - (size_t)pos,
+                                        " %s=%u.%02u%%",
+                                        nm ? nm : "?",
+                                        (unsigned)(cnt[k] * 100ULL / total),
+                                        (unsigned)((cnt[k] * 10000ULL / total) % 100));
+                    }
+                    if (pos > 0) sw_trace_force("%s", line);
+                }
+            }
+        }
+    }
+#endif /* NOJME_PERF_DEBUG */
     /* v36.81 [TEX-DIAG]: адреса/размеры/счётчики всех текстур выдачи —
      * то, о чём просил пользователь («адреса текстур?»). Печатается в
      * том же 5-с такте, что и diag (чтение+сброс счётчиков в одном
@@ -361,6 +522,40 @@ static void diag_emit(void) {
                 sw_trace_force("%s", texbuf);
         }
     }
+    /* v36.100 [GFX-PERF]: пер-API время графических нативов + тотальное
+     * время всех нативов за 5-с период (см. include/gfxperf.h). Формат:
+     * <id>=<вызовов>/<мс>. Читается так: nat_ms = весь нативный бюджет
+     * кадра; di+dri+dro+dras+drai+gr+crgb+ci+prim+fl = его графическая
+     * часть; остаток nat_ms - графика = прочие нативы (RMS/строки/мат).
+     * dio/drrot — только счётчики под-путей (memcpy-опака / rot90-270).
+     * Счётчики живут в render.c (ядро) — слабые ссылки: белые тесты,
+     * линкующие switch_trace.c без ядра, молчат.
+     * v36.106 [PERF-GATE]: только в диагностических сборках (NOJME_PERF=1). */
+#if NOJME_PERF_DEBUG
+    {
+        extern volatile uint32_t g_gfxp_n[] __attribute__((weak));
+        extern volatile uint32_t g_gfxp_us[] __attribute__((weak));
+        if (g_gfxp_n && g_gfxp_us) {
+            uint32_t n[GFXP_COUNT], us[GFXP_COUNT];
+            for (int i = 0; i < GFXP_COUNT; i++) {
+                n[i]  = g_gfxp_n[i];  g_gfxp_n[i] = 0;
+                us[i] = g_gfxp_us[i]; g_gfxp_us[i] = 0;
+            }
+            sw_trace_force("[GFX-PERF] di=%u/%u dio=%u dri=%u/%u drrot=%u dro=%u/%u dras=%u/%u drai=%u/%u gr=%u/%u crgb=%u/%u ci=%u/%u prim=%u/%u fl=%u/%u nat=%u/%u",
+                           n[GFXP_DI], us[GFXP_DI] / 1000u, n[GFXP_DI_O],
+                           n[GFXP_DR], us[GFXP_DR] / 1000u, n[GFXP_DR_ROT],
+                           n[GFXP_DRO], us[GFXP_DRO] / 1000u,
+                           n[GFXP_DRAS], us[GFXP_DRAS] / 1000u,
+                           n[GFXP_DRAI], us[GFXP_DRAI] / 1000u,
+                           n[GFXP_GR], us[GFXP_GR] / 1000u,
+                           n[GFXP_CRGB], us[GFXP_CRGB] / 1000u,
+                           n[GFXP_CI], us[GFXP_CI] / 1000u,
+                           n[GFXP_PRIM], us[GFXP_PRIM] / 1000u,
+                           n[GFXP_FL], us[GFXP_FL] / 1000u,
+                           n[GFXP_NAT], us[GFXP_NAT] / 1000u);
+        }
+    }
+#endif /* NOJME_PERF_DEBUG */
 }
 
 void sw_diag_tick(void) {
@@ -770,6 +965,85 @@ static Uint32 trace_beat_cb(Uint32 interval, void* param) {
                 s_last_stall_log = 0; /* re-arm the throttle after recovery */
             }
 
+            /* v36.92 [STALL-PROBE]: детектор «сайт замер, но поток жив» —
+             * слепая зона всей лестницы why= выше. Полевой кейс Metal Slug 6
+             * (v36.91): at.bl держал монитор 12.5 с, нативы всплесками каждые
+             * 2.5-5 с — age не растёт (T-STALL/SLOWLOGIC молчат), live цел,
+             * а jsite раннера НЕ МЕНЯЕТСЯ ударами подряд (обновление раз в
+             * 64k инструкций; между натив-всплесками байткод почти не идёт).
+             * Три подряд одинаковых jsite при возрасте натива <6 с = запрос
+             * g_stall_stack_gen: раннер сам печатает [STALLSTACK] — цепочку
+             * кадров (execute.c, обход СВОИХ кадров безопасен) — и следующий
+             * полевой лог назовёт ТОЧНОЕ место длинного вычисления.
+             * Троттл 30 с; под pause-защёлкой зонд молчит (раннеры
+             * запаркованы дизайном). */
+            if (!(pause_latch & 2)) {
+                static char s_probe_sites[8][64];
+                static int s_probe_tids[8];
+                static int s_probe_stale[8];
+                static int s_probe_init = 0;
+                static uint64_t s_probe_last_req = 0;
+                if (!s_probe_init) {
+                    for (int q = 0; q < 8; q++) s_probe_tids[q] = -1;
+                    s_probe_init = 1;
+                }
+                {
+                    extern int jvm_runners_probe(char (*)[64], long long*, int*, int)
+                        __attribute__((weak));
+                    if (jvm_runners_probe) {
+                        char psites[8][64];
+                        long long pages[8];
+                        int ptids[8];
+                        int pn = jvm_runners_probe(psites, pages, ptids, 8);
+                        for (int k = 0; k < 8; k++) {
+                            if (k >= pn) { s_probe_tids[k] = -1; continue; }
+                            int prev = -1;
+                            for (int q = 0; q < 8; q++)
+                                if (s_probe_tids[q] == ptids[k]) { prev = q; break; }
+                            int same = (prev >= 0 &&
+                                        strcmp(s_probe_sites[prev], psites[k]) == 0);
+                            int stale = same ? s_probe_stale[prev] + 1 : 0;
+                            snprintf(s_probe_sites[k], 64, "%s", psites[k]);
+                            s_probe_tids[k] = ptids[k];
+                            s_probe_stale[k] = stale;
+                            if (stale >= 3 && pages[k] >= 0 && pages[k] < 6000) {
+                                uint64_t nowp = sdl_switch_ui_ticks_ms();
+                                if (nowp - s_probe_last_req >= 30000) {
+                                    s_probe_last_req = nowp;
+                                    extern volatile uint32_t g_stall_stack_gen
+                                        __attribute__((weak));
+                                    if (&g_stall_stack_gen) {
+                                        g_stall_stack_gen++;
+                                        char ptext[TRACE_LINE_CAP];
+                                        snprintf(ptext, sizeof(ptext),
+                                                 "[STALL-PROBE] t%d site=%.56s stale for %d beats, native age %lld ms (working) — requesting [STALLSTACK]",
+                                                 ptids[k], psites[k], stale,
+                                                 (long long)pages[k]);
+                                        trace_emit_impl(ptext, 1);
+                                        stall_alarm = 1;
+                                    }
+                                    /* v36.94 [STALLSTACK-REMOTE]: поток может
+                                     * так и не дойти до yield-чекпоинта
+                                     * [STALLSTACK] (полевой кейс v36.93:
+                                     * <1024 инструкций за 22.5 c — ни одного
+                                     * yield). Печатаем цепочку кадров САМИ,
+                                     * seqlock-чтением из beat-потока. Живой
+                                     * поток уводит frame_seq — дамп молча
+                                     * отменяется, ложных срабатываний нет. */
+                                    {
+                                        extern void jvm_threads_dump_stall_frames(int)
+                                            __attribute__((weak));
+                                        if (jvm_threads_dump_stall_frames) {
+                                            jvm_threads_dump_stall_frames(ptids[k]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             /* v35.04 [NO-FRAME]: VM thread(s) alive and PROGRESSING (the
              * why= classes above did not fire) but the settled-frame
              * sequence has not advanced for 10 beats. The game thread is
@@ -989,6 +1263,49 @@ static Uint32 trace_beat_cb(Uint32 interval, void* param) {
     if (stuck) return interval;
 
     if (!logging_on()) return interval; /* v34.92 gate */
+    /* v36.105 [VM-PAIRS]: топ ДИНАМИЧЕСКИХ пар опкодов — из БИТА таймера,
+     * а не из diag-такта главного цикла. Причина: тяжёлые сцены эффектов
+     * глушат главный цикл на сотни мс за итерацию (полевой PUMP-GAP), а
+     * синтетические репродукторы (EffBench) — на весь прогон; диаг-такт
+     * в такие окна молчит, а пары нужны именно по ним. Таблица
+     * процесс-широкая (execute.c g_vm_pairs_hist, выборка 1/64 в каденсе
+     * T_SLOW), чтение+сброс из потока таймера соревнуется с инкрементами
+     * интерпретаторов — потеря единичных счётов на стыке допустима для
+     * статистики. Порог 512 (как у [VM-OPS]), топ-5, каденс 5 с.
+     * v36.106 [PERF-GATE]: только в диагностических сборках (NOJME_PERF=1). */
+#if NOJME_PERF_DEBUG
+    {
+        static uint32_t s_pairs_beat = 0;
+        if (++s_pairs_beat >= 5) {
+            s_pairs_beat = 0;
+            extern int jvm_perf_pairs_top(uint32_t out_pair[16], uint32_t out_cnt[16],
+                                          int kmax, uint32_t min_total, uint64_t* out_total)
+                __attribute__((weak));
+            if (&jvm_perf_pairs_top && jvm_perf_pairs_top) {
+                uint32_t pair[16], cnt[16];
+                uint64_t ptotal = 0;
+                int picked = jvm_perf_pairs_top(pair, cnt, 16, 512, &ptotal);
+                if (picked > 0 && ptotal > 0) {
+                    char pline[512];
+                    int pos = snprintf(pline, sizeof(pline), "[VM-PAIRS] n=%llu top:",
+                                       (unsigned long long)ptotal);
+                    extern const OpcodeInfo opcode_table[256];
+                    for (int k = 0; k < picked && pos > 0 &&
+                         pos < (int)sizeof(pline) - 64; k++) {
+                        const char* nm1 = opcode_table[(pair[k] >> 8) & 0xFF].name;
+                        const char* nm2 = opcode_table[pair[k] & 0xFF].name;
+                        pos += snprintf(pline + pos, sizeof(pline) - (size_t)pos,
+                                        " %s+%s=%u.%02u%%",
+                                        nm1 ? nm1 : "?", nm2 ? nm2 : "?",
+                                        (unsigned)(cnt[k] * 100ULL / ptotal),
+                                        (unsigned)((cnt[k] * 10000ULL / ptotal) % 100));
+                    }
+                    if (pos > 0) trace_emit_impl(pline, 0);
+                }
+            }
+        }
+    }
+#endif /* NOJME_PERF_DEBUG */
     /* v36.60 [ALIVE-IDLE]: только после 10 с полной тишины лога — и не
      * чаще раза в 10 с (запись alive обновляет g_last_emit_ms в
      * trace_emit_impl). В живой сессии строк нет вовсе; в замолкшей —

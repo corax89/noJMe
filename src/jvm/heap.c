@@ -2858,12 +2858,21 @@ static int gc_stamp_on(void) {
 void gc_collect(JVM* jvm) {
     if (!jvm) return;
     /* v34.95 SAFEPOINT-BACKOFF entry gate: skip collections inside the
-     * post-abort window (see the comment at g_gc_backoff_until_ms). */
+     * post-abort window (see the comment at g_gc_backoff_until_ms).
+     * v36.93 [GC-CRITICAL-BYPASS]: бэккофф существует, чтобы дать
+     * post-abort состоянию устояться. НО когда куча близка к заполнению,
+     * пропуск сборки катастрофичен: free-list деградирует, каждая
+     * аллокация ходит по длинному фрагментированному списку, игровой
+     * цикл растягивается на секунды и замерзает весь фронтенд. Поэтому
+     * при заполнении >= 90% бэккофф-окно игнорируем. */
     {
+        size_t bk_used = heap.allocated;
+        size_t bk_cap  = (size_t)(heap.end - heap.start);
+        int bk_critical = (bk_cap > 0 && bk_used * 100 >= bk_cap * 90);
         struct timespec bk_ts;
         clock_gettime(CLOCK_MONOTONIC, &bk_ts);
         jlong bk_now = (jlong)bk_ts.tv_sec * 1000 + bk_ts.tv_nsec / 1000000;
-        if (bk_now < g_gc_backoff_until_ms) {
+        if (bk_now < g_gc_backoff_until_ms && !bk_critical) {
             static int bk_log_n = 0;
             if (bk_log_n < 10 || (bk_log_n % 200) == 0) {
                 bk_log_n++;

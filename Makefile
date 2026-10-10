@@ -51,7 +51,8 @@ JVM_SRCS := \
 	$(SRCDIR)/jvm/sax.c \
 	$(SRCDIR)/jvm/stubs.c \
 	$(SRCDIR)/jvm/threads.c \
-	$(SRCDIR)/jvm/charset.c
+	$(SRCDIR)/jvm/charset.c \
+	$(SRCDIR)/jvm/threadpool.c
 
 MIDP_SRCS := \
 	$(SRCDIR)/midp/display.c \
@@ -76,6 +77,69 @@ MIDI_SRCS := \
 	$(SRCDIR)/midi/midi.c
 
 # ==============================================
+# v36.89: Sonivox (AOSP) MIDI synthesizer — Apache 2.0
+#
+# Vendored pure-C wavetable/DLS synthesizer from AOSP external/sonivox
+# (arm-wt-22k). Replaces NOJME's hand-rolled FM synth with a real
+# sample-based GM engine: dramatically better instrument quality,
+# native DLS-bank loading, Schroeder reverb.
+#
+# Build flags:
+#   -D NUM_OUTPUT_CHANNELS=2    stereo output
+#   -D _SAMPLE_RATE_44100        match NOJME audio rate
+#   -D MAX_SYNTH_VOICES=64       polyphony
+#   -D EAS_WT_SYNTH             wavetable synth (built-in 22 kHz bank)
+#   -D _8_BIT_SAMPLES            bank is stored as 8-bit PCM (small)
+#   -D _FILTER_ENABLED           resonant filter in synth voice
+#   -D _REVERB_ENABLED           Schroeder reverb (built-in)
+#   -D DLS_SYNTHESIZER           DLS bank loading support
+#   -D NATIVE_EAS_KERNEL         use C kernel (not external DSP)
+#   -D JET_INTERFACE             JET API compiled in (needed by some parsers)
+#   -D _IMELODY_PARSER           iMelody ringtone parser
+#   -D _RTTTL_PARSER             RTTTL ringtone parser
+#   -D _OTA_PARSER               OTA ringtone parser
+#   -D _XMF_PARSER               XMF container parser
+#   -D _NO_DEBUG_PREPROCESSOR    disable verbose debug message table
+#
+# Disabled deliberately (no source in AOSP snapshot, or not needed):
+#   _CHORUS_ENABLED  (no eas_chorus.c in this drop)
+#   MMAPI_SUPPORT    (no eas_tonecontrol.c)
+#   _IMA_DECODER     (no eas_imaadpcm.c / eas_ima_tables.c)
+#   _WAVE_PARSER     (no eas_wavefile.c)
+#   _SMAF_PARSER / _CMX_PARSER / _MFI_PARSER
+#
+# ARM assembly files (ARM-E_*.s) are NOT compiled — eas_wtengine.c
+# contains the C fallbacks for WT_VoiceGain / WT_Interpolate etc.,
+# so the synth runs in pure C on every platform (x86_64, MinGW,
+# Switch aarch64, M17 ARMv7 hard-float).
+# ==============================================
+SONIVOX_LIB_C   := $(wildcard $(SRCDIR)/midi/sonivox/lib_src/*.c)
+SONIVOX_HOST_C   := $(SRCDIR)/midi/sonivox/host_src/eas_config.c \
+                    $(SRCDIR)/midi/sonivox/host_src/eas_report.c \
+                    $(SRCDIR)/midi/sonivox/eas_host_nojme.c
+SONIVOX_C_SRCS   := $(SONIVOX_LIB_C) $(SONIVOX_HOST_C)
+SONIVOX_INCS     := -I$(SRCDIR)/midi/sonivox/include \
+                    -I$(SRCDIR)/midi/sonivox/host_src \
+                    -I$(SRCDIR)/midi/sonivox/lib_src
+SONIVOX_DEFS     := -D NUM_OUTPUT_CHANNELS=2 \
+                    -D _SAMPLE_RATE_22050 \
+                    -D MAX_SYNTH_VOICES=32 \
+                    -D EAS_WT_SYNTH \
+                    -D _8_BIT_SAMPLES \
+                    -D _FILTER_ENABLED \
+                    -D _REVERB_ENABLED \
+                    -D DLS_SYNTHESIZER \
+                    -D JET_INTERFACE \
+                    -D _IMELODY_PARSER \
+                    -D _RTTTL_PARSER \
+                    -D _OTA_PARSER \
+                    -D _XMF_PARSER \
+                    -D _NO_DEBUG_PREPROCESSOR \
+                    -include stdbool.h \
+                    -Wno-unused-parameter \
+                    -Wno-stringop-truncation
+
+# ==============================================
 # v34.69: AMR-NB decoder (vendored opencore-amrnb, Apache 2.0)
 #
 # Converted to plain C (no C++ anywhere): builds with the ordinary C
@@ -88,7 +152,7 @@ MIDI_SRCS := \
 # ==============================================
 AMR_WRAPPER_C := $(SRCDIR)/amr/amr_nb_dec.c
 AMR_OPENCORE_C := $(wildcard $(SRCDIR)/amr/opencore/codecs_v2/audio/gsm_amr/amr_nb/common/src/*.c \
-				 $(SRCDIR)/amr/opencore/codecs_v2/audio/gsm_amr/amr_nb/dec/src/*.c)
+                                 $(SRCDIR)/amr/opencore/codecs_v2/audio/gsm_amr/amr_nb/dec/src/*.c)
 AMR_C_SRCS := $(AMR_WRAPPER_C) $(AMR_OPENCORE_C)
 AMR_INCS := -I$(SRCDIR)/amr -I$(SRCDIR)/amr/oscl \
 	-I$(SRCDIR)/amr/opencore/codecs_v2/audio/gsm_amr/amr_nb/common/include \
@@ -124,6 +188,19 @@ IS_MINGW_NATIVE := $(if $(MSYSTEM),1,$(if $(MINGW_PREFIX),1,0))
 ARM_OPT_CFLAGS := -ftree-vectorize -fipa-cp-clone -finline-functions-called-once
 
 # ==============================================
+# v36.106 [PERF-GATE]: NOJME_PERF=1 — вернуть телеметрию отладки
+# производительности ([VM-PERF] ivk=/fiv=/ifc=, [VM-OPS], [VM-PAIRS],
+# [GFX-PERF] nat=) в ЛЮБУЮ цель (switchui/switch/headless/app/libretro/m17).
+# По умолчанию (без переменной) телеметрия ВЫКЛЮЧЕНА компиляционно — ноль
+# чтений таймера/атомиков/инкрементов на горячем пути; код сохранён.
+# Пример: make switchui NOJME_PERF=1
+# ==============================================
+ifdef NOJME_PERF
+NOJME_PERF_CFLAGS := -DNOJME_PERF_DEBUG=1
+$(info NOTE: NOJME_PERF=1 — performance-debug telemetry is COMPILED IN ([VM-PERF]/[VM-OPS]/[VM-PAIRS]/[GFX-PERF]).)
+endif
+
+# ==============================================
 # v34.85: goal -> platform convenience mapping
 # ==============================================
 # `make switch` (without any platform= variable) selects the Switch
@@ -143,25 +220,25 @@ endif
 # ==============================================
 
 ifeq ($(platform), m17)
-	# ==============================================
-	# M17 ARM 32-bit cross-compilation (release, stripped)
-	# ==============================================
-	TARGET := $(BINDIR)/$(TARGET_NAME)_libretro.so
+        # ==============================================
+        # M17 ARM 32-bit cross-compilation (release, stripped)
+        # ==============================================
+        TARGET := $(BINDIR)/$(TARGET_NAME)_libretro.so
 
-	CROSS_COMPILE ?= /opt/m17-toolchain/usr/bin/arm-buildroot-linux-gnueabihf-
-	CC = $(CROSS_COMPILE)gcc
-	AR = $(CROSS_COMPILE)ar
-	STRIP = $(CROSS_COMPILE)strip
+        CROSS_COMPILE ?= /opt/m17-toolchain/usr/bin/arm-buildroot-linux-gnueabihf-
+        CC = $(CROSS_COMPILE)gcc
+        AR = $(CROSS_COMPILE)ar
+        STRIP = $(CROSS_COMPILE)strip
 
-	# ARM 32-bit optimization flags - release, no debug.
-	# v34.41 FIX: -Ofast replaced with -O3 -fno-fast-math -ffp-contract=off:
-	# -ffast-math FMA-contracted the scalar rasterizer z/UV math, so NEON
-	# and scalar diverged by ULPs (selftest: 6 raster FAILs, depth diff=495,
-	# reproduced on qemu-arm gcc-14 -Ofast) and -ffinite-math-only allowed
-	# the compiler to remove the sampler's NaN guards. -ffp-contract=off
-	# makes FP evaluation deterministic on every GCC (m17 6.4 ... 14+).
-	# ARM 32-bit optimization flags - release, no debug — release, no debug
-	CFLAGS := -Wall -Wextra -std=c11 \
+        # ARM 32-bit optimization flags - release, no debug.
+        # v34.41 FIX: -Ofast replaced with -O3 -fno-fast-math -ffp-contract=off:
+        # -ffast-math FMA-contracted the scalar rasterizer z/UV math, so NEON
+        # and scalar diverged by ULPs (selftest: 6 raster FAILs, depth diff=495,
+        # reproduced on qemu-arm gcc-14 -Ofast) and -ffinite-math-only allowed
+        # the compiler to remove the sampler's NaN guards. -ffp-contract=off
+        # makes FP evaluation deterministic on every GCC (m17 6.4 ... 14+).
+        # ARM 32-bit optimization flags - release, no debug — release, no debug
+        CFLAGS := -Wall -Wextra -std=c11 \
 	-I$(INCDIR) -I$(SRCDIR) -I$(SRCDIR)/include -I$(SRCDIR)/jvm -I$(SRCDIR)/midp \
 	-I$(SRCDIR)/utils -I$(SRCDIR)/libretro \
 	-DLIBRETRO -DARM -D_GNU_SOURCE -DJ2ME_DEBUG=0 -DOPT_NO_BOUNDS_CHECK \
@@ -170,35 +247,35 @@ ifeq ($(platform), m17)
 	-fno-stack-protector -fomit-frame-pointer \
 	-fmerge-all-constants -fno-math-errno \
 	-marm -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard \
-	-flto $(ARM_OPT_CFLAGS)
+	-flto $(ARM_OPT_CFLAGS) $(NOJME_PERF_CFLAGS)
 
-	LDFLAGS := -shared -Wl,--no-undefined -Wl,--gc-sections \
+        LDFLAGS := -shared -Wl,--no-undefined -Wl,--gc-sections \
 	-Wl,--version-script=$(SRCDIR)/libretro/link.T \
 	-flto -fuse-linker-plugin \
 	-lm -pthread
 
-	HAVE_NEON = 1
-	ARCH = arm
-	PLATFORM_NAME = M17 ARM 32-bit
+        HAVE_NEON = 1
+        ARCH = arm
+        PLATFORM_NAME = M17 ARM 32-bit
 
-	# v34.24: expose NEON to the preprocessor. render.c also autodetects via
-	# __ARM_NEON__ (defined by -mfpu=neon-vfpv4); HAVE_NEON makes the build
-	# flag queryable and lets other units conditional-compile on it.
-	ifeq ($(HAVE_NEON),1)
-	CFLAGS += -DHAVE_NEON=1
-	endif
+        # v34.24: expose NEON to the preprocessor. render.c also autodetects via
+        # __ARM_NEON__ (defined by -mfpu=neon-vfpv4); HAVE_NEON makes the build
+        # flag queryable and lets other units conditional-compile on it.
+        ifeq ($(HAVE_NEON),1)
+        CFLAGS += -DHAVE_NEON=1
+        endif
 
-	# v34.80: GCC >= 14 with LTO downgrades the static __thread/_Thread_local
-	# vars (src/jvm/threads.c, src/jvm/execute.c) to TLS local-exec during the
-	# link-time recompile — "R_ARM_TLS_LE32 relocation not permitted in shared
-	# object" (observed: bootlin armv7 gcc 14.3; -ftls-model=* does NOT help,
-	# the model is recomputed from whole-program visibility). The stock m17
-	# toolchain (gcc 6.4) links the same flags fine. NOJME_M17_NO_LTO=1 drops
-	# LTO for toolchains that hit this (cost: a little codegen quality).
-	ifeq ($(NOJME_M17_NO_LTO),1)
-	CFLAGS := $(filter-out -flto,$(CFLAGS))
-	LDFLAGS := $(filter-out -flto -fuse-linker-plugin,$(LDFLAGS))
-	endif
+        # v34.80: GCC >= 14 with LTO downgrades the static __thread/_Thread_local
+        # vars (src/jvm/threads.c, src/jvm/execute.c) to TLS local-exec during the
+        # link-time recompile — "R_ARM_TLS_LE32 relocation not permitted in shared
+        # object" (observed: bootlin armv7 gcc 14.3; -ftls-model=* does NOT help,
+        # the model is recomputed from whole-program visibility). The stock m17
+        # toolchain (gcc 6.4) links the same flags fine. NOJME_M17_NO_LTO=1 drops
+        # LTO for toolchains that hit this (cost: a little codegen quality).
+        ifeq ($(NOJME_M17_NO_LTO),1)
+        CFLAGS := $(filter-out -flto,$(CFLAGS))
+        LDFLAGS := $(filter-out -flto -fuse-linker-plugin,$(LDFLAGS))
+        endif
 
 else ifeq ($(platform), switch)
         # ==============================================
@@ -261,14 +338,14 @@ else ifeq ($(platform), switch)
         # -D__SWITCH__ activates the newlib portability guards (native.c:
         # no <sys/syscall.h>/syscall(2)/setpriority on devkitA64).
         CFLAGS := -Wall -Wextra -std=c11 \
-        -I$(INCDIR) -I$(SRCDIR) -I$(SRCDIR)/include \
-        -DLIBRETRO -D__SWITCH__ -DHAVE_LIBNX -D_GNU_SOURCE -DJ2ME_DEBUG=0 \
-        -O2 -MMD -MP \
-        -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE \
-        -fno-strict-aliasing -fno-strict-overflow \
-        -fno-delete-null-pointer-checks -fno-ipa-pure-const \
-        -ffunction-sections -fdata-sections \
-        -I$(LIBNX)/include
+	-I$(INCDIR) -I$(SRCDIR) -I$(SRCDIR)/include \
+	-DLIBRETRO -D__SWITCH__ -DHAVE_LIBNX -D_GNU_SOURCE -DJ2ME_DEBUG=0 \
+	-O2 -MMD -MP \
+	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE \
+	-fno-strict-aliasing -fno-strict-overflow \
+	-fno-delete-null-pointer-checks -fno-ipa-pure-const \
+	-ffunction-sections -fdata-sections \
+	-I$(LIBNX)/include $(NOJME_PERF_CFLAGS)
 
         # No LDFLAGS here: the .a is archived with $(AR) rcs (see the
         # $(TARGET) recipe below); -specs=$(LIBNX)/switch.specs is applied
@@ -292,103 +369,103 @@ else ifeq ($(platform), switch)
         PLATFORM_NAME = Nintendo Switch libretro core (devkitPro)
 
 else ifeq ($(platform), linux)
-	# ==============================================
-	# Native Linux build
-	# ==============================================
-	TARGET := $(BINDIR)/$(TARGET_NAME)_libretro.so
+        # ==============================================
+        # Native Linux build
+        # ==============================================
+        TARGET := $(BINDIR)/$(TARGET_NAME)_libretro.so
 
-	CC ?= gcc
-	AR ?= ar
-	STRIP ?= strip
+        CC ?= gcc
+        AR ?= ar
+        STRIP ?= strip
 
-	# Detect architecture
-	UNAME_M := $(shell uname -m)
-	ifeq ($(UNAME_M),x86_64)
-	ARCH = x86_64
-	ARCH_CFLAGS = -march=native
-	else ifeq ($(UNAME_M),aarch64)
-	ARCH = arm64
-	ARCH_CFLAGS = -march=armv8-a
-	else ifeq ($(UNAME_M),armv7l)
-	ARCH = arm
-	ARCH_CFLAGS = -marm -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard
-	else
-	ARCH = $(UNAME_M)
-	ARCH_CFLAGS =
-	endif
+        # Detect architecture
+        UNAME_M := $(shell uname -m)
+        ifeq ($(UNAME_M),x86_64)
+        ARCH = x86_64
+        ARCH_CFLAGS = -march=native
+        else ifeq ($(UNAME_M),aarch64)
+        ARCH = arm64
+        ARCH_CFLAGS = -march=armv8-a
+        else ifeq ($(UNAME_M),armv7l)
+        ARCH = arm
+        ARCH_CFLAGS = -marm -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard
+        else
+        ARCH = $(UNAME_M)
+        ARCH_CFLAGS =
+        endif
 
-	CFLAGS := -Wall -Wextra -std=c11 \
+        CFLAGS := -Wall -Wextra -std=c11 \
 	-I$(INCDIR) -I$(SRCDIR) -I$(SRCDIR)/include \
 	-DLIBRETRO -D_GNU_SOURCE -DJ2ME_DEBUG=0 \
-	-O2 -fPIC -MMD -MP $(ARCH_CFLAGS)
+	-O2 -fPIC -MMD -MP $(ARCH_CFLAGS) $(NOJME_PERF_CFLAGS)
 
-	LDFLAGS := -shared -Wl,--no-undefined \
+        LDFLAGS := -shared -Wl,--no-undefined \
 	-Wl,--version-script=$(SRCDIR)/libretro/link.T \
 	-lm -pthread
 
-	PLATFORM_NAME = Linux $(ARCH)
+        PLATFORM_NAME = Linux $(ARCH)
 
-	# v34.84 (midlets3 session): AddressSanitizer build -
-	# make platform=linux ASAN=1
-	# (run with LD_PRELOAD=$(gcc -print-file-name=libasan.so) if needed).
-	ifdef ASAN
-	CFLAGS += -fsanitize=address -fno-omit-frame-pointer -g
-	LDFLAGS += -fsanitize=address
-	endif
+        # v34.84 (midlets3 session): AddressSanitizer build -
+        # make platform=linux ASAN=1
+        # (run with LD_PRELOAD=$(gcc -print-file-name=libasan.so) if needed).
+        ifdef ASAN
+        CFLAGS += -fsanitize=address -fno-omit-frame-pointer -g
+        LDFLAGS += -fsanitize=address
+        endif
 
-	# ARM-specific optimizations
-	ifeq ($(ARCH),arm)
-	# v34.41: -fno-fast-math -ffp-contract=off - same reason as m17 above:
-	# VFPv4 VFMA contraction broke the bit-equality of NEON vs scalar.
-	CFLAGS += -O3 -flto -fno-fast-math -ffp-contract=off $(ARM_OPT_CFLAGS)
-	LDFLAGS += -flto -fuse-linker-plugin
-	endif
-	# v34.24: native armv7l with NEON (uname detected) - pass it through.
-	# (marker: NOJME_NEON_NATIVE_ARM)
-	ifeq ($(UNAME_M),armv7l)
-	CFLAGS += -DHAVE_NEON=1
-	endif
+        # ARM-specific optimizations
+        ifeq ($(ARCH),arm)
+        # v34.41: -fno-fast-math -ffp-contract=off - same reason as m17 above:
+        # VFPv4 VFMA contraction broke the bit-equality of NEON vs scalar.
+        CFLAGS += -O3 -flto -fno-fast-math -ffp-contract=off $(ARM_OPT_CFLAGS)
+        LDFLAGS += -flto -fuse-linker-plugin
+        endif
+        # v34.24: native armv7l with NEON (uname detected) - pass it through.
+        # (marker: NOJME_NEON_NATIVE_ARM)
+        ifeq ($(UNAME_M),armv7l)
+        CFLAGS += -DHAVE_NEON=1
+        endif
 
 else
-	# ==============================================
-	# Windows (MinGW) — DEFAULT
-	# ==============================================
-	TARGET := $(BINDIR)/$(TARGET_NAME)_libretro.dll
+        # ==============================================
+        # Windows (MinGW) — DEFAULT
+        # ==============================================
+        TARGET := $(BINDIR)/$(TARGET_NAME)_libretro.dll
 
 ifeq ($(IS_MINGW_NATIVE),1)
-	# ---- Running inside MSYS2/MinGW on Windows ----
-	CC ?= gcc
-	AR ?= ar
-	STRIP ?= strip
+        # ---- Running inside MSYS2/MinGW on Windows ----
+        CC ?= gcc
+        AR ?= ar
+        STRIP ?= strip
 
-	# Detect 32/64 bit from MSYSTEM or uname
-	IS_64BIT := $(if $(findstring 64,$(MSYSTEM)),1,0)
-	ifeq ($(IS_64BIT),1)
-	ARCH = x86_64
-	else
-	ARCH = x86
-	endif
-	PLATFORM_NAME = Windows $(ARCH) (native MinGW)
+        # Detect 32/64 bit from MSYSTEM or uname
+        IS_64BIT := $(if $(findstring 64,$(MSYSTEM)),1,0)
+        ifeq ($(IS_64BIT),1)
+        ARCH = x86_64
+        else
+        ARCH = x86
+        endif
+        PLATFORM_NAME = Windows $(ARCH) (native MinGW)
 else
-	# ---- Cross-compiling from Linux to Windows ----
-	CROSS_COMPILE ?= x86_64-w64-mingw32-
-	CC = $(CROSS_COMPILE)gcc
-	AR = $(CROSS_COMPILE)ar
-	STRIP = $(CROSS_COMPILE)strip
+        # ---- Cross-compiling from Linux to Windows ----
+        CROSS_COMPILE ?= x86_64-w64-mingw32-
+        CC = $(CROSS_COMPILE)gcc
+        AR = $(CROSS_COMPILE)ar
+        STRIP = $(CROSS_COMPILE)strip
 
-	ARCH = x86_64
-	PLATFORM_NAME = Windows $(ARCH) (cross-compile)
+        ARCH = x86_64
+        PLATFORM_NAME = Windows $(ARCH) (cross-compile)
 endif
 
-	CFLAGS := -Wall -Wextra -std=c11 \
+        CFLAGS := -Wall -Wextra -std=c11 \
 	-I$(INCDIR) -I$(SRCDIR) -I$(SRCDIR)/include \
 	-DLIBRETRO -DWIN32 -D_GNU_SOURCE -DJ2ME_DEBUG=0 \
 	-g -O2 -fPIC -MMD -MP \
-	-D__USE_MINGW_ANSI_STDIO=1
+	-D__USE_MINGW_ANSI_STDIO=1 $(NOJME_PERF_CFLAGS)
 
-	# v34.69: no -static-libstdc++ anymore — the whole core (incl. the
-	# AMR-NB decoder) is plain C; only libgcc can ever be pulled in.
-	LDFLAGS := -shared -static-libgcc \
+        # v34.69: no -static-libstdc++ anymore — the whole core (incl. the
+        # AMR-NB decoder) is plain C; only libgcc can ever be pulled in.
+        LDFLAGS := -shared -static-libgcc \
 	-Wl,--out-implib,$(BINDIR)/lib$(TARGET_NAME)_libretro.a \
 	-lm
 endif
@@ -402,6 +479,8 @@ LR_OBJDIR ?= $(OBJDIR)/libretro
 ALL_LIBRETRO_OBJS := $(patsubst $(SRCDIR)/%.c,$(LR_OBJDIR)/%.o,$(ALL_LIBRETRO_SRCS))
 # v34.69: AMR-NB decoder is plain C — always built, no CXX probe.
 ALL_LIBRETRO_OBJS += $(patsubst $(SRCDIR)/amr/%.c,$(LR_OBJDIR)/amr/%.o,$(AMR_C_SRCS))
+# v36.89: Sonivox MIDI synth is plain C — always built.
+ALL_LIBRETRO_OBJS += $(patsubst $(SRCDIR)/midi/sonivox/%.c,$(LR_OBJDIR)/midi/sonivox/%.o,$(SONIVOX_C_SRCS))
 
 # ==============================================
 # Build targets
@@ -473,7 +552,7 @@ $(LR_OBJDIR)/utils/%.o: $(SRCDIR)/utils/%.c
 $(LR_OBJDIR)/midi/%.o: $(SRCDIR)/midi/%.c
 	@mkdir -p $(dir $@)
 	@echo "  CC  $<"
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(SONIVOX_INCS) $(SONIVOX_DEFS) -c $< -o $@
 
 $(LR_OBJDIR)/render/%.o: $(SRCDIR)/render/%.c
 	@mkdir -p $(dir $@)
@@ -497,6 +576,12 @@ $(LR_OBJDIR)/amr/%.o: $(SRCDIR)/amr/%.c
 	@mkdir -p $(dir $@)
 	@echo "  CC  $<"
 	$(CC) $(CFLAGS) $(AMR_INCS) -c $< -o $@
+
+# v36.89: Sonivox MIDI synthesizer objects (plain C, vendored from AOSP)
+$(LR_OBJDIR)/midi/sonivox/%.o: $(SRCDIR)/midi/sonivox/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC  $<"
+	$(CC) $(CFLAGS) $(SONIVOX_INCS) $(SONIVOX_DEFS) -c $< -o $@
 
 # Link / archive. v34.86: platform=switch ARCHIVES the core (libretro
 # Switch convention: STATIC_LINKING - cores are linked into RetroArch,
@@ -547,7 +632,7 @@ SDL2_LIBS :=
 endif
 endif
 
-APP_CFLAGS := -Wall -Wextra -std=c11 -O2 -I$(INCDIR) -I$(SRCDIR) -I$(SRCDIR)/include -D_GNU_SOURCE -MMD -MP $(SDL2_CFLAGS)
+APP_CFLAGS := -Wall -Wextra -std=c11 -O2 -I$(INCDIR) -I$(SRCDIR) -I$(SRCDIR)/include -D_GNU_SOURCE -MMD -MP $(SDL2_CFLAGS) $(NOJME_PERF_CFLAGS)
 APP_LDFLAGS := -lm -pthread $(SDL2_LIBS)
 # The app target is documented as a NATIVE build; on a Linux host the default
 # `platform` is windows and CC points at the MinGW cross-compiler, so the app
@@ -556,6 +641,8 @@ APP_CC ?= gcc
 
 # v34.69: AMR-NB decoder in the app build too (plain C — always built).
 APP_OBJS += $(patsubst $(SRCDIR)/amr/%.c,$(OBJDIR)/app/amr/%.o,$(AMR_C_SRCS))
+# v36.89: Sonivox MIDI synth in the app build too (plain C — always built).
+APP_OBJS += $(patsubst $(SRCDIR)/midi/sonivox/%.c,$(OBJDIR)/app/midi/sonivox/%.o,$(SONIVOX_C_SRCS))
 
 app: app-dirs $(APP_TARGET)
 	@echo ""
@@ -579,6 +666,14 @@ $(OBJDIR)/app/amr/%.o: $(SRCDIR)/amr/%.c
 	@mkdir -p $(dir $@)
 	$(APP_CC) $(APP_CFLAGS) $(AMR_INCS) -c $< -o $@
 
+$(OBJDIR)/app/midi/%.o: $(SRCDIR)/midi/%.c
+	@mkdir -p $(dir $@)
+	$(APP_CC) $(APP_CFLAGS) $(SONIVOX_INCS) $(SONIVOX_DEFS) -c $< -o $@
+
+$(OBJDIR)/app/midi/sonivox/%.o: $(SRCDIR)/midi/sonivox/%.c
+	@mkdir -p $(dir $@)
+	$(APP_CC) $(APP_CFLAGS) $(SONIVOX_INCS) $(SONIVOX_DEFS) -c $< -o $@
+
 # ==============================================
 # Headless application (no SDL2 required)
 # ==============================================
@@ -588,11 +683,12 @@ HEADLESS_SRCS := $(JVM_SRCS) $(MIDP_SRCS) $(UTIL_SRCS) $(MIDI_SRCS) \
 HEADLESS_OBJS := $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/headless/%.o,$(HEADLESS_SRCS))
 HEADLESS_CC ?= gcc
 
-HEADLESS_CFLAGS := -Wall -Wextra -std=c11 -O2 -I$(INCDIR) -I$(SRCDIR) -I$(SRCDIR)/include -D_GNU_SOURCE -DJ2ME_DEBUG=0 -DJ2ME_HEADLESS -MMD -MP
+HEADLESS_CFLAGS := -Wall -Wextra -std=c11 -O2 -I$(INCDIR) -I$(SRCDIR) -I$(SRCDIR)/include -D_GNU_SOURCE -DJ2ME_DEBUG=0 -DJ2ME_HEADLESS -MMD -MP $(NOJME_PERF_CFLAGS)
 HEADLESS_LDFLAGS := -lm -pthread
 
 # v34.69: AMR-NB decoder in the headless build too (plain C — always built).
 HEADLESS_OBJS += $(patsubst $(SRCDIR)/amr/%.c,$(OBJDIR)/headless/amr/%.o,$(AMR_C_SRCS))
+HEADLESS_OBJS += $(patsubst $(SRCDIR)/midi/sonivox/%.c,$(OBJDIR)/headless/midi/sonivox/%.o,$(SONIVOX_C_SRCS))
 
 headless: headless-dirs $(HEADLESS_TARGET)
 	@echo ""
@@ -615,6 +711,14 @@ $(OBJDIR)/headless/%.o: $(SRCDIR)/%.c
 $(OBJDIR)/headless/amr/%.o: $(SRCDIR)/amr/%.c
 	@mkdir -p $(dir $@)
 	$(HEADLESS_CC) $(HEADLESS_CFLAGS) $(AMR_INCS) -c $< -o $@
+
+$(OBJDIR)/headless/midi/%.o: $(SRCDIR)/midi/%.c
+	@mkdir -p $(dir $@)
+	$(HEADLESS_CC) $(HEADLESS_CFLAGS) $(SONIVOX_INCS) $(SONIVOX_DEFS) -c $< -o $@
+
+$(OBJDIR)/headless/midi/sonivox/%.o: $(SRCDIR)/midi/sonivox/%.c
+	@mkdir -p $(dir $@)
+	$(HEADLESS_CC) $(HEADLESS_CFLAGS) $(SONIVOX_INCS) $(SONIVOX_DEFS) -c $< -o $@
 
 # ==============================================
 # v34.86: switchui — Nintendo Switch NRO
@@ -726,7 +830,7 @@ SWITCH_CFLAGS := -Wall -Wextra -std=c11 \
 -ffunction-sections -fdata-sections \
 -fno-asynchronous-unwind-tables -fno-ident \
 -I$(LIBNX)/include \
-$(SWITCH_SDL_CFLAGS)
+$(SWITCH_SDL_CFLAGS) $(NOJME_PERF_CFLAGS)
 
 # Libraries are linked AFTER the objects (static-archive order).
 # (v34.84 BUG: -lSDL2 sat in LDFLAGS, -lnx/-lpthread absent.)
@@ -744,6 +848,7 @@ SWITCH_SRCS := $(ALL_APP_SRCS) \
 
 SWITCH_OBJS := $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/switch/%.o,$(SWITCH_SRCS))
 SWITCH_OBJS += $(patsubst $(SRCDIR)/amr/%.c,$(OBJDIR)/switch/amr/%.o,$(AMR_C_SRCS))
+SWITCH_OBJS += $(patsubst $(SRCDIR)/midi/sonivox/%.c,$(OBJDIR)/switch/midi/sonivox/%.o,$(SONIVOX_C_SRCS))
 
 SWITCH_ELF := $(BINDIR)/nojme_switch.elf
 # v36.18: stripped-копия эльфа — именно она скармливается elf2nro (полный
@@ -795,6 +900,16 @@ $(OBJDIR)/switch/amr/%.o: $(SRCDIR)/amr/%.c
 	@echo "  CC  $<"
 	$(SWITCH_CC) $(SWITCH_CFLAGS) $(AMR_INCS) -c $< -o $@
 
+$(OBJDIR)/switch/midi/%.o: $(SRCDIR)/midi/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC  $<"
+	$(SWITCH_CC) $(SWITCH_CFLAGS) $(SONIVOX_INCS) $(SONIVOX_DEFS) -c $< -o $@
+
+$(OBJDIR)/switch/midi/sonivox/%.o: $(SRCDIR)/midi/sonivox/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC  $<"
+	$(SWITCH_CC) $(SWITCH_CFLAGS) $(SONIVOX_INCS) $(SONIVOX_DEFS) -c $< -o $@
+
 endif # switchui goal guard
 
 .PHONY: switchui switchui-dirs
@@ -816,6 +931,7 @@ SWITCHUI_SRCS := $(ALL_APP_SRCS) \
 	$(SRCDIR)/switch/pathguard.c
 SWITCHUI_OBJS := $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/switchui/%.o,$(SWITCHUI_SRCS))
 SWITCHUI_OBJS += $(patsubst $(SRCDIR)/amr/%.c,$(OBJDIR)/switchui/amr/%.o,$(AMR_C_SRCS))
+SWITCHUI_OBJS += $(patsubst $(SRCDIR)/midi/sonivox/%.c,$(OBJDIR)/switchui/midi/sonivox/%.o,$(SONIVOX_C_SRCS))
 SWITCHUI_CC ?= gcc
 # SDL2 discovery: pkg-config, else override via env:
 #   SWITCHUI_SDL_CFLAGS / SWITCHUI_SDL_LIBS
@@ -825,7 +941,7 @@ SWITCHUI_SDL_LIBS ?= $(shell pkg-config --libs sdl2 2>/dev/null || echo -lSDL2)
 SWITCHUI_CFLAGS := -Wall -Wextra -std=c11 -O2 \
 	-I$(INCDIR) -I$(SRCDIR) -I$(SRCDIR)/include \
 	-D__SWITCH__ -D_GNU_SOURCE -DJ2ME_DEBUG=0 \
-	$(SWITCHUI_SDL_CFLAGS) -MMD -MP
+	$(SWITCHUI_SDL_CFLAGS) -MMD -MP $(NOJME_PERF_CFLAGS)
 
 SWITCHUI_LDFLAGS := -lm -pthread $(SWITCHUI_SDL_LIBS)
 
@@ -856,6 +972,16 @@ $(OBJDIR)/switchui/amr/%.o: $(SRCDIR)/amr/%.c
 	@mkdir -p $(dir $@)
 	@echo "  CC  $<"
 	$(SWITCHUI_CC) $(SWITCHUI_CFLAGS) $(AMR_INCS) -c $< -o $@
+
+$(OBJDIR)/switchui/midi/%.o: $(SRCDIR)/midi/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC  $<"
+	$(SWITCHUI_CC) $(SWITCHUI_CFLAGS) $(SONIVOX_INCS) $(SONIVOX_DEFS) -c $< -o $@
+
+$(OBJDIR)/switchui/midi/sonivox/%.o: $(SRCDIR)/midi/sonivox/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC  $<"
+	$(SWITCHUI_CC) $(SWITCHUI_CFLAGS) $(SONIVOX_INCS) $(SONIVOX_DEFS) -c $< -o $@
 
 else
 # No host compiler in this environment (e.g. plain cmd.exe + devkitPro
@@ -895,7 +1021,7 @@ check:
 	@for src in $(ALL_LIBRETRO_SRCS); do \
 	if [ -f "$$src" ]; then \
 	echo "  OK  $$src"; \
-	else \
+        else \
 	echo "  MISSING  $$src"; \
 	exit 1; \
 	fi \

@@ -10732,6 +10732,10 @@ static JavaValue native_thread_currentThread(JVM* jvm, JavaThread* thread,
  * 5-с диагностике). Слабо-читается диагностикой — в белых хост-тестах
  * без неё просто не печатается. */
 volatile uint32_t g_zperf_psc_clamps = 0;
+/* v36.99 [PSC-TURBO-SMALL]: счётчик МЕЛКИХ снов (2..9 мс) окна paint,
+ * укороченных до 1 мс в ТУРБО (diag pss=). Отдельный от psc: большие
+ * сны клампятся в любом режиме, мелкие — только в турбо. */
+volatile uint32_t g_zperf_pss_clamps = 0;
 /* v36.85 [TURBO-FF]: счётчик сон-дилатаций раннера в турбо (diag tff=). */
 volatile uint32_t g_turbo_ff_sleep_dilates = 0;
 
@@ -10862,6 +10866,55 @@ static JavaValue native_thread_sleep(JVM* jvm, JavaThread* thread,
                             cap = s_psc_turbo_ms;
                     }
                     millis = cap;
+                }
+            }
+        }
+        /* v36.99 [PSC-TURBO-SMALL]: МЕЛКИЕ сны окна paint в турбо.
+         *
+         * ПОЛЕВОЙ КОРЕНЬ (Zombie Infection, тяжёлый уровень, лог
+         * v36.98-loadfix1): paint кадра стоит 100-200 мс, из них
+         * ~40-80 мс НЕ байткод (vi=8.4M/с при пике 19.7M/с) — часть
+         * этого времени может быть хореографией коротких Thread.sleep
+         * (2..9 мс), на которые кламп v36.84 (только >=10 мс) не
+         * распространялся. На телефоне такие сны отдавали единственный
+         * CPU второму потоку игры; в эмуляторе фронтендный сон в окне
+         * paint — мёртвое время: раннер стоит в handshake serviceRepaints,
+         * ввод ждёт насоса. В ТУРБО семантика быстрого перемотки уже
+         * режет сны раннера (NOJME_TURBO_SLEEP_DIV /4) и vsync-паузу
+         * serviceRepaints (TURBO-FF) — короткие сны фронтендного paint
+         * были последним нетронутым тормозом. Клампим 2..9 мс -> 1 мс
+         * ТОЛЬКО в турбо; обычный режим не тронут (фейды/анимации меню
+         * сохраняют телефонный темп). Счётчик g_zperf_pss_clamps (diag
+         * pss=) покажет в поле, сколько таких снов находилось. Рубильник
+         * NOJME_PAINT_SLEEP_TURBO_SMALL=0 — вернуть v36.98. */
+        {
+            static long s_pss_on = -1;
+            if (s_pss_on < 0) {
+                const char* pe = getenv("NOJME_PAINT_SLEEP_TURBO_SMALL");
+                s_pss_on = (pe && pe[0] == '0') ? 0 : 1;
+            }
+            if (s_pss_on && millis >= 2 && millis < 10 &&
+                &midp_paint_window_active && midp_paint_window_active()) {
+                extern int jvm_current_os_thread_is_vm_runner(void);
+                extern long g_jvm_thread_budget; /* 0 = turbo */
+                if (g_jvm_thread_budget == 0 &&
+                    !jvm_current_os_thread_is_vm_runner()) {
+                    static int s_pss_traced = 0;
+                    if (!s_pss_traced) {
+                        s_pss_traced = 1;
+                        {
+                            extern void sw_trace_force(const char* fmt, ...)
+                                __attribute__((weak));
+                            if (&sw_trace_force && sw_trace_force)
+                                sw_trace_force("[ZPERF] small paint-sleep %ld -> 1 ms "
+                                               "(turbo paint window; NOJME_PAINT_SLEEP_TURBO_SMALL=0 отключает)",
+                                               (long)millis);
+                        }
+                        LOG_SAFE("[ZPERF] small paint-sleep %ld -> 1 ms (turbo paint window)\n",
+                                 (long)millis);
+                    }
+                    g_zperf_pss_clamps++;
+                    millis = 1;
                 }
             }
         }
@@ -11195,13 +11248,32 @@ void native_threads_registry_reset(void) {
  * jvm_note_native_call). */
 void jvm_note_native_call(JavaThread* thread, const char* cls, const char* mth) {
     if (!thread) return;
+    /* v36.97 [NATIVE-NOTE-LITE] — Windows twin of the POSIX change: coarse
+     * 32-call stamp refresh + pointer-pair name cache (see the POSIX twin). */
     thread->last_native_ms = (jlong)GetTickCount64();
+    thread->in_native = 1; /* v36.93: td-дампер печатает age только пока натив реально исполняется */
     thread->spin_instr = 0; /* v36.88 [SPIN-BREAK-ICOUNT] */
-    if (cls && mth) {
-        snprintf(thread->last_native, sizeof(thread->last_native), "%.60s.%.30s", cls, mth);
-    } else {
-        snprintf(thread->last_native, sizeof(thread->last_native), "?");
+    if (cls != (const char*)thread->note_last_cls || mth != (const char*)thread->note_last_mth) {
+        thread->note_last_cls = cls;
+        thread->note_last_mth = mth;
+        if (cls && mth) {
+            snprintf(thread->last_native, sizeof(thread->last_native), "%.60s.%.30s", cls, mth);
+        } else {
+            snprintf(thread->last_native, sizeof(thread->last_native), "?");
+        }
     }
+}
+
+/* v36.93 [NATIVE-RETURN-DIAG]: вызывается на выходе из натива (все
+ * диспетчерские сайты opcodes.c). Сбрасывает флаг in_native, чтобы
+ * td-дамп показывал «(idle) age=-1» для ПРОСТАИВАЮЩЕГО потока вместо
+ * устаревшего «nat=<последний натив> age=<растёт>», который читался
+ * как многосекундное зависание (Bounce Tales: age=12550 при реальном
+ * времени Thread.start = 3 мс). last_native_ms остаётся штампом
+ * последней активности — ta=/liveness не меняются. */
+void jvm_note_native_return(JavaThread* thread) {
+    if (!thread) return;
+    thread->in_native = 0;
 }
 
 void jvm_dump_all_threads(void) {
@@ -11254,11 +11326,14 @@ void jvm_threads_dump_snprint(JVM* jvm, char* buf, size_t cap, int deep) {
 
     if (jvm && jvm->main_thread) {
         JavaThread* mt = jvm->main_thread;
-        jlong age = mt->last_native_ms ? now_ms - mt->last_native_ms : -1;
+        /* v36.93: age печатаем только пока поток РЕАЛЬНО внутри натива;
+         * простой — «(idle) age=-1» (см. [NATIVE-RETURN-DIAG]) */
+        jlong age = (mt->in_native && mt->last_native_ms) ? now_ms - mt->last_native_ms : -1;
+        const char* mt_nat = (mt->in_native && mt->last_native[0]) ? mt->last_native : "(idle)";
         /* v34.96: nat widened %.32s -> %.48s (see POSIX twin comment) */
         off += (size_t)snprintf(buf + off, cap - off,
             "td m: nat=%.48s age=%lld",
-            mt->last_native[0] ? mt->last_native : "(none)",
+            mt_nat,
             (long long)age);
         if (mt->park_why[0])
             off += (size_t)snprintf(buf + off, cap - off, " why=%.15s", mt->park_why);
@@ -11301,11 +11376,15 @@ void jvm_threads_dump_snprint(JVM* jvm, char* buf, size_t cap, int deep) {
         else if (st == THREAD_STATE_WAITING) sts = "wait";
         else if (st == THREAD_STATE_BLOCKED) sts = "blocked";
         if (off + 200 < cap) {
+            /* v36.93: как в m-строке — nat/age только при in_native */
+            jlong age_in = (t->in_native && t->last_native_ms) ? now_ms - t->last_native_ms : -1;
+            const char* t_nat = (t->in_native && t->last_native[0]) ? t->last_native : "(idle)";
+            (void)age;
             off += (size_t)snprintf(buf + off, cap - off,
                 "td t%d: %s nat=%.48s age=%lld%s",
                 t->id, sts,
-                t->last_native[0] ? t->last_native : "(none)",
-                (long long)age,
+                t_nat,
+                (long long)age_in,
                 t->mon_enter_wait ? " monenter" : "");
             /* v34.99: monitor-wait age for runner threads (see the m-line
              * note above). */
@@ -11423,6 +11502,158 @@ void jvm_spin_break_pause_fresh_runners(void) {
         }
     }
 #endif
+}
+
+/* v36.92 [STALL-PROBE]: снапшот живых pthread-раннеров для beat-сторожа
+ * switch_trace.c. ПОЛЕВОЙ КОРЕНЬ (Metal Slug 6, v36.91 поле): один вызов
+ * at.bl держал монитор 12.5 с, диспетчируя нативы всплесками каждые 2.5-5 с
+ * (jsite при этом ЗАМЕР — обновляется раз в 64k инструкций, а байткод между
+ * всплесками почти не исполняется). Все классификаторы сторожа смотрят
+ * мимо: age не растёт (всплески), live не падает, seqage ловит только STUCK.
+ * Зонд отдаёт beat-у (tid, jsite, native-age) каждого раннера: побитовые
+ * сравнения jsite между ударами дают ТОЧНЫЙ сигнал «сайт замер, но поток
+ * жив» — по нему выставляется g_stall_stack_gen и [STALLSTACK] (execute.c)
+ * печатает ЦЕПОЧКУ КАДРОВ из самого раннера (безопасно). Racy-читки
+ * допустимы: jsite — стабильная строка в структуре потока (DUMP-FENCE
+ * v36.48), age — jlong, читается атомарно для диагностики. */
+int jvm_runners_probe(char sites[][64], long long* native_age_ms,
+                      int* tids, int max) {
+    extern int64_t jvm_exec_now_ms(void);
+    jlong now = (jlong)jvm_exec_now_ms();
+    int n = 0;
+#ifdef _WIN32
+    for (int i = 0; i < MAX_PTHREADS && n < max; i++) {
+        JavaThread* t = g_win_live_jt[i];
+        if (!t || !g_pthread_running[i]) continue;
+        if (sites) {
+            snprintf(sites[n], 64, "%.63s",
+                     t->jsite[0] ? t->jsite : "(?)");
+        }
+        if (native_age_ms)
+            native_age_ms[n] = t->last_native_ms ? (long long)(now - t->last_native_ms) : -1;
+        if (tids) tids[n] = t->id;
+        n++;
+    }
+#else
+    for (int i = 0; i < g_live_count && i < MAX_PTHREADS && n < max; i++) {
+        JavaThread* t = g_live_threads[i];
+        if (!t || !g_live_running[i]) continue;
+        if (sites) {
+            snprintf(sites[n], 64, "%.63s",
+                     t->jsite[0] ? t->jsite : "(?)");
+        }
+        if (native_age_ms)
+            native_age_ms[n] = t->last_native_ms ? (long long)(now - t->last_native_ms) : -1;
+        if (tids) tids[n] = t->id;
+        n++;
+    }
+#endif
+    return n;
+}
+
+/* v36.94 [STALLSTACK-REMOTE]: удалённый дамп цепочки Java-кадров застрявшего
+ * потока БЕЗ его участия. ПОЛЕВОЙ КОРЕНЬ (Metal Slug 6, лог v36.93):
+ * [STALL-PROBE] запросил [STALLSTACK] на 129-й секунде, но дамп так и не
+ * вышел — застрявший поток исполнил МЕНЬШЕ 1024 инструкций за 22.5 с
+ * (нет ни одного yield: ни [STALLSTACK]-чекпоинта execute.c, ни
+ * [LONGFRAME], ни выстрела спин-брейкера, ни [SPIN-GATE]). Точная цепочка
+ * кадров — единственный недостающий свидетель для именования вычисления.
+ *
+ * Безопасность: seqlock на frame_seq (bump в push_frame/pop_frame —
+ * единственных точках мутации цепочки). Читатель требует: (1) seq чётный
+ * и стабилен 2 мс ДО обхода, (2) после обхода seq не изменился. Застрявший
+ * поток по определению не мутирует цепочку — чтение сходится с первой
+ * попытки; живой поток уводит seq и дамп молча отменяется (без частичной
+ * печати). Память кадров принадлежит пулу потоков (free только во
+ * flush/exit) — стабильный seq гарантирует валидность указателей.
+ * Двойная печать: LOG_SAFE (stderr хоста) + sw_trace_force (log.txt). */
+void jvm_threads_dump_stall_frames(int tid) {
+    extern void sw_trace_force(const char* fmt, ...)
+        __attribute__((weak));
+    JavaThread* target = NULL;
+#ifdef _WIN32
+    for (int i = 0; i < MAX_PTHREADS; i++) {
+        JavaThread* t = g_win_live_jt[i];
+        if (t && g_pthread_running[i] && t->id == tid) { target = t; break; }
+    }
+#else
+    for (int i = 0; i < g_live_count && i < MAX_PTHREADS; i++) {
+        JavaThread* t = g_live_threads[i];
+        if (t && g_live_running[i] && t->id == tid) { target = t; break; }
+    }
+#endif
+    if (!target) return;
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        uint32_t seq0 = target->frame_seq;
+#ifdef _WIN32
+        Sleep(2); /* 2 мс тишины: мутирующий поток уводит seq */
+#else
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 2 * 1000000L };
+        nanosleep(&ts, NULL); /* 2 мс тишины: мутирующий поток уводит seq */
+#endif
+        if (seq0 != target->frame_seq) continue;
+
+        /* Снимок кадров (максимум 24 — как [STALLSTACK]) */
+        struct { const char* cls; const char* mth; unsigned pc; } snap[24];
+        int d = 0;
+        JavaFrame* f = target->current_frame;
+        while (f && d < 24) {
+            snap[d].cls = (f->clazz && f->clazz->class_name)
+                              ? f->clazz->class_name : "?";
+            snap[d].mth = (f->method && f->method->name)
+                              ? f->method->name : "?";
+            snap[d].pc = (unsigned)f->pc;
+            d++;
+            f = f->prev;
+        }
+
+        if (seq0 != target->frame_seq) continue; /* мутация во время обхода */
+
+        /* Кольцо последних (op, pc) — до печати, после проверки seq */
+        char ring[256];
+        int off = 0;
+        ring[0] = '\0';
+        {
+            uint8_t cur = target->stall_ring_idx;
+            for (int k = 0; k < 16 && off < (int)sizeof(ring) - 24; k++) {
+                uint8_t idx = (uint8_t)((cur - k) & 15);
+                int w = snprintf(ring + off, sizeof(ring) - off,
+                                 "%s%02X@%u", k ? "," : "",
+                                 target->stall_ring_op[idx],
+                                 (unsigned)target->stall_ring_pc[idx]);
+                if (w < 0) break;
+                off += w;
+            }
+        }
+
+        extern int64_t jvm_exec_now_ms(void);
+        jlong now = (jlong)jvm_exec_now_ms();
+        jlong nage = target->last_native_ms
+                         ? now - target->last_native_ms : -1;
+
+        LOG_SAFE("[STALLSTACK-REMOTE] tid=%d (seq %u) dump-begin jsite=%.56s in_native=%d park=%.15s spin_instr=%llu native_age=%lld frames=%d\n",
+                 tid, (unsigned)seq0,
+                 target->jsite[0] ? target->jsite : "(?)",
+                 (int)target->in_native,
+                 target->park_why[0] ? target->park_why : "-",
+                 (unsigned long long)target->spin_instr,
+                 (long long)nage, d);
+        for (int k = 0; k < d; k++) {
+            LOG_SAFE("[STALLSTACK-REMOTE]   [%d] %s.%s pc=%u\n",
+                     k, snap[k].cls, snap[k].mth, snap[k].pc);
+        }
+        LOG_SAFE("[STALL-RING] tid=%d %s\n", tid, ring);
+        if (&sw_trace_force && sw_trace_force) {
+            sw_trace_force("[STALLSTACK-REMOTE] tid=%d frames=%d jsite=%.56s spin=%llu ring[0]=%s",
+                           tid, d,
+                           target->jsite[0] ? target->jsite : "(?)",
+                           (unsigned long long)target->spin_instr,
+                           ring);
+        }
+        return; /* успешный дамп */
+    }
+    /* Три попытки не сошлись — поток жив и мутирует кадры; дамп не нужен. */
 }
 
 /* v36.83 [SPIN-BREAK-SIBLING]: есть ли у потока ХОТЯ БЫ ОДИН «свободный»
@@ -11606,14 +11837,17 @@ void jvm_threads_dump_snprint(JVM* jvm, char* buf, size_t cap, int deep) {
 
     if (jvm && jvm->main_thread) {
         JavaThread* mt = jvm->main_thread;
-        jlong age = mt->last_native_ms ? now_ms - mt->last_native_ms : -1;
+        /* v36.93: age печатаем только пока поток РЕАЛЬНО внутри натива;
+         * простой — «(idle) age=-1» (см. [NATIVE-RETURN-DIAG]) */
+        jlong age = (mt->in_native && mt->last_native_ms) ? now_ms - mt->last_native_ms : -1;
+        const char* mt_nat = (mt->in_native && mt->last_native[0]) ? mt->last_native : "(idle)";
         /* v34.96: nat widened %.32s -> %.48s — "javax/microedition/m3g/
          * Graphics3D.releaseTarget" is 48 chars; the v34.95 trace cut the
          * METHOD NAME off exactly at the class name, hiding whether the
          * wedge was in bindTarget / render / releaseTarget. */
         off += (size_t)snprintf(buf + off, cap - off,
             "td m: nat=%.48s age=%lld",
-            mt->last_native[0] ? mt->last_native : "(none)",
+            mt_nat,
             (long long)age);
         /* v34.98: slow-check park reason ("fe-pause"/"gc-sp") — explains a
          * "run" main thread with a growing age and no new native. */
@@ -11720,11 +11954,15 @@ void jvm_threads_dump_snprint(JVM* jvm, char* buf, size_t cap, int deep) {
         else if (st == THREAD_STATE_WAITING) sts = "wait";
         else if (st == THREAD_STATE_BLOCKED) sts = "blocked";
         if (off + 200 < cap) {
+            /* v36.93: как в m-строке — nat/age только при in_native */
+            jlong age_in = (t->in_native && t->last_native_ms) ? now_ms - t->last_native_ms : -1;
+            const char* t_nat = (t->in_native && t->last_native[0]) ? t->last_native : "(idle)";
+            (void)age;
             off += (size_t)snprintf(buf + off, cap - off,
                 "td t%d: %s nat=%.48s age=%lld%s",
                 t->id, sts,
-                t->last_native[0] ? t->last_native : "(none)",
-                (long long)age,
+                t_nat,
+                (long long)age_in,
                 t->mon_enter_wait ? " monenter" : "");
             /* v34.98: the slow-check park reason — explains "run but frozen" */
             if (t->park_why[0])
@@ -11840,17 +12078,47 @@ extern void v37_note_dispatch(const char* cls, const char* mth);
 void jvm_note_native_call(JavaThread* thread, const char* cls, const char* mth) {
     if (cls && mth) v37_note_dispatch(cls, mth);
     if (!thread) return;
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    thread->last_native_ms = (jlong)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-    thread->spin_instr = 0; /* v36.88 [SPIN-BREAK-ICOUNT]: натив — точка
-     * «свежести» и для гейта: работа с последнего натива отсчитывается
-     * заново (см. JavaThread::spin_instr, execute.c slow-check). */
-    if (cls && mth) {
-        snprintf(thread->last_native, sizeof(thread->last_native), "%.60s.%.30s", cls, mth);
-    } else {
-        snprintf(thread->last_native, sizeof(thread->last_native), "?");
+    /* v36.98 [NATIVE-NOTE-FRESH]: штамп last_native_ms обновляется НА
+     * КАЖДЫЙ вызов (семантика до v36.97 возвращена). v36.97
+     * [NATIVE-NOTE-LITE] экономил clock_gettime+snprintf, обновляя штамп
+     * раз в 32 вызова: для высокочастотных потоков (~183 натива/кадр в
+     * геймплее Zombie) гранулярность честна, но у НИЗКОЧАСТОТНЫХ раннеров
+     * штамп старел на СЕКУНДЫ. Полевой крах (лог v36.97, Zombie
+     * Infection): в фазе загрузки уровня раннер t2 проводит цикл ВНУТРИ
+     * serviceRepaints (250-мс нанослипы внутри натива — диспетчеризациями
+     * НЕ являются) и в тяжёлой чистой Java между ними — единицы диспетчеризаций
+     * в секунду; «каждый 32-й» штамп замерз, окно свежести 1200 мс
+     * jvm_threads_have_free_sibling (v36.83 [SPIN-BREAK-SIBLING])
+     * захлопнулось — защита x8 тихо исчезла, и брейкер ударил базовым
+     * порогом 1500 мс по легитимной Gameloft-загрузке на главном потоке:
+     * [SPIN-BREAK] tid=1 site g.a@124 -> вечный экран загрузки.
+     * Цена: один clock_gettime(CLOCK_MONOTONIC) на диспетчеризацию —
+     * чтение регистра (vDSO на Linux, CNTVCT/libnx на Horizon);
+     * дорогая часть старой цены — snprintf — ОСТАЁТСЯ гейтированной
+     * сменой пары указателей ниже (v36.97). Windows-двойник ниже штамп
+     * никогда не гейтировал и правильности не терял. */
+    thread->in_native = 1;
+    thread->spin_instr = 0;
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        thread->last_native_ms = (jlong)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
     }
+    if (cls != (const char*)thread->note_last_cls || mth != (const char*)thread->note_last_mth) {
+        thread->note_last_cls = cls;
+        thread->note_last_mth = mth;
+        if (cls && mth) {
+            snprintf(thread->last_native, sizeof(thread->last_native), "%.60s.%.30s", cls, mth);
+        } else {
+            snprintf(thread->last_native, sizeof(thread->last_native), "?");
+        }
+    }
+}
+
+/* v36.93 [NATIVE-RETURN-DIAG] — POSIX twin (см. Windows-версию выше). */
+void jvm_note_native_return(JavaThread* thread) {
+    if (!thread) return;
+    thread->in_native = 0;
 }
 
 /* v34.9: number of alive pthread-backed VM threads (for GC safepoint census) */
@@ -12554,6 +12822,17 @@ static JavaValue native_thread_isAlive(JVM* jvm, JavaThread* thread,
 }
 
 /* Thread.join() - wait for thread to terminate */
+/* v36.91 [JOIN-CAP]: helpers for the bounded join() (see the block comment
+ * inside native_thread_join). The deadline is thread-local to the JOINING
+ * thread (the frame thread inside destroyApp). */
+static int64_t mon_join_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static __thread int64_t s_join_cap_deadline = 0;
+static __thread int      s_join_cap_reported = 0;
+
 static JavaValue native_thread_join(JVM* jvm, JavaThread* thread,
                                     JavaValue* args, int arg_count) {
     (void)jvm; (void)thread; (void)arg_count;
@@ -12578,6 +12857,32 @@ static JavaValue native_thread_join(JVM* jvm, JavaThread* thread,
         return NATIVE_RETURN_VOID();
     }
     
+    /* v36.91 [JOIN-CAP]: см. native_thread_join_millis. join() БЕЗ
+     * таймаута (именно его вызывает destroyApp игр — поле: Metal Slug 6,
+     * l.destroyApp@0 -> Thread.join на зацикленном игровом потоке) в окне
+     * destroyApp ограничивается NOJME_JOIN_CAP_MS (дефолт 5000 мс):
+     * teardown гасит раннеры, сессия рвётся гарантированно. */
+    {
+        static jlong s_join_cap_ms = -1;
+        static int   s_cap_logged = 0;
+        if (s_join_cap_ms < 0) {
+            const char* e = getenv("NOJME_JOIN_CAP_MS");
+            s_join_cap_ms = (e && atol(e) >= 0) ? atol(e) : 5000;
+        }
+        extern int midp_destroy_app_in_flight(void);
+        if (jvm && !jvm->running) {
+            if (!s_cap_logged) {
+                s_cap_logged = 1;
+                LOG_SAFE("[JOIN-CAP] VM stopping — join() returns immediately (tid=%d still alive)\n", thread_id);
+            }
+            memory_barrier();
+            return NATIVE_RETURN_VOID();
+        }
+        if (midp_destroy_app_in_flight() && s_join_cap_ms > 0) {
+            s_join_cap_deadline = mon_join_now_ms() + s_join_cap_ms;
+        }
+    }
+    
 #ifdef _WIN32
     /* Windows: wait on event with timeout */
     /* CRITICAL: Use || (OR) not && (AND). We wait while EITHER flag indicates
@@ -12585,6 +12890,14 @@ static JavaValue native_thread_join(JVM* jvm, JavaThread* thread,
      * becomes true (race condition during thread startup), join returns immediately.
      */
     while (g_pthread_running[thread_id] || target->is_alive) {
+        /* v36.91 [JOIN-CAP]: bounded join during destroyApp */
+        if (s_join_cap_deadline && mon_join_now_ms() >= s_join_cap_deadline) {
+            if (!s_join_cap_reported) {
+                s_join_cap_reported = 1;
+                LOG_SAFE("[JOIN-CAP] destroyApp join() aborted after cap on a live target (tid=%d) — session teardown will stop it (NOJME_JOIN_CAP_MS)\n", thread_id);
+            }
+            break;
+        }
         if (g_win_thread_events[thread_id]) {
             DWORD result = WaitForSingleObject(g_win_thread_events[thread_id], 50);
             if (result == WAIT_OBJECT_0) {
@@ -12602,6 +12915,7 @@ static JavaValue native_thread_join(JVM* jvm, JavaThread* thread,
             }
         }
     }
+    s_join_cap_deadline = 0;
 #else
     /* POSIX: wait on condition variable with timeout */
     pthread_mutex_lock(&g_pthread_mutex);
@@ -12610,6 +12924,14 @@ static JavaValue native_thread_join(JVM* jvm, JavaThread* thread,
      * becomes true (race condition during thread startup), join returns immediately.
      */
     while (g_pthread_running[thread_id] || target->is_alive) {
+        /* v36.91 [JOIN-CAP]: bounded join during destroyApp */
+        if (s_join_cap_deadline && mon_join_now_ms() >= s_join_cap_deadline) {
+            if (!s_join_cap_reported) {
+                s_join_cap_reported = 1;
+                LOG_SAFE("[JOIN-CAP] destroyApp join() aborted after cap on a live target (tid=%d) — session teardown will stop it (NOJME_JOIN_CAP_MS)\n", thread_id);
+            }
+            break;
+        }
         /* Use timed wait to avoid infinite blocking */
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -12625,6 +12947,7 @@ static JavaValue native_thread_join(JVM* jvm, JavaThread* thread,
         }
     }
     pthread_mutex_unlock(&g_pthread_mutex);
+    s_join_cap_deadline = 0;
 #endif
 
     /* CRITICAL: Add memory barrier after join to ensure visibility of all writes
@@ -12713,16 +13036,52 @@ static JavaValue native_thread_join_millis(JVM* jvm, JavaThread* thread,
 
     /* Poll with a millisecond countdown (2ms granularity keeps cooperative
      * scheduling alive while waiting). millis == 0 means wait forever. */
-    jlong remaining = millis;
-    while (target->is_alive) {
-        if (millis > 0 && remaining <= 0) break;
-        thread_yield(jvm);
+    /* v36.91 [JOIN-CAP]: ПОЛЕВОЙ КОРЕНЬ «игра не выходит, только kill»
+     * (Metal Slug 6, лог 2026-10-07): destroyApp игры делает join() без
+     * таймаута на ИГРОВОЙ поток, а тот зациклен в catch-обработчике
+     * synchronized-блока (at.run@704..708, [MON-EXIT-FREE] в opcodes.c
+     * чинит саму петлю) — либо просто крутит свой цикл мимо флага
+     * выхода. join(0) без cap держит frame-поток вечно, сессия не
+     * рвётся, frontend не выходит. Правило: БЕЗГРАНИЧНЫЙ join остаётся
+     * безграничным в живой VM (игры вольны ждать свои рабочие потоки),
+     * НО в окне destroyApp (midp_destroy_app_in_flight) или при
+     * остановленной VM ожидание ограничивается NOJME_JOIN_CAP_MS
+     * (по умолчанию 5000 мс): по истечении записываем [JOIN-CAP] и
+     * возвращаемся — teardown всё равно гасит раннеров (jvm->running
+     * останавливает interpret-циклы). */
+    {
+        static jlong s_join_cap_ms = -1;
+        static int   s_cap_logged = 0;
+        if (s_join_cap_ms < 0) {
+            const char* e = getenv("NOJME_JOIN_CAP_MS");
+            s_join_cap_ms = (e && atol(e) >= 0) ? atol(e) : 5000;
+        }
+        extern int midp_destroy_app_in_flight(void);
+        jlong cap_ms = 0;   /* 0 = unlimited */
+        if (jvm && !jvm->running) cap_ms = 1;  /* VM останавливается — не ждём вовсе */
+        else if (millis == 0 && midp_destroy_app_in_flight())
+            cap_ms = s_join_cap_ms;
+        jlong remaining = millis;
+        jlong waited = 0;
+        while (target->is_alive) {
+            if (millis > 0 && remaining <= 0) break;
+            if (cap_ms > 0 && waited >= cap_ms) {
+                if (!s_cap_logged) {
+                    s_cap_logged = 1;
+                    LOG_SAFE("[JOIN-CAP] destroyApp join() aborted after %lld ms on a live target (tid=%d) — session teardown will stop it (NOJME_JOIN_CAP_MS)\n",
+                             (long long)cap_ms, target->id);
+                }
+                break;
+            }
+            thread_yield(jvm);
 #ifndef _WIN32
-        usleep(2000);
+            usleep(2000);
 #else
-        Sleep(2);
+            Sleep(2);
 #endif
-        if (millis > 0) remaining -= 2;
+            if (millis > 0) remaining -= 2;
+            waited += 2;
+        }
     }
     return NATIVE_RETURN_VOID();
 }

@@ -38,6 +38,14 @@
 #include "jvm.h"
 #include "render/render.h"
 #include "midp/bitmap_font.h"
+#include "gfxperf.h" /* v36.100 [GFX-PERF]: per-API wall-time counters */
+
+/* v36.100 [GFX-PERF]: counter storage (see include/gfxperf.h). Plain
+ * globals — render.c sits in the core, every target links it; only
+ * switch_trace.c (5-s diag) reads/resets them, via weak refs so the
+ * whitebox builds that link switch_trace.c WITHOUT the core still link. */
+volatile uint32_t g_gfxp_n[GFXP_COUNT] = {0};
+volatile uint32_t g_gfxp_us[GFXP_COUNT] = {0};
 
 /* ============================================================================
  * SECTION 0: ARM NEON SIMD — conditional compilation (v34.24)
@@ -657,6 +665,87 @@ static void sse2_copy_rev32(uint32_t* dst, const uint32_t* src, int n) {
 }
 
 #endif /* RENDER_HAVE_SSE2 */
+
+/* ---------------------------------------------------------------------------
+ * v36.100 [CREATERGB-FOLD] helpers: SIMD stages for
+ * midp_image_create_from_rgb (graphics.c). Public (nojme_*) because that
+ * function lives in another TU; bit-identical to the scalar loops they
+ * replace:
+ *   nojme_span_or_opaque   dst[i] = 0xFF000000 | (src[i] & 0x00FFFFFF)
+ *   nojme_span_all_alpha_ff  == (no pixel has (p>>24) != 0xFF)
+ * --------------------------------------------------------------------------- */
+void nojme_span_or_opaque(uint32_t* dst, const uint32_t* src, size_t n) {
+#if RENDER_HAVE_NEON
+    const uint32x4_t lo = vdupq_n_u32(0x00FFFFFFu);
+    const uint32x4_t hi = vdupq_n_u32(0xFF000000u);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        vst1q_u32(dst + i,     vorrq_u32(hi, vandq_u32(vld1q_u32(src + i),     lo)));
+        vst1q_u32(dst + i + 4, vorrq_u32(hi, vandq_u32(vld1q_u32(src + i + 4), lo)));
+    }
+    for (; i + 4 <= n; i += 4)
+        vst1q_u32(dst + i, vorrq_u32(hi, vandq_u32(vld1q_u32(src + i), lo)));
+    for (; i < n; i++) dst[i] = 0xFF000000u | (src[i] & 0x00FFFFFFu);
+    return;
+#endif
+#if RENDER_HAVE_SSE2
+    const __m128i lo = _mm_set1_epi32((int)0x00FFFFFFu);
+    const __m128i hi = _mm_set1_epi32((int)0xFF000000u);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        _mm_storeu_si128((__m128i*)(dst + i),     _mm_or_si128(hi, _mm_and_si128(_mm_loadu_si128((const __m128i*)(src + i)),     lo)));
+        _mm_storeu_si128((__m128i*)(dst + i + 4), _mm_or_si128(hi, _mm_and_si128(_mm_loadu_si128((const __m128i*)(src + i + 4)), lo)));
+    }
+    for (; i + 4 <= n; i += 4)
+        _mm_storeu_si128((__m128i*)(dst + i), _mm_or_si128(hi, _mm_and_si128(_mm_loadu_si128((const __m128i*)(src + i)), lo)));
+    for (; i < n; i++) dst[i] = 0xFF000000u | (src[i] & 0x00FFFFFFu);
+    return;
+#endif
+    for (size_t i = 0; i < n; i++) dst[i] = 0xFF000000u | (src[i] & 0x00FFFFFFu);
+}
+
+int nojme_span_all_alpha_ff(const uint32_t* p, size_t n) {
+    /* OR-reduce of ((p>>24) ^ 0xFF) lanes: 0 <=> every alpha byte is 0xFF. */
+#if RENDER_HAVE_NEON
+    const uint32x4_t xm = vdupq_n_u32(0xFFu);
+    uint32x4_t acc = vdupq_n_u32(0);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        acc = vorrq_u32(acc, veorq_u32(vshrq_n_u32(vld1q_u32(p + i), 24), xm));
+        acc = vorrq_u32(acc, veorq_u32(vshrq_n_u32(vld1q_u32(p + i + 4), 24), xm));
+        if (vgetq_lane_u32(acc, 0) | vgetq_lane_u32(acc, 1) |
+            vgetq_lane_u32(acc, 2) | vgetq_lane_u32(acc, 3))
+            return 0; /* early exit on first non-opaque quad */
+    }
+    for (; i + 4 <= n; i += 4)
+        acc = vorrq_u32(acc, veorq_u32(vshrq_n_u32(vld1q_u32(p + i), 24), xm));
+    if (vgetq_lane_u32(acc, 0) | vgetq_lane_u32(acc, 1) |
+        vgetq_lane_u32(acc, 2) | vgetq_lane_u32(acc, 3))
+        return 0;
+    for (; i < n; i++) if ((p[i] >> 24) != 0xFFu) return 0;
+    return 1;
+#endif
+#if RENDER_HAVE_SSE2
+    const __m128i xm = _mm_set1_epi32(0xFF);
+    __m128i acc = _mm_setzero_si128();
+    __m128i any = _mm_setzero_si128();
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        acc = _mm_or_si128(acc, _mm_xor_si128(_mm_srli_epi32(_mm_loadu_si128((const __m128i*)(p + i)), 24), xm));
+        acc = _mm_or_si128(acc, _mm_xor_si128(_mm_srli_epi32(_mm_loadu_si128((const __m128i*)(p + i + 4)), 24), xm));
+        any = _mm_or_si128(any, acc);
+    }
+    for (; i + 4 <= n; i += 4)
+        acc = _mm_or_si128(acc, _mm_xor_si128(_mm_srli_epi32(_mm_loadu_si128((const __m128i*)(p + i)), 24), xm));
+    any = _mm_or_si128(any, acc);
+    if (_mm_movemask_epi8(_mm_cmpeq_epi32(any, _mm_setzero_si128())) != 0xFFFF)
+        return 0;
+    for (; i < n; i++) if ((p[i] >> 24) != 0xFFu) return 0;
+    return 1;
+#endif
+    for (size_t i = 0; i < n; i++) if ((p[i] >> 24) != 0xFFu) return 0;
+    return 1;
+}
 
 /* Platform-neutral dispatch: on ARM the fast helpers above are compiled
  * under their span_* names directly; on x86-64 the SSE2 implementations
@@ -1595,6 +1684,7 @@ void midp_graphics_draw_image(MidpGraphics* gfx, MidpImage* img,
 
     if (likely_opaque) {
         /* Fast path: memcpy per row for opaque images */
+        gfxp_count(GFXP_DI_O); /* v36.100 [GFX-PERF]: opaque memcpy sub-path */
         for (int py = 0; py < copy_h; py++) {
             uint32_t *src_row = img->pixels + (src_y_off + py) * img->width + src_x_off;
             uint32_t *dst_row = gfx->pixels + (dst_y1 + py) * gfx->width + dst_x1;
@@ -2184,6 +2274,35 @@ void midp_blit_rgb(MidpGraphics* gfx, const jint* rgb_data, jint src_len,
          * and even == 0) — a mutable destination image must drop its cached
          * exact-opacity scan, or a later drawImage could memcpy the image
          * (raw pink color-key pixels included) onto the screen. */
+        /* v36.100 [DRAWRGB-SCR-SPAN]: SCREEN gfx (owner_image == NULL) —
+         * альфа кадра всё равно сбрасывается стадией презентации
+         * (XRGB8888/RGB565 конверсии см. render.h/nojme_convert_*), поэтому
+         * точная Porter-Duff формула с ТРЕМЯ целочисленными делениями на
+         * пиксель (outA = srcA + dstA*invSrcA>>8; r/g/b /= outA — см.
+         * blit_rgb_blend_px) для экрана избыточна: на A57@1 ГГц одно
+         * полноэкранное наложение (240x320, туман/затемнение — фирменный
+         * приём Gameloft-хорроров) стоило миллионы udiv (~10-20 тактов
+         * каждый) и ДОМИНИРОВАЛО кадр. Экранный путь теперь идёт тем же
+         * SIMD src-over спаном, что и drawImage (span_src_over_span,
+         * выходная альфа 0xFF, без делений): отличие каналов <= 2 младших
+         * бита, альфа 0xFF против 254 — НЕРАЗЛИЧИМО и всё равно сбрасывается
+         * при выводе. Спан применим и к ОБРАЗУ, который заведомо весь
+         * непрозрачен (alpha-скан: offscreen-буфер после фонового блита —
+         * идиома композиции Gameloft): каждый dst-пиксель имеет dstA==0xFF,
+         * точная формула дала бы outA 254/255 и те же каналы +-2 младших
+         * бита, а спан пишет 0xFF -> образ ОСТАЁТСЯ all-opaque и финальный
+         * drawImage берёт memcpy-путь (вместо бленда после 254-х альф
+         * старой формулы). Пиксели с alpha<0xFF до вызова (скан = не весь
+         * опак) остаются на точной формуле — их читают getRGB/блендинг
+         * downstream. Проверка скана — ДО инвалидации (см. ниже).
+         * NOJME_DRAWRGB_SCR_SPAN=0 возвращает старую семантику (A/B). */
+        static int s_scr_span = -1;
+        if (s_scr_span < 0) {
+            const char* e = getenv("NOJME_DRAWRGB_SCR_SPAN");
+            s_scr_span = (e && e[0] && e[0] == '0') ? 0 : 1;
+        }
+        const int scr_fast = s_scr_span &&
+            (!gfx->owner_image || midp_image_all_opaque(gfx->owner_image));
         if (gfx->owner_image)
             midp_image_invalidate_alpha_scan(gfx->owner_image);
         /* Alpha blending path: v34.24 NEON quads store fully-opaque runs
@@ -2207,6 +2326,29 @@ void midp_blit_rgb(MidpGraphics* gfx, const jint* rgb_data, jint src_len,
                                         (const uint32_t*)&rgb_data[sFirst], npx);
             } else {
                 nojme_m3g_cov_mark_rect(gfx, tx + lead, ty + py, npx, 1);
+            }
+            if (scr_fast) {
+#if RENDER_HAVE_SIMD
+                span_src_over_span(&gfx->pixels[dstRow + lead],
+                                   (const uint32_t*)&rgb_data[sFirst], npx);
+                continue;
+#else
+                for (int px = 0; px < npx; px++) {
+                    uint32_t sc = (uint32_t)rgb_data[sFirst + px];
+                    uint32_t sa = sc >> 24;
+                    if (sa == 0xFFu) {
+                        gfx->pixels[dstRow + lead + px] = sc;
+                    } else if (sa) {
+                        uint32_t dc = gfx->pixels[dstRow + lead + px];
+                        uint32_t ia = 255u - sa;
+                        uint32_t r = (((sc >> 16) & 0xFF) * sa + ((dc >> 16) & 0xFF) * ia + 128) >> 8;
+                        uint32_t g = (((sc >> 8) & 0xFF) * sa + ((dc >> 8) & 0xFF) * ia + 128) >> 8;
+                        uint32_t b = ((sc & 0xFF) * sa + (dc & 0xFF) * ia + 128) >> 8;
+                        gfx->pixels[dstRow + lead + px] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                    }
+                }
+                continue;
+#endif
             }
             int px = 0;
 #if RENDER_HAVE_NEON
@@ -5285,6 +5427,50 @@ int render_neon_selftest(void) {
             fails++;
         }
         free(sfb); free(pfb); free(spix); free(pimg);
+    }
+
+    /* --- v36.100 [CREATERGB-FOLD] stage bit-exactness: nojme_span_or_opaque
+     * and nojme_span_all_alpha_ff vs their scalar references, odd sizes to
+     * exercise the 8/4 blocks + tails. --- */
+    {
+        const int W8 = 61, H8 = 17, N8 = W8 * H8; /* 1037 = 8*129+4+1 */
+        uint32_t* src8 = (uint32_t*)malloc(N8 * 4);
+        uint32_t* dst8 = (uint32_t*)malloc(N8 * 4);
+        uint32_t* ref8 = (uint32_t*)malloc(N8 * 4);
+        if (src8 && dst8 && ref8) {
+            /* patterned ramp + LCG, incl. all-0xFF and all-0x00 alpha rows */
+            for (int i = 0; i < N8; i++) {
+                uint32_t p = (i < 256) ? (uint32_t)i * 0x01010101u
+                                       : (uint32_t)(LCG_NEXT());
+                src8[i] = p;
+            }
+            /* or_opaque: dst = 0xFF000000 | (src & 0x00FFFFFF) */
+            for (int i = 0; i < N8; i++)
+                ref8[i] = 0xFF000000u | (src8[i] & 0x00FFFFFFu);
+            memset(dst8, 0, N8 * 4);
+            nojme_span_or_opaque(dst8, src8, N8);
+            int bad8 = memcmp(dst8, ref8, N8 * 4) != 0;
+            /* all_alpha_ff: scan verdict vs per-pixel reference */
+            int ref_all = 1;
+            for (int i = 0; i < N8; i++) if ((src8[i] >> 24) != 0xFFu) { ref_all = 0; break; }
+            if (nojme_span_all_alpha_ff(src8, N8) != ref_all) bad8 = 1;
+            /* force a non-opaque pixel in the SIMD mid-block + tail */
+            src8[N8 / 2] &= 0x00FFFFFFu;
+            src8[N8 - 1] &= 0x00FFFFFFu;
+            if (nojme_span_all_alpha_ff(src8, N8) != 0) bad8 = 1;
+            /* all-opaque case (incl. 0 and 1 tails) */
+            for (int i = 0; i < N8; i++) src8[i] = 0xFF000000u | (uint32_t)(i * 7);
+            if (nojme_span_all_alpha_ff(src8, N8) != 1) bad8 = 1;
+            if (nojme_span_all_alpha_ff(src8, 0) != 1) bad8 = 1; /* n==0 */
+            if (nojme_span_all_alpha_ff(src8, 1) != 1) bad8 = 1;
+            if (nojme_span_all_alpha_ff(NULL, 0) != 1) bad8 = 1;
+            ALWAYS_LOG("[NEON-TEST] creatergb stages %s (mismatches=%d)\n",
+                      bad8 ? "FAIL" : "PASS", bad8);
+            fails += bad8 ? 1 : 0;
+        } else {
+            fails++;
+        }
+        free(src8); free(dst8); free(ref8);
     }
 
     ALWAYS_LOG("[NEON-TEST] %s (%d failure%s)\n",

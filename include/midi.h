@@ -160,11 +160,31 @@ typedef struct MidiSequencer {
     double tick_accumulator;       /* Accumulated ticks from real time */
 } MidiSequencer;
 
-/* MIDI file structure */
+/* MIDI file structure
+ * v36.89: Sonivox (AOSP) backend. Synthesis is delegated to the EAS
+ * library — every MidiFile owns its own EAS_DATA_HANDLE instance and
+ * (for SMF) an EAS_HANDLE stream. For device://tone and device://midi
+ * (midi_load_empty), eas_stream is a raw MIDI stream opened via
+ * EAS_OpenMIDIStream, and direct midi_*_file() calls feed it bytes.
+ *
+ * v36.89b: Sonivox's built-in GM bank (wt_22khz.c) is hardcoded for
+ * 22050 Hz — we run the synth at 22050 Hz internally and linearly
+ * upsample 2:1 to 44100 Hz (NOJME's audio rate) in midi_generate_samples.
+ * src_buf holds 129 stereo frames (one carryover + 128 from EAS_Render);
+ * src_pos is the fractional read position within src_buf (advances by
+ * 0.5 per 44100-Hz output sample).
+ */
 typedef struct MidiFile {
     uint8_t* data;
     uint32_t size;
     MidiSequencer* sequencer;
+    void*   eas_data;            /* EAS_DATA_HANDLE */
+    void*   eas_stream;          /* EAS_HANDLE */
+    void*   eas_locator;         /* EAS_FILE_LOCATOR (memory-backed struct) */
+    bool    is_midi_stream;     /* true = raw MIDI stream, false = SMF file */
+    int16_t src_buf[258];        /* 129 stereo frames: 1 carryover + 128 EAS_Render */
+    int     src_avail;          /* frames currently in src_buf (0, 1, or 129) */
+    double  src_pos;            /* fractional read position in src_buf (22050 Hz units) */
 } MidiFile;
 
 /* Initialize MIDI subsystem */
@@ -228,6 +248,31 @@ int  midi_get_program_file(MidiFile* midi, int channel);
 /* v23: minimal valid MIDI file (header + empty track) used as the synthesizer
  * target for device://tone and device://midi players. */
 MidiFile* midi_load_empty(void);
+
+/* v36.90 [MIDI-PERF]: runtime synth performance configuration.
+ * Polyphony is applied per live EAS instance (already-loaded files are
+ * retuned) and to every future load; 0 resets to the build-time maximum.
+ * Filter/reverb toggle the engine hot-path gates (eas_wtengine.c /
+ * eas_mixer.c). Defaults: polyphony 24, filter off, reverb off — the
+ * fast J2ME-era configuration; settings.ini / core options / env vars
+ * feed these wrappers. */
+int  midi_set_polyphony(int voices);
+void midi_set_filter_enabled(int on);
+void midi_set_reverb_enabled(int on);
+int  midi_get_polyphony(void);
+int  midi_get_filter_enabled(void);
+int  midi_get_reverb_enabled(void);
+
+/* v36.91 [MIDI-GAIN]: post-render digital gain on the Sonivox output.
+ * Sonivox renders noticeably quieter than the PCM/WAV path (measured:
+ * GoF_InGame RMS -25.2 dBFS at the EAS-default 0.90 vs a typical
+ * full-scale game WAV at RMS -12..-18 dBFS), so MIDI sounded much
+ * quieter than PCM. Default 2.0 (+6 dB) evens them out without
+ * clipping (EAS-internal 1.00 saturates on dense chords — do NOT raise
+ * the EAS volume instead). Range 0.25..4.0; settings midi_gain
+ * (percent 100..400) / env NOJME_MIDI_GAIN (percent). */
+void  midi_set_gain(float gain);
+float midi_get_gain(void);
 
 /* Get active sequencer (for audio callback) */
 MidiSequencer* midi_get_active_sequencer(void);

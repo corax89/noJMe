@@ -2351,10 +2351,47 @@ void midp_process_pending_keys(JVM* jvm) {
      * время доставки (ACC_SYNC-вход обработчика реентерантен) — окно
      * гонки между tryenter и вызовом обработчика закрыто. */
     int runner_trylock = 0;
+    /* v36.94 [KEY-BUDGET]: 1 = дренаж на насосном/фрейм-потоке — доставка
+     * идёт с бюджетом монитора (см. arm/disarm в цикле ниже). */
+    int pump_budget = 0;
+    /* v36.94 [KEY-BUDGET]: NOJME_KEY_BUDGET_MS (дефолт 1000, 0 = выкл). */
+    int s_key_budget_ms = -1;
+    {
+        static long s_kb_budget = -2;
+        if (s_kb_budget == -2) {
+            const char* e = getenv("NOJME_KEY_BUDGET_MS");
+            /* v36.96 [KEY-BUDGET-FAST]: дефолт 200 (см. twin в
+             * midp_pump_deferred_keys). */
+            s_kb_budget = (e && atol(e) >= 0) ? atol(e) : 200L;
+        }
+        s_key_budget_ms = (int)s_kb_budget;
+    }
     {
         extern int jvm_current_os_thread_is_vm_runner(void);
         if (jvm_current_os_thread_is_vm_runner()) {
             runner_trylock = 1;
+        }
+    }
+    /* v36.93 [KEY-TRYLOCK-PUMP] (Metal Slug 6 / diag mx=12540):
+     * очередь дренирует и ГЛАВНЫЙ/насосный поток (tid 1). Он раньше шёл
+     * без trylock и блокировался в monenter (at.h@197) на всё время
+     * synchronized-секции игры: at.bl(int) — ACC_SYNC-метод на 46 504
+     * байт байткода; его монитор занят 11.8 c — насос замерал на 12.5 c
+     * (mx=12540, tj=12521 в diag): мертвы таймеры, present, пауза,
+     * сторожевые таймеры. Теперь у насосного потока тот же trylock, что
+     * и у раннеров (v36.57): канва занята — ключ остаётся в очереди до
+     * следующего бита/кадра, насос продолжает тикать. */
+    if (!runner_trylock) {
+        JavaThread* pump_self = jvm_current_thread(jvm);
+        if (!pump_self || pump_self->id == 1) {
+            runner_trylock = 1;
+            /* v36.94 [KEY-BUDGET]: фронтенд-дренаж получает бюджет монитора
+             * (NOJME_KEY_BUDGET_MS, дефолт 1000). Игровой поток (VM-раннер)
+             * дренажирует БЕЗ бюджета — его блокировки это игровая логика.
+             * Поле v36.93: насос висел на at.h@197 (замок состояния ввода
+             * игры, НЕ канва) 22.5 c — теперь размотается за ≤1 c, ключ
+             * вернётся в очередь, фронтенд продолжит кадр. */
+            pump_budget = 1;
         }
     }
     while (midp_keyq_pop2(&code, &pressed, &pms)) {
@@ -2390,9 +2427,57 @@ void midp_process_pending_keys(JVM* jvm) {
                     (unsigned long long)((pms && now > pms) ? (now - pms) : 0));
         }
         if (pressed) {
+            if (pump_budget && s_key_budget_ms > 0) {
+                extern void jvm_paint_lock_arm(uint32_t budget_ms);
+                jvm_paint_lock_arm((uint32_t)s_key_budget_ms);
+            }
             midp_call_keyPressed_impl(jvm, code);
+            if (pump_budget && s_key_budget_ms > 0) {
+                extern void jvm_paint_lock_disarm(void);
+                jvm_paint_lock_disarm();
+            }
         } else {
+            if (pump_budget && s_key_budget_ms > 0) {
+                extern void jvm_paint_lock_arm(uint32_t budget_ms);
+                jvm_paint_lock_arm((uint32_t)s_key_budget_ms);
+            }
             midp_call_keyReleased_impl(jvm, code);
+            if (pump_budget && s_key_budget_ms > 0) {
+                extern void jvm_paint_lock_disarm(void);
+                jvm_paint_lock_disarm();
+            }
+        }
+        /* v36.94 [KEY-BUDGET]: упёрлись в бюджет — ключ в голову очереди,
+         * выход из цикла; фронтенд продолжает кадр, повтор на следующем бите.
+         * v36.96: печать только при истечении бюджета (см. twin выше). */
+        if (pump_budget && s_key_budget_ms > 0) {
+            extern int jvm_paint_lock_aborted(void);
+            if (jvm_paint_lock_aborted()) {
+                extern int jvm_paint_lock_budget_expired(void);
+                int budget_expired = jvm_paint_lock_budget_expired();
+                extern void jvm_paint_lock_reset(void);
+                jvm_paint_lock_reset();
+                midp_keyq_push_front(code, pressed, pms);
+                if (budget_expired) {
+                    static unsigned s_pk_budget_logs = 0;
+                    if (++s_pk_budget_logs <= 40 || (s_pk_budget_logs % 500) == 0) {
+                        LOG_SAFE("[KEY-BUDGET] pending-keys delivery exceeded %d ms on %s(%d) — requeued; frontend loop alive\n",
+                                 s_key_budget_ms,
+                                 pressed ? "press" : "release", code);
+                        extern void sw_trace_force(const char* fmt, ...)
+                            __attribute__((weak));
+                        if (&sw_trace_force && sw_trace_force) {
+                            sw_trace_force("[KEY-BUDGET] pending-keys delivery exceeded %d ms on %s(%d) — requeued; frontend loop alive",
+                                           s_key_budget_ms,
+                                           pressed ? "press" : "release", code);
+                        }
+                    }
+                }
+                if (runner_trylock && current_displayable_obj) {
+                    monitor_exit(jvm, (JavaObject*)current_displayable_obj);
+                }
+                return;
+            }
         }
         if (runner_trylock && current_displayable_obj) {
             monitor_exit(jvm, (JavaObject*)current_displayable_obj);
@@ -2455,10 +2540,68 @@ void midp_pump_deferred_keys(JVM* jvm) {
         DISP_DEBUG("[KEYQ] wall-clock net fired: head waited %llu ms", (unsigned long long)head_age_ms);
     }
 
+    /* v36.94 [KEY-BUDGET] (Metal Slug 6, лог v36.93: фриз 22.5 c):
+     * trylock КАНВЫ — недостаточен. Игры держат ВТОРОЙ замок состояния
+     * ввода (MS6: synchronized(поле at.a) внутри run() [605..700],
+     * arraycopy+слияние клавиш; keyReleased -> h(II) -> monenter
+     * at.h@196 на ТОТ ЖЕ объект). Гонка: канва свободна (t2 между
+     * вызовами bl) -> tryenter канвы успешен -> delivery входит в
+     * h(II) -> t2 заходит в свою key-sync секцию -> delivery висит на
+     * at.a 2.5-22.5 c (поле: MON-WAIT at.h@197 waited=22010). Теперь
+     * доставка клавиш НА ФРОНТЕНДЕ идёт с бюджетом монитора (тот же
+     * механизм, что PAINT-BUDGET v36.57): по истечении NOJME_KEY_BUDGET_MS
+     * (дефолт 1000) monitor_enter выходит с JNI_ERR, op_monitorenter
+     * бросает исключение, ключ РАЗМАТЫВАЕТСЯ чисто через Java-обработчики
+     * (v34.99 MONITOR-UNWIND; мониторы-владельцы освобождаются unwind-ом),
+     * ключ возвращается в ГОЛОВУ очереди для повторной попытки. Фронтенд
+     * замирает максимум на 1 c вместо 22.5. Ключ теряется только если
+     * игра молчит дольше бюджета КАЖДУЮ попытку — и то он остаётся в
+     * очереди и будет доставлен, когда игра оживёт. */
+    int key_budget_ms = -1;
+    {
+        static long s_key_budget = -2;
+        if (s_key_budget == -2) {
+            const char* e = getenv("NOJME_KEY_BUDGET_MS");
+            /* v36.96 [KEY-BUDGET-FAST]: дефолт 1000 -> 200. Полевой лог
+             * v36.95 (MS6): все 5 пауз были дедлоком «насос ждёт at.a /
+             * владелец ждёт фенс насоса» и жгли ВЕСЬ бюджет — пауза 1 c.
+             * v36.96 рвёт дедлок мгновенно ([FENCE-DEADLOCK-BREAK]), бюджет
+             * остаётся страховкой для прочих долгих удержаний: 200 мс =
+             * незаметный хиккап вместо секундного замирания; ключ не
+             * теряется (requeue + повтор). 0 = выкл. */
+            s_key_budget = (e && atol(e) >= 0) ? atol(e) : 200L;
+        }
+        key_budget_ms = (int)s_key_budget;
+    }
     int delivered = 0;
     int code, pressed;
     uint64_t pms;
+    /* v36.93 [KEY-TRYLOCK-PUMP]: фоллбек-насос исполняет Java на ФРЕЙМ-
+     * потоке. Раньше он доставлял ключ без попытки захвата монитора
+     * канвы — и если игровой поток находился внутри длинной
+     * synchronized-секции (Metal Slug 6: at.bl(int), ACC_SYNC, 46 504
+     * байта байткода, монитор занят 11.8 c), фрейм-поток замерал на
+     * monenter на всё это время (diag mx=12540 = «фриз 12.5 c»).
+     * Теперь: монитор свободен/реентерабельно наш — доставляем (владение
+     * держим на весь вызов, как и v36.57-раннер); занят — ключ
+     * возвращается в голову очереди, кадр продолжается, доставит
+     * игровой дренаж или следующий кадр. */
+    int trylock_held = 0;
     while (midp_keyq_pop2(&code, &pressed, &pms)) {
+        if (current_displayable_obj) {
+            if (monitor_tryenter(jvm, (JavaObject*)current_displayable_obj) != JNI_OK) {
+                midp_keyq_push_front(code, pressed, pms);
+                {
+                    static unsigned s_pump_skip_logs = 0;
+                    if (++s_pump_skip_logs <= 40 || (s_pump_skip_logs % 500) == 0) {
+                        KEYQ_TRACE("[KEYQ-TRYLOCK] canvas busy — fallback pump defers key %d (frame %d)",
+                                   code, now);
+                    }
+                }
+                break;
+            }
+            trylock_held = 1;
+        }
         delivered++;
         /* [YSFIX] field trace: soft key reached the fallback pump.
          * [YSFIX2] v36.40: + sw_trace (device log; stderr kept for host). */
@@ -2472,9 +2615,66 @@ void midp_pump_deferred_keys(JVM* jvm) {
                     (unsigned long long)((pms && now > pms) ? (now - pms) : 0));
         }
         if (pressed) {
+            if (key_budget_ms > 0) {
+                extern void jvm_paint_lock_arm(uint32_t budget_ms);
+                jvm_paint_lock_arm((uint32_t)key_budget_ms);
+            }
             midp_call_keyPressed_impl(jvm, code);
+            if (key_budget_ms > 0) {
+                extern void jvm_paint_lock_disarm(void);
+                jvm_paint_lock_disarm();
+            }
         } else {
+            if (key_budget_ms > 0) {
+                extern void jvm_paint_lock_arm(uint32_t budget_ms);
+                jvm_paint_lock_arm((uint32_t)key_budget_ms);
+            }
             midp_call_keyReleased_impl(jvm, code);
+            if (key_budget_ms > 0) {
+                extern void jvm_paint_lock_disarm(void);
+                jvm_paint_lock_disarm();
+            }
+        }
+        /* v36.94 [KEY-BUDGET]: доставка упёрлась в бюджет монитора —
+         * исключение размотало Java-обработчик, ключ возвращаем в голову
+         * очереди (повтор на следующем кадре/бите), кадр продолжается.
+         * v36.96: [KEY-BUDGET "exceeded"] печатаем ТОЛЬКО при истечении
+         * бюджета (jvm_paint_lock_budget_expired); разрыв дедлока
+         * ([FENCE-DEADLOCK], ожидание было короче) логируется своим
+         * тегом в threads.c. */
+        {
+            extern int jvm_paint_lock_aborted(void);
+            if (key_budget_ms > 0 && jvm_paint_lock_aborted()) {
+                extern int jvm_paint_lock_budget_expired(void);
+                int budget_expired = jvm_paint_lock_budget_expired();
+                extern void jvm_paint_lock_reset(void);
+                jvm_paint_lock_reset();
+                midp_keyq_push_front(code, pressed, pms);
+                if (budget_expired) {
+                    static unsigned s_key_budget_logs = 0;
+                    if (++s_key_budget_logs <= 40 || (s_key_budget_logs % 500) == 0) {
+                        LOG_SAFE("[KEY-BUDGET] key delivery exceeded %d ms on %s(%d) — requeued (game holds its input lock); frontend loop alive\n",
+                                 key_budget_ms,
+                                 pressed ? "press" : "release", code);
+                        extern void sw_trace_force(const char* fmt, ...)
+                            __attribute__((weak));
+                        if (&sw_trace_force && sw_trace_force) {
+                            sw_trace_force("[KEY-BUDGET] key delivery exceeded %d ms on %s(%d) — requeued (game holds its input lock); frontend loop alive",
+                                           key_budget_ms,
+                                           pressed ? "press" : "release", code);
+                        }
+                    }
+                }
+                if (trylock_held) {
+                    monitor_exit(jvm, (JavaObject*)current_displayable_obj);
+                    trylock_held = 0;
+                }
+                break;
+            }
+        }
+        if (trylock_held) {
+            monitor_exit(jvm, (JavaObject*)current_displayable_obj);
+            trylock_held = 0;
         }
         /* Stop when a keyPressed switched us into a canvas whose game loop
          * should serialize the rest (or the queue emptied - the pop checks). */
@@ -4309,6 +4509,12 @@ static JavaValue native_canvas_serviceRepaints(JVM* jvm, JavaThread* thread,
                    (g_midp_paint_done_seq == done_at_entry || g_paint_pending)) {
                 if (deadline_guard >= 250) break;  /* frontend not pumping */
                 deadline_guard += 2;
+                /* v36.97 [VM-PERF]: раннер ждёт насос внутри serviceRepaints —
+                 * копим handshake-время (take-and-reset читает diag-строка). */
+                {
+                    extern volatile uint32_t g_perf_srep_ms_acc;
+                    __sync_fetch_and_add(&g_perf_srep_ms_acc, 2u);
+                }
                 {
                     extern volatile int g_gc_safepoint_request;
                     if (g_gc_safepoint_request) {
@@ -10001,6 +10207,111 @@ static JavaValue native_font_getFont(JVM* jvm, JavaThread* thread,
  * Initialize native methods
  */
 
+/* ============================================================================
+ * v36.100 [GFX-PERF]: timed wrappers around the per-frame graphics natives.
+ * The registration tables below bind THESE (not the raw implementations), so
+ * every early-return inside a native is still counted exactly once — the
+ * wall-time pair lives in the wrapper, one frame of accounting per call.
+ * See include/gfxperf.h for the counter semantics; the 5-s diag prints them
+ * as [GFX-PERF]. Always on (Switch cannot pass env flags — field report).
+ * ==========================================================================*/
+#include "gfxperf.h"
+
+/* defined below the registration tables (v36.100 wrapper order) */
+static JavaValue native_graphics_drawRGB(JVM* jvm, JavaThread* thread,
+                                         JavaValue* args, int arg_count);
+
+static JavaValue gfxp_wrap_drawImage(JVM* j, JavaThread* t, JavaValue* a, int n) {
+    uint64_t t0 = gfxp_begin();
+    JavaValue r = native_graphics_drawImage(j, t, a, n);
+    gfxp_end(GFXP_DI, t0);
+    return r;
+}
+static JavaValue gfxp_wrap_drawImage_anchor(JVM* j, JavaThread* t, JavaValue* a, int n) {
+    uint64_t t0 = gfxp_begin();
+    JavaValue r = native_graphics_drawImage_anchor(j, t, a, n);
+    gfxp_end(GFXP_DI, t0);
+    return r;
+}
+static JavaValue gfxp_wrap_drawRegion(JVM* j, JavaThread* t, JavaValue* a, int n) {
+    uint64_t t0 = gfxp_begin();
+    JavaValue r = native_graphics_drawRegion(j, t, a, n);
+    gfxp_end(GFXP_DR, t0);
+    /* transform is arg 6 (this, img, x_src, y_src, w, h, transform, ...):
+     * 4..7 = the general rot90/270 per-pixel path in midp_graphics_draw_region */
+    if (n >= 7 && a[6].i >= 4 && a[6].i <= 7) gfxp_count(GFXP_DR_ROT);
+    return r;
+}
+static JavaValue gfxp_wrap_drawRGB(JVM* j, JavaThread* t, JavaValue* a, int n) {
+    uint64_t t0 = gfxp_begin();
+    JavaValue r = native_graphics_drawRGB(j, t, a, n);
+    /* id semantics mirror the render.c [DRAWRGB-SCR-SPAN] path split:
+     * DRAS = fast SIMD span (screen gfx, or an all-opaque image gfx —
+     * midp_image_all_opaque lazily resolves the scan, exactly like the
+     * render.c check), DRAI = exact Porter-Duff scalar (image with
+     * transparency). */
+    int id = GFXP_DRO;
+    if (n >= 9 && a[8].i) {
+        JavaObject* gfx_obj = (JavaObject*)a[0].ref;
+        MidpGraphics* gfx = gfx_obj ? get_graphics_from_object(gfx_obj) : NULL;
+        id = GFXP_DRAI;
+        if (gfx && (!gfx->owner_image || midp_image_all_opaque(gfx->owner_image)))
+            id = GFXP_DRAS;
+    }
+    gfxp_end(id, t0);
+    return r;
+}
+static JavaValue gfxp_wrap_getRGB(JVM* j, JavaThread* t, JavaValue* a, int n) {
+    uint64_t t0 = gfxp_begin();
+    JavaValue r = native_image_getRGB(j, t, a, n);
+    gfxp_end(GFXP_GR, t0);
+    return r;
+}
+static JavaValue gfxp_wrap_createRGBImage(JVM* j, JavaThread* t, JavaValue* a, int n) {
+    uint64_t t0 = gfxp_begin();
+    JavaValue r = native_image_createRGBImage(j, t, a, n);
+    gfxp_end(GFXP_CRGB, t0);
+    return r;
+}
+static JavaValue gfxp_wrap_createImage(JVM* j, JavaThread* t, JavaValue* a, int n) {
+    uint64_t t0 = gfxp_begin();
+    JavaValue r = native_image_createImage(j, t, a, n);
+    gfxp_end(GFXP_CI, t0);
+    return r;
+}
+static JavaValue gfxp_wrap_flushGraphics(JVM* j, JavaThread* t, JavaValue* a, int n) {
+    uint64_t t0 = gfxp_begin();
+    JavaValue r = native_gamecanvas_flushGraphics(j, t, a, n);
+    gfxp_end(GFXP_FL, t0);
+    return r;
+}
+static JavaValue gfxp_wrap_flushGraphicsRegion(JVM* j, JavaThread* t, JavaValue* a, int n) {
+    uint64_t t0 = gfxp_begin();
+    JavaValue r = native_gamecanvas_flushGraphicsRegion(j, t, a, n);
+    gfxp_end(GFXP_FL, t0);
+    return r;
+}
+#define GFXP_WRAP_PRIM(name, fn) \
+    static JavaValue name(JVM* j, JavaThread* t, JavaValue* a, int n) { \
+        uint64_t t0 = gfxp_begin(); \
+        JavaValue r = fn(j, t, a, n); \
+        gfxp_end(GFXP_PRIM, t0); \
+        return r; \
+    }
+GFXP_WRAP_PRIM(gfxp_wrap_fillRect,        native_graphics_fillRect)
+GFXP_WRAP_PRIM(gfxp_wrap_drawRect,        native_graphics_drawRect)
+GFXP_WRAP_PRIM(gfxp_wrap_drawLine,        native_graphics_drawLine)
+GFXP_WRAP_PRIM(gfxp_wrap_fillTriangle,    native_graphics_fillTriangle)
+GFXP_WRAP_PRIM(gfxp_wrap_drawString,      native_graphics_drawString)
+GFXP_WRAP_PRIM(gfxp_wrap_drawChars,       native_graphics_drawChars)
+GFXP_WRAP_PRIM(gfxp_wrap_drawSubstring,   native_graphics_drawSubstring)
+GFXP_WRAP_PRIM(gfxp_wrap_drawChar,        native_graphics_drawChar)
+GFXP_WRAP_PRIM(gfxp_wrap_fillRoundRect,   native_graphics_fillRoundRect)
+GFXP_WRAP_PRIM(gfxp_wrap_drawRoundRect,   native_graphics_drawRoundRect)
+GFXP_WRAP_PRIM(gfxp_wrap_fillArc,         native_graphics_fillArc)
+GFXP_WRAP_PRIM(gfxp_wrap_drawArc,         native_graphics_drawArc)
+GFXP_WRAP_PRIM(gfxp_wrap_copyArea,        native_graphics_copyArea)
+
 void init_javax_microedition_lcdui_display(JVM* jvm) {
     NativeMethodEntry methods[] = {
         {"javax/microedition/lcdui/Display", "getDisplay", "(Ljavax/microedition/midlet/MIDlet;)Ljavax/microedition/lcdui/Display;", native_display_getDisplay},
@@ -10051,8 +10362,8 @@ void init_javax_microedition_lcdui_game_gamecanvas(JVM* jvm) {
         {"javax/microedition/lcdui/game/GameCanvas", "getKeyStates", "()I", native_gamecanvas_getKeyStates},
         {"javax/microedition/lcdui/game/GameCanvas", "suppressKeyEvents", "(Z)V", native_gamecanvas_suppressKeyEvents},
         {"javax/microedition/lcdui/game/GameCanvas", "getGraphics", "()Ljavax/microedition/lcdui/Graphics;", native_gamecanvas_getGraphics},
-        {"javax/microedition/lcdui/game/GameCanvas", "flushGraphics", "()V", native_gamecanvas_flushGraphics},
-        {"javax/microedition/lcdui/game/GameCanvas", "flushGraphics", "(IIII)V", native_gamecanvas_flushGraphicsRegion},
+        {"javax/microedition/lcdui/game/GameCanvas", "flushGraphics", "()V", gfxp_wrap_flushGraphics},
+        {"javax/microedition/lcdui/game/GameCanvas", "flushGraphics", "(IIII)V", gfxp_wrap_flushGraphicsRegion},
         
         /* Sprite constructors */
         {"javax/microedition/lcdui/game/Sprite", "<init>", "(Ljavax/microedition/lcdui/Image;)V", native_sprite_init_image},
@@ -10129,14 +10440,14 @@ void init_javax_microedition_lcdui_game_gamecanvas(JVM* jvm) {
 
 void init_javax_microedition_lcdui_image(JVM* jvm) {
     NativeMethodEntry methods[] = {
-        {"javax/microedition/lcdui/Image", "createImage", "(II)Ljavax/microedition/lcdui/Image;", native_image_createImage},
+        {"javax/microedition/lcdui/Image", "createImage", "(II)Ljavax/microedition/lcdui/Image;", gfxp_wrap_createImage},
         {"javax/microedition/lcdui/Image", "createImage", "(Ljava/lang/String;)Ljavax/microedition/lcdui/Image;", native_image_createImage_from_string},
         {"javax/microedition/lcdui/Image", "createImage", "([BII)Ljavax/microedition/lcdui/Image;", native_image_createImage_from_bytes},
         /* CRITICAL: createImage with transform and from Image source */
         {"javax/microedition/lcdui/Image", "createImage", "(Ljavax/microedition/lcdui/Image;IIIII)Ljavax/microedition/lcdui/Image;", native_image_createImage_region},
         {"javax/microedition/lcdui/Image", "createImage", "(Ljavax/microedition/lcdui/Image;)Ljavax/microedition/lcdui/Image;", native_image_createImage_copy},
         {"javax/microedition/lcdui/Image", "createImage", "(Ljava/io/InputStream;)Ljavax/microedition/lcdui/Image;", native_image_createImage_stream},
-        {"javax/microedition/lcdui/Image", "createRGBImage", "([IIIZ)Ljavax/microedition/lcdui/Image;", native_image_createRGBImage},
+        {"javax/microedition/lcdui/Image", "createRGBImage", "([IIIZ)Ljavax/microedition/lcdui/Image;", gfxp_wrap_createRGBImage},
         {"javax/microedition/lcdui/Image", "getWidth", "()I", native_image_getWidth},
         {"javax/microedition/lcdui/Image", "getHeight", "()I", native_image_getHeight},
         {"javax/microedition/lcdui/Image", "isMutable", "()Z", native_image_isMutable},
@@ -10144,8 +10455,8 @@ void init_javax_microedition_lcdui_image(JVM* jvm) {
          * scanlength, x, y, width, height) is 7 params. The mismatch made
          * every getRGB call resolve to a do-nothing stub (silently zero
          * data), breaking all pixel probing in games. */
-        {"javax/microedition/lcdui/Image", "getRGB", "([IIIIIII)V", native_image_getRGB},
-        {"javax/microedition/lcdui/Image", "getRGB", "([IIIIII)V", native_image_getRGB},
+        {"javax/microedition/lcdui/Image", "getRGB", "([IIIIIII)V", gfxp_wrap_getRGB},
+        {"javax/microedition/lcdui/Image", "getRGB", "([IIIIII)V", gfxp_wrap_getRGB},
         {"javax/microedition/lcdui/Image", "getGraphics", "()Ljavax/microedition/lcdui/Graphics;", native_image_getGraphics},
     };
     native_register_methods(jvm, methods, sizeof(methods) / sizeof(methods[0]));
@@ -10298,31 +10609,31 @@ void init_javax_microedition_lcdui_graphics(JVM* jvm) {
         {"javax/microedition/lcdui/Graphics", "setColor", "(III)V", native_graphics_setColorRGB},
         {"javax/microedition/lcdui/Graphics", "getColor", "()I", native_graphics_getColor},
         {"javax/microedition/lcdui/Graphics", "setFont", "(Ljavax/microedition/lcdui/Font;)V", native_graphics_setFont},
-        {"javax/microedition/lcdui/Graphics", "drawLine", "(IIII)V", native_graphics_drawLine},
-        {"javax/microedition/lcdui/Graphics", "fillRect", "(IIII)V", native_graphics_fillRect},
-        {"javax/microedition/lcdui/Graphics", "drawRect", "(IIII)V", native_graphics_drawRect},
-        {"javax/microedition/lcdui/Graphics", "fillRoundRect", "(IIIIII)V", native_graphics_fillRoundRect},
-        {"javax/microedition/lcdui/Graphics", "drawRoundRect", "(IIIIII)V", native_graphics_drawRoundRect},
-        {"javax/microedition/lcdui/Graphics", "fillArc", "(IIIIII)V", native_graphics_fillArc},
-        {"javax/microedition/lcdui/Graphics", "drawArc", "(IIIIII)V", native_graphics_drawArc},
-        {"javax/microedition/lcdui/Graphics", "drawString", "(Ljava/lang/String;III)V", native_graphics_drawString},
+        {"javax/microedition/lcdui/Graphics", "drawLine", "(IIII)V", gfxp_wrap_drawLine},
+        {"javax/microedition/lcdui/Graphics", "fillRect", "(IIII)V", gfxp_wrap_fillRect},
+        {"javax/microedition/lcdui/Graphics", "drawRect", "(IIII)V", gfxp_wrap_drawRect},
+        {"javax/microedition/lcdui/Graphics", "fillRoundRect", "(IIIIII)V", gfxp_wrap_fillRoundRect},
+        {"javax/microedition/lcdui/Graphics", "drawRoundRect", "(IIIIII)V", gfxp_wrap_drawRoundRect},
+        {"javax/microedition/lcdui/Graphics", "fillArc", "(IIIIII)V", gfxp_wrap_fillArc},
+        {"javax/microedition/lcdui/Graphics", "drawArc", "(IIIIII)V", gfxp_wrap_drawArc},
+        {"javax/microedition/lcdui/Graphics", "drawString", "(Ljava/lang/String;III)V", gfxp_wrap_drawString},
         /* v34.8 FIX (Bounce Tales): рисование текста частями строки */
-        {"javax/microedition/lcdui/Graphics", "drawSubstring", "(Ljava/lang/String;IIIII)V", native_graphics_drawSubstring},
+        {"javax/microedition/lcdui/Graphics", "drawSubstring", "(Ljava/lang/String;IIIII)V", gfxp_wrap_drawSubstring},
         /* v35: API-completeness */
-        {"javax/microedition/lcdui/Graphics", "drawChar", "(III)V", native_graphics_drawChar},
-        {"javax/microedition/lcdui/Graphics", "drawChars", "([CIIIII)V", native_graphics_drawChars},
+        {"javax/microedition/lcdui/Graphics", "drawChar", "(III)V", gfxp_wrap_drawChar},
+        {"javax/microedition/lcdui/Graphics", "drawChars", "([CIIIII)V", gfxp_wrap_drawChars},
         {"javax/microedition/lcdui/Graphics", "getFont", "()Ljavax/microedition/lcdui/Font;", native_graphics_getFont},
         {"javax/microedition/lcdui/Graphics", "getRedComponent", "()I", native_graphics_getRedComponent},
         {"javax/microedition/lcdui/Graphics", "getGreenComponent", "()I", native_graphics_getGreenComponent},
         {"javax/microedition/lcdui/Graphics", "getBlueComponent", "()I", native_graphics_getBlueComponent},
         /* v34.8 FIX (Bounce Tales): заливка треугольника */
-        {"javax/microedition/lcdui/Graphics", "fillTriangle", "(IIIIII)V", native_graphics_fillTriangle},
-        {"javax/microedition/lcdui/Graphics", "drawImage", "(Ljavax/microedition/lcdui/Image;III)V", native_graphics_drawImage},
+        {"javax/microedition/lcdui/Graphics", "fillTriangle", "(IIIIII)V", gfxp_wrap_fillTriangle},
+        {"javax/microedition/lcdui/Graphics", "drawImage", "(Ljavax/microedition/lcdui/Image;III)V", gfxp_wrap_drawImage},
         /* CRITICAL: drawRegion - used by most games for sprite rendering */
-        {"javax/microedition/lcdui/Graphics", "drawRegion", "(Ljavax/microedition/lcdui/Image;IIIIIIII)V", native_graphics_drawRegion},
+        {"javax/microedition/lcdui/Graphics", "drawRegion", "(Ljavax/microedition/lcdui/Image;IIIIIIII)V", gfxp_wrap_drawRegion},
         /* Additional drawing methods */
-        {"javax/microedition/lcdui/Graphics", "drawImage", "(Ljavax/microedition/lcdui/Image;IIII)V", native_graphics_drawImage_anchor},
-        {"javax/microedition/lcdui/Graphics", "copyArea", "(IIIIIII)V", native_graphics_copyArea},
+        {"javax/microedition/lcdui/Graphics", "drawImage", "(Ljavax/microedition/lcdui/Image;IIII)V", gfxp_wrap_drawImage_anchor},
+        {"javax/microedition/lcdui/Graphics", "copyArea", "(IIIIIII)V", gfxp_wrap_copyArea},
         /* Clip methods */
         {"javax/microedition/lcdui/Graphics", "setClip", "(IIII)V", native_graphics_setClip},
         {"javax/microedition/lcdui/Graphics", "clipRect", "(IIII)V", native_graphics_clipRect},
@@ -10353,7 +10664,7 @@ void init_javax_microedition_lcdui_graphics(JVM* jvm) {
          * call silently fell into the stub no-op path and Doom RPG's 3D
          * viewport (raycaster -> drawRGB -> flushGraphics) never rendered -
          * the loading screen stayed on screen forever. */
-        {"javax/microedition/lcdui/Graphics", "drawRGB", "([IIIIIIIZ)V", native_graphics_drawRGB},
+        {"javax/microedition/lcdui/Graphics", "drawRGB", "([IIIIIIIZ)V", gfxp_wrap_drawRGB},
     };
     native_register_methods(jvm, methods, sizeof(methods) / sizeof(methods[0]));
 }

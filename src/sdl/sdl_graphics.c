@@ -3382,31 +3382,37 @@ static int sdl_dir_mask_rot(int mask) {
 }
 
 /* 9-зонная маска -> ITU-T цифра кейпада (0 = центр/мусор). Прямые зоны —
- * те же цифры, что шлёт ортогональная пара; диагонали — [STICK-DIAG]
- * v36.87: UP|LEFT='7', UP|RIGHT='9', DOWN|LEFT='1', DOWN|RIGHT='3'
- * (как на реальном телефоне: диагональ = ОДНА клавиша). */
+ * те же цифры, что шлёт ортогональная пара; диагонали — v37.00 [KEYUI]
+ * (восстановлено в v37.01 по полевому запросу): UP|LEFT='1',
+ * UP|RIGHT='3', DOWN|LEFT='7', DOWN|RIGHT='9' — ВЕРТИКАЛЬНЫЙ СВАП
+ * раскладки v36.87 (тогда 1/3 были СНИЗУ, 7/9 СВЕРХУ; запрос: «перенеси
+ * кнопки 1 и 3 с нижней части стика в верхнюю вместо 7 и 9, которые
+ * должны быть снизу»). Сетка теперь совпадает с телефоном:
+ * 1 — лево-ВЕРХ, 3 — право-ВЕРХ, 7 — лево-НИЗ, 9 — право-НИЗ. */
 static SDL_Keycode sdl_dir_zone_digit(int mask) {
     switch (mask) {
         case 1:  return SDLK_2;  /* UP */
         case 2:  return SDLK_8;  /* DOWN */
         case 4:  return SDLK_4;  /* LEFT */
         case 8:  return SDLK_6;  /* RIGHT */
-        case 5:  return SDLK_7;  /* UP|LEFT */
-        case 9:  return SDLK_9;  /* UP|RIGHT */
-        case 6:  return SDLK_1;  /* DOWN|LEFT */
-        case 10: return SDLK_3;  /* DOWN|RIGHT */
+        case 5:  return SDLK_1;  /* UP|LEFT */
+        case 9:  return SDLK_3;  /* UP|RIGHT */
+        case 6:  return SDLK_7;  /* DOWN|LEFT */
+        case 10: return SDLK_9;  /* DOWN|RIGHT */
         default: return 0;
     }
 }
 
 /* Только диагональная цифра маски (0 = не диагональ) — «пятая виртуальная
- * клавиша» режима BOTH: edges лишь при входе/выходе из диагональной зоны. */
+ * клавиша» режима BOTH: edges лишь при входе/выходе из диагональной зоны.
+ * v37.00 [KEYUI]: тот же вертикальный свап, что и у зон (1/3 — верх,
+ * 7/9 — низ). */
 static SDL_Keycode sdl_dir_diag_digit(int mask) {
     switch (mask) {
-        case 5:  return SDLK_7;
-        case 9:  return SDLK_9;
-        case 6:  return SDLK_1;
-        case 10: return SDLK_3;
+        case 5:  return SDLK_1;
+        case 9:  return SDLK_3;
+        case 6:  return SDLK_7;
+        case 10: return SDLK_9;
         default: return 0;
     }
 }
@@ -3478,6 +3484,52 @@ static void sdl_switch_dir_dispatch(SdlContext* ctx, int slot) {
         if (kd && kd != pd)
             sdl_diag_dispatch_edge(ctx, kd, true, "diag");
     }
+}
+
+/* ======================= v37.00 [RMS-WAIT] (restored v37.01) ======================= */
+/* Сообщение на время дисковых записей RMS при ручном выходе из игры.
+ * Полевой запрос: «если приложение при ручном завершении пишет RMS и
+ * из-за этого приходится ждать закрытия, то добавь в центре черную
+ * надпись в белом прямоугольнике "ожидается завершение сохранения"
+ * (и английскую версию если язык выбран английский)».
+ * Рисуется ОДИН кадр в ui-канву и сразу выдаётся (тот же путь, что у
+ * sw_trace_flush): destroyApp/teardown, которые тянут записи на SD
+ * (100-800 мс на стор), не трогают ui-канву — надпись висит до
+ * следующей отрисовки (меню фронтенда после teardown). Язык — текущий
+ * UI (MINUS переключает, бейдж ru/en в углу), строка ST_SAVE_WAIT.
+ * Вызывается ТОЛЬКО когда есть что писать (midp_rms_exit_writes_pending
+ * > 0: стор открыт либо dirty) — пустых вспышек у игр без RMS нет. */
+void sdl_switch_save_wait_notice(void) {
+    uint32_t* cv = sdl_switch_ui_canvas();
+    if (!cv) return;
+    const char* txt = switch_text(ST_SAVE_WAIT);
+    int scale = 2;
+    int tw = switch_font_text_width(txt, scale);
+    if (tw <= 0) return; /* нет шрифта/текста — не молчать в логе всё равно */
+    if (tw > SWITCH_UI_WIDTH - 96) { /* длинная строка не влезла — мельче */
+        scale = 1;
+        tw = switch_font_text_width(txt, scale);
+    }
+    const int glyph_h = 16 * scale; /* базовый глиф 8x16 (см. switch_font) */
+    const int pad_x = 48, pad_y = 28;
+    const int box_w = tw + pad_x * 2;
+    const int box_h = glyph_h + pad_y * 2;
+    const int x0 = (SWITCH_UI_WIDTH - box_w) / 2;
+    const int y0 = (SWITCH_UI_HEIGHT - box_h) / 2;
+
+    /* фон — чёрный (последний кадр игры/меню не просвечивает), в центре
+     * БЕЛЫЙ прямоугольник с ЧЁРНОЙ надписью — ровно как просил пользователь */
+    const int n = SWITCH_UI_WIDTH * SWITCH_UI_HEIGHT;
+    for (int i = 0; i < n; i++) cv[i] = 0xFF000000u;
+    for (int yy = y0; yy < y0 + box_h; yy++) {
+        if (yy < 0 || yy >= SWITCH_UI_HEIGHT) continue;
+        uint32_t* row = cv + (size_t)yy * (size_t)SWITCH_UI_WIDTH + x0;
+        for (int xx = 0; xx < box_w; xx++) row[xx] = 0xFFFFFFFFu;
+    }
+    switch_font_draw_text(cv, SWITCH_UI_WIDTH, SWITCH_UI_HEIGHT,
+                          x0 + pad_x, y0 + pad_y, txt, 0xFF000000u, 0, scale);
+    sdl_switch_ui_present();
+    sw_trace_force("[RMS-WAIT] notice shown (RMS writes pending on exit)");
 }
 
 /* ======================= in-game pause menu ======================= */
@@ -3940,6 +3992,15 @@ static void sdl_switch_pause_menu(SdlContext* ctx) {
         {
             extern void jvm_frontend_pause_end(void);
             jvm_frontend_pause_end();
+        }
+        /* v37.00 [RMS-WAIT] (restored v37.01): игра сейчас допишет и
+         * закроет свои сторы в destroyApp (диск: 100-800 мс на стор) —
+         * если писать есть что, в центре экрана появляется белая плашка
+         * «ожидается завершение сохранения» (язык — текущий UI). */
+        {
+            extern int midp_rms_exit_writes_pending(void);
+            if (midp_rms_exit_writes_pending() > 0)
+                sdl_switch_save_wait_notice();
         }
         if (ctx->jvm) midlet_call_destroy_app(ctx->jvm, true);
         ctx->running = false;
@@ -4501,6 +4562,13 @@ void sdl_process_events(SdlContext* ctx) {
         }
     }
     if (g_sw_in.quit) {
+        /* v37.00 [RMS-WAIT] (restored v37.01): HOME посреди игры — тот же
+         * ручной выход: перед destroyApp (RMS-записи) показать плашку. */
+        {
+            extern int midp_rms_exit_writes_pending(void);
+            if (midp_rms_exit_writes_pending() > 0)
+                sdl_switch_save_wait_notice();
+        }
         if (ctx->jvm) midlet_call_destroy_app(ctx->jvm, true);
         ctx->running = false;
         if (ctx->jvm) ctx->jvm->running = false;

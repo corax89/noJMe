@@ -123,6 +123,9 @@ void thread_destroy(JVM* jvm, JavaThread* thread);
 int monitor_enter(JVM* jvm, JavaObject* obj);
 int monitor_tryenter(JVM* jvm, JavaObject* obj);  /* v36.57 [KEY-TRYLOCK] */
 int monitor_exit(JVM* jvm, JavaObject* obj);
+/* v36.91 [MON-EXIT-FREE]: monitorexit robustness helpers — see threads.c */
+int  monitor_is_free(JavaObject* obj);
+void monitor_force_release(JavaObject* obj);
 int monitor_wait(JVM* jvm, JavaObject* obj, jlong timeout, bool timed);
 int monitor_notify(JVM* jvm, JavaObject* obj);
 int monitor_notify_all(JVM* jvm, JavaObject* obj);

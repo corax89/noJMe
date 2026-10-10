@@ -1,6 +1,30 @@
 /*
- * J2ME Emulator - MIDI Synthesizer Implementation
- * FM synthesis-based MIDI player
+ * NOJME - MIDI subsystem (Sonivox backend, v36.89)
+ *
+ * This file replaces the old FM-synthesis engine with the open-source
+ * Sonivox/EAS synthesizer from AOSP. Quality is dramatically better
+ * (sample-based GM bank + DLS support + Schroeder reverb) while the
+ * public API in midi.h stays byte-for-byte compatible with media.c.
+ *
+ * Architecture:
+ *   midi_load()        -> EAS_Init + EAS_OpenFile(memory locator) +
+ *                         EAS_Prepare + EAS_ParseMetaData
+ *   midi_load_empty()  -> EAS_Init + EAS_OpenMIDIStream (for tone/MIDIControl)
+ *   midi_play()        -> EAS_Resume
+ *   midi_stop()        -> EAS_Pause  + sets playing=false, end_reached=true
+ *   midi_generate_samples() -> EAS_Render (loop, drains src_buf first)
+ *   midi_advance_time()    -> no-op (Sonivox advances inside EAS_Render)
+ *   midi_note_on/off/CC/PC (_file) -> EAS_WriteMIDIStream (raw MIDI bytes)
+ *   midi_set_position_ms() -> EAS_Locate
+ *   midi_set_volume()      -> EAS_SetVolume (0..100)
+ *   midi_get_duration_ms() -> cached from EAS_ParseMetaData
+ *   midi_get_position_ms() -> maintained manually (sample clock)
+ *
+ * The internal sequencer struct (MidiSequencer) keeps the reverb/chorus
+ * buffers from the old FM design so the layout matches media.c — those
+ * buffers are unused now (Sonivox has its own reverb).
+ *
+ * Apache 2.0 for the Sonivox-derived parts; same NOJME license otherwise.
  */
 
 #ifndef _WIN32
@@ -13,1605 +37,1078 @@
 #include <math.h>
 
 #include "midi.h"
-#include "debug_macros.h" /* v36.28: MEDIA_DEBUG midi_load fingerprint */
+#include "debug_macros.h" /* MEDIA_DEBUG macro */
 
-/* Math constants */
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
+/* v36.90 [MIDI-PERF]: internal AOSP API for runtime synth parameters.
+ * PARSER_DATA_POLYPHONY lives in the E_PARSER_DATA enum (lib_src/eas_parser.h)
+ * — the header is on the include path, pulling it in is safer than
+ * hardcoding the enum position. EAS_IntSetStrmParam itself is defined in
+ * lib_src/eas_public.c but was never declared in a public header. */
+#include "eas_parser.h"
+EAS_RESULT EAS_IntSetStrmParam (EAS_DATA_HANDLE pEASData, EAS_HANDLE pStream,
+                                EAS_INT param, EAS_I32 value);
+
+/* v36.90 [MIDI-PERF]: runtime synth performance gates (defined in
+ * eas_host_nojme.c; read by eas_wtengine.c / eas_mixer.c).
+ * 0 = fast defaults (no per-voice filter, dry mix). */
+extern int g_nojme_voice_filter;
+extern int g_nojme_reverb;
+
+/* v36.89 [SONIVOX-DIAG]: trace of what Sonivox is doing.
+ *
+ * v36.90 [MIDI-PERF] GATE: the trace used to be UNCONDITIONAL. That is
+ * acceptable on Switch (sw_trace is gated by the logging toggle there),
+ * but on desktop/host builds it fprintf+fflush'd from the audio thread
+ * (from under g_audio_mutex, inside the mix loop) and on Switch with
+ * logging=on it did open(O_APPEND)+write+close SD I/O twice a second
+ * while holding the audio mutex. Now it is gated by NOJME_SONIVOX_TRACE=1
+ * (env) or the existing logging gate, resolved once at first use. The
+ * per-100-calls peak scan runs only when the trace is enabled.
+ */
+static int sonivox_trace_enabled(void) {
+    static int s_enabled = -1;
+    if (s_enabled < 0) {
+        const char* e = getenv("NOJME_SONIVOX_TRACE");
+        s_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return s_enabled;
+}
+
+#if defined(__SWITCH__) || defined(NOJME_SWITCH_TRACE)
+#include "switch/switch_trace.h"
+#define SONIVOX_TRACE(fmt, ...)  do { \
+    if (sonivox_trace_enabled()) sw_trace("[SONIVOX] " fmt, ##__VA_ARGS__); \
+} while (0)
+#else
+#include <stdio.h>
+#define SONIVOX_TRACE(fmt, ...)  do { \
+    if (sonivox_trace_enabled()) { \
+        fprintf(stderr, "[SONIVOX] " fmt "\n", ##__VA_ARGS__); \
+        fflush(stderr); \
+    } \
+} while (0)
 #endif
 
-/* Maximum polyphony */
-#define MAX_POLYPHONY 32
+/* Sonivox public API */
+#include "eas.h"
+#include "eas_types.h"
 
-/* Default tempo (120 BPM) */
-#define DEFAULT_TEMPO 500000  /* microseconds per beat */
-#define DEFAULT_TICKS_PER_BEAT 480
+/* ------------------------------------------------------------------
+ * Memory-backed EAS_FILE_LOCATOR: wraps the SMF bytes already in
+ * memory (MidiFile->data / size) into a callback struct Sonivox can
+ * pull from. Each MidiFile owns one of these.
+ * ------------------------------------------------------------------ */
+typedef struct {
+    void  *handle;            /* pointer back to MidiFile->data */
+    int  (*readAt)(void *handle, void *buf, int offset, int size);
+    int  (*size)(void *handle);
+} nojme_eas_locator;
 
-/* Global state */
+/* readAt callback: copy from the MIDI byte buffer at offset */
+static int nojme_loc_readAt(void *handle, void *buf, int offset, int size) {
+    const uint8_t *data = (const uint8_t *) handle;
+    /* size/offset validated by caller (Sonivox passes file_pos in [0, length]) */
+    if (!data || !buf || offset < 0 || size < 0) return 0;
+    /* Note: we don't have direct access to file length here, but the
+     * Sonivox parser bounds-checks via EAS_HWFileLength. We trust it. */
+    memcpy(buf, data + offset, (size_t) size);
+    return size;
+}
+
+/* size callback: return total MIDI byte count */
+static int nojme_loc_size(void *handle) {
+    if (!handle) return 0;
+    /* The handle is a pointer to a struct holding {data,size}. We
+     * actually need both pieces. Trick: store a small wrapper struct
+     * that contains data + size, and pass THAT as the handle. */
+    return 0; /* will be overridden by wrapper (see below) */
+}
+
+/* Real handle structure (kept here so callbacks can see it) */
+typedef struct {
+    const uint8_t *data;
+    int             size;
+} nojme_loc_handle;
+
+static int nojme_loc_readAt_real(void *handle, void *buf, int offset, int size) {
+    nojme_loc_handle *h = (nojme_loc_handle *) handle;
+    if (!h || !h->data || offset < 0 || size < 0) return 0;
+    if (offset >= h->size) return 0;
+    if (offset + size > h->size) size = h->size - offset;
+    memcpy(buf, h->data + offset, (size_t) size);
+    return size;
+}
+
+static int nojme_loc_size_real(void *handle) {
+    nojme_loc_handle *h = (nojme_loc_handle *) handle;
+    return h ? h->size : 0;
+}
+
+/* ------------------------------------------------------------------
+ * Globals (one global EAS instance shared across all MidiFiles? No —
+ * Sonivox docs say each pEASData is independent; for J2ME's
+ * "multiple players at once" feature, each MidiFile gets its own
+ * EAS_DATA_HANDLE so two players can be rendered independently.)
+ * ------------------------------------------------------------------ */
 static uint32_t g_sample_rate = 44100;
 static MidiSequencer* g_active_sequencer = NULL;
 
-/* Note frequency table (calculated at init) */
-static float g_note_frequencies[MIDI_NOTE_COUNT];
-
-/* FM synthesis parameters for different instruments */
-typedef struct {
-    float attack;
-    float decay;
-    float sustain;
-    float release;
-    float mod_index;
-    float mod_ratio;
-} FMPatch;
-
-/* Simple FM patches for General MIDI instruments */
-static const FMPatch g_patches[] = {
-    /* 0: Piano */
-    {0.01f, 0.1f, 0.7f, 0.3f, 1.0f, 1.0f},
-    /* 1: Bright Piano */
-    {0.005f, 0.15f, 0.6f, 0.25f, 1.5f, 2.0f},
-    /* 2: Electric Grand */
-    {0.005f, 0.2f, 0.5f, 0.2f, 2.0f, 1.0f},
-    /* 3: Honky Tonk */
-    {0.01f, 0.1f, 0.6f, 0.3f, 0.5f, 0.5f},
-    /* 4: Electric Piano 1 */
-    {0.001f, 0.3f, 0.4f, 0.3f, 3.0f, 0.5f},
-    /* 5: Electric Piano 2 */
-    {0.001f, 0.25f, 0.5f, 0.25f, 2.5f, 0.25f},
-    /* 6: Harpsichord */
-    {0.001f, 0.1f, 0.8f, 0.1f, 0.3f, 2.0f},
-    /* 7: Clavinet */
-    {0.001f, 0.15f, 0.7f, 0.15f, 0.5f, 3.0f},
-    /* 8: Celesta */
-    {0.001f, 0.3f, 0.3f, 0.5f, 2.0f, 3.0f},
-    /* 9: Glockenspiel */
-    {0.001f, 0.4f, 0.2f, 0.6f, 1.0f, 4.0f},
-    /* 10: Music Box */
-    {0.001f, 0.2f, 0.4f, 0.4f, 1.5f, 3.0f},
-    /* 11: Vibraphone */
-    {0.001f, 0.3f, 0.5f, 0.4f, 2.0f, 2.0f},
-    /* 12: Marimba */
-    {0.001f, 0.2f, 0.6f, 0.3f, 0.5f, 1.0f},
-    /* 13: Xylophone */
-    {0.001f, 0.15f, 0.5f, 0.4f, 0.3f, 2.0f},
-    /* 14: Tubular Bells */
-    {0.001f, 0.5f, 0.3f, 0.7f, 3.0f, 1.5f},
-    /* 15: Dulcimer */
-    {0.001f, 0.2f, 0.6f, 0.3f, 1.0f, 1.0f},
-    /* 16: Drawbar Organ */
-    {0.01f, 0.05f, 0.9f, 0.1f, 0.5f, 1.0f},
-    /* 17: Percussive Organ */
-    {0.01f, 0.1f, 0.8f, 0.1f, 0.7f, 2.0f},
-    /* 18: Rock Organ */
-    {0.01f, 0.05f, 0.85f, 0.1f, 1.0f, 0.5f},
-    /* 19: Church Organ */
-    {0.02f, 0.1f, 0.8f, 0.2f, 0.3f, 0.5f},
-    /* 20: Reed Organ */
-    {0.02f, 0.15f, 0.7f, 0.15f, 0.4f, 1.0f},
-    /* 21: Accordion */
-    {0.01f, 0.1f, 0.8f, 0.1f, 0.6f, 0.5f},
-    /* 22: Harmonica */
-    {0.01f, 0.1f, 0.75f, 0.15f, 0.8f, 1.0f},
-    /* 23: Tango Accordion */
-    {0.01f, 0.1f, 0.8f, 0.1f, 1.0f, 0.5f},
-    /* 24: Nylon Guitar */
-    {0.002f, 0.15f, 0.5f, 0.3f, 0.8f, 1.0f},
-    /* 25: Steel Guitar */
-    {0.002f, 0.1f, 0.6f, 0.25f, 1.2f, 0.5f},
-    /* 26: Jazz Guitar */
-    {0.002f, 0.15f, 0.55f, 0.2f, 1.5f, 1.0f},
-    /* 27: Clean Guitar */
-    {0.002f, 0.1f, 0.65f, 0.2f, 0.5f, 0.5f},
-    /* 28: Muted Guitar */
-    {0.001f, 0.1f, 0.3f, 0.2f, 1.0f, 2.0f},
-    /* 29: Overdrive Guitar */
-    {0.001f, 0.1f, 0.7f, 0.15f, 2.0f, 1.0f},
-    /* 30: Distortion Guitar */
-    {0.001f, 0.1f, 0.7f, 0.15f, 3.0f, 0.5f},
-    /* 31: Guitar Harmonics */
-    {0.001f, 0.2f, 0.5f, 0.3f, 2.0f, 2.0f},
-    /* 32: Acoustic Bass */
-    {0.002f, 0.2f, 0.4f, 0.25f, 0.5f, 0.5f},
-    /* 33: Electric Bass (finger) */
-    {0.002f, 0.15f, 0.5f, 0.2f, 1.0f, 0.5f},
-    /* 34: Electric Bass (pick) */
-    {0.001f, 0.1f, 0.5f, 0.15f, 1.5f, 0.5f},
-    /* 35: Fretless Bass */
-    {0.005f, 0.3f, 0.4f, 0.2f, 0.3f, 1.0f},
-    /* 36: Slap Bass 1 */
-    {0.001f, 0.05f, 0.6f, 0.1f, 2.0f, 1.0f},
-    /* 37: Slap Bass 2 */
-    {0.001f, 0.08f, 0.55f, 0.12f, 2.5f, 1.0f},
-    /* 38: Synth Bass 1 */
-    {0.002f, 0.1f, 0.6f, 0.15f, 3.0f, 0.5f},
-    /* 39: Synth Bass 2 */
-    {0.002f, 0.15f, 0.5f, 0.2f, 2.5f, 1.0f},
-    /* 40: Violin */
-    {0.05f, 0.2f, 0.7f, 0.35f, 0.5f, 1.0f},
-    /* 41: Viola */
-    {0.05f, 0.2f, 0.7f, 0.35f, 0.4f, 1.0f},
-    /* 42: Cello */
-    {0.05f, 0.22f, 0.7f, 0.35f, 0.35f, 1.0f},
-    /* 43: Contrabass */
-    {0.05f, 0.25f, 0.65f, 0.3f, 0.3f, 0.5f},
-    /* 44: Tremolo Strings */
-    {0.05f, 0.15f, 0.7f, 0.25f, 1.5f, 2.0f},
-    /* 45: Pizzicato Strings */
-    {0.002f, 0.12f, 0.4f, 0.25f, 0.6f, 1.0f},
-    /* 46: Orchestral Harp */
-    {0.002f, 0.15f, 0.45f, 0.3f, 0.8f, 1.5f},
-    /* 47: Timpani */
-    {0.002f, 0.3f, 0.35f, 0.4f, 1.2f, 0.5f},
-    /* 48: String Ensemble 1 */
-    {0.06f, 0.2f, 0.75f, 0.35f, 0.4f, 1.0f},
-    /* 49: String Ensemble 2 */
-    {0.07f, 0.2f, 0.75f, 0.35f, 0.6f, 1.5f},
-    /* 50: Synth Strings 1 */
-    {0.08f, 0.25f, 0.7f, 0.4f, 0.8f, 1.0f},
-    /* 51: Synth Strings 2 */
-    {0.08f, 0.25f, 0.7f, 0.4f, 1.2f, 2.0f},
-    /* 52: Choir Aahs */
-    {0.08f, 0.2f, 0.7f, 0.35f, 0.5f, 1.5f},
-    /* 53: Voice Oohs */
-    {0.08f, 0.2f, 0.65f, 0.35f, 0.3f, 1.0f},
-    /* 54: Synth Voice */
-    {0.06f, 0.2f, 0.7f, 0.3f, 1.2f, 2.0f},
-    /* 55: Orchestra Hit */
-    {0.001f, 0.15f, 0.5f, 0.2f, 3.0f, 1.0f},
-    /* 56: Trumpet */
-    {0.015f, 0.12f, 0.6f, 0.2f, 1.2f, 1.0f},
-    /* 57: Trombone */
-    {0.02f, 0.15f, 0.6f, 0.25f, 0.9f, 1.0f},
-    /* 58: Tuba */
-    {0.02f, 0.18f, 0.6f, 0.25f, 0.7f, 0.5f},
-    /* 59: Muted Trumpet */
-    {0.01f, 0.1f, 0.5f, 0.2f, 2.0f, 2.0f},
-    /* 60: French Horn */
-    {0.04f, 0.18f, 0.65f, 0.3f, 0.6f, 1.0f},
-    /* 61: Brass Section */
-    {0.025f, 0.15f, 0.65f, 0.25f, 1.1f, 1.0f},
-    /* 62: Synth Brass 1 */
-    {0.01f, 0.12f, 0.7f, 0.2f, 1.8f, 1.0f},
-    /* 63: Synth Brass 2 */
-    {0.01f, 0.12f, 0.7f, 0.2f, 2.4f, 2.0f},
-    /* 64: Soprano Sax */
-    {0.02f, 0.15f, 0.65f, 0.2f, 1.0f, 2.0f},
-    /* 65: Alto Sax */
-    {0.02f, 0.15f, 0.65f, 0.2f, 0.9f, 2.0f},
-    /* 66: Tenor Sax */
-    {0.02f, 0.15f, 0.65f, 0.2f, 0.8f, 1.5f},
-    /* 67: Baritone Sax */
-    {0.02f, 0.15f, 0.65f, 0.2f, 0.7f, 1.0f},
-    /* 68: Oboe */
-    {0.03f, 0.15f, 0.7f, 0.2f, 1.1f, 2.0f},
-    /* 69: English Horn */
-    {0.03f, 0.18f, 0.7f, 0.25f, 0.9f, 1.5f},
-    /* 70: Bassoon */
-    {0.03f, 0.2f, 0.65f, 0.25f, 0.6f, 1.0f},
-    /* 71: Clarinet */
-    {0.02f, 0.15f, 0.7f, 0.2f, 0.5f, 2.0f},
-    /* 72: Piccolo */
-    {0.01f, 0.12f, 0.6f, 0.2f, 0.6f, 1.0f},
-    /* 73: Flute */
-    {0.03f, 0.15f, 0.65f, 0.25f, 0.5f, 1.0f},
-    /* 74: Recorder */
-    {0.02f, 0.15f, 0.6f, 0.2f, 0.4f, 1.0f},
-    /* 75: Pan Flute */
-    {0.04f, 0.18f, 0.6f, 0.3f, 0.9f, 1.5f},
-    /* 76: Blown Bottle */
-    {0.04f, 0.2f, 0.6f, 0.3f, 1.3f, 2.0f},
-    /* 77: Shakuhachi */
-    {0.03f, 0.2f, 0.6f, 0.3f, 1.5f, 2.0f},
-    /* 78: Whistle */
-    {0.02f, 0.12f, 0.6f, 0.2f, 0.7f, 1.0f},
-    /* 79: Ocarina */
-    {0.02f, 0.15f, 0.6f, 0.2f, 0.5f, 1.0f},
-    /* 80: Square Lead */
-    {0.005f, 0.1f, 0.7f, 0.15f, 1.5f, 2.0f},
-    /* 81: Sawtooth Lead */
-    {0.005f, 0.1f, 0.7f, 0.15f, 2.5f, 1.0f},
-    /* 82: Calliope Lead */
-    {0.01f, 0.12f, 0.7f, 0.2f, 1.2f, 1.5f},
-    /* 83: Chiff Lead */
-    {0.008f, 0.1f, 0.65f, 0.2f, 2.0f, 3.0f},
-    /* 84: Charang Lead */
-    {0.005f, 0.1f, 0.7f, 0.15f, 2.8f, 2.0f},
-    /* 85: Voice Lead */
-    {0.02f, 0.12f, 0.7f, 0.2f, 1.0f, 1.5f},
-    /* 86: Fifths Lead */
-    {0.005f, 0.1f, 0.7f, 0.15f, 2.2f, 1.0f},
-    /* 87: Bass + Lead */
-    {0.004f, 0.1f, 0.7f, 0.15f, 3.0f, 0.5f},
-    /* 88: New Age Pad */
-    {0.12f, 0.3f, 0.65f, 0.45f, 0.8f, 1.0f},
-    /* 89: Warm Pad */
-    {0.15f, 0.3f, 0.7f, 0.45f, 0.4f, 1.0f},
-    /* 90: Polysynth Pad */
-    {0.1f, 0.25f, 0.7f, 0.4f, 1.2f, 2.0f},
-    /* 91: Choir Pad */
-    {0.14f, 0.3f, 0.7f, 0.45f, 0.6f, 1.5f},
-    /* 92: Bowed Pad */
-    {0.15f, 0.3f, 0.7f, 0.45f, 0.5f, 1.0f},
-    /* 93: Metallic Pad */
-    {0.12f, 0.3f, 0.6f, 0.45f, 2.0f, 3.0f},
-    /* 94: Halo Pad */
-    {0.18f, 0.35f, 0.65f, 0.5f, 1.5f, 2.5f},
-    /* 95: Sweep Pad */
-    {0.2f, 0.35f, 0.65f, 0.5f, 2.2f, 1.5f},
-    /* 96: Rain */
-    {0.05f, 0.25f, 0.5f, 0.4f, 3.0f, 4.0f},
-    /* 97: Soundtrack */
-    {0.1f, 0.3f, 0.6f, 0.45f, 1.2f, 1.5f},
-    /* 98: Crystal */
-    {0.002f, 0.3f, 0.35f, 0.5f, 2.5f, 3.5f},
-    /* 99: Atmosphere */
-    {0.15f, 0.35f, 0.6f, 0.5f, 2.0f, 2.0f},
-    /* 100: Brightness */
-    {0.002f, 0.3f, 0.35f, 0.5f, 3.0f, 5.0f},
-    /* 101: Goblins */
-    {0.12f, 0.3f, 0.6f, 0.45f, 1.8f, 2.5f},
-    /* 102: Echoes */
-    {0.1f, 0.3f, 0.55f, 0.5f, 2.5f, 1.5f},
-    /* 103: Sci-Fi */
-    {0.08f, 0.3f, 0.55f, 0.45f, 3.5f, 3.0f},
-    /* 104: Sitar */
-    {0.002f, 0.15f, 0.45f, 0.25f, 2.2f, 2.0f},
-    /* 105: Banjo */
-    {0.001f, 0.1f, 0.45f, 0.2f, 1.0f, 1.0f},
-    /* 106: Shamisen */
-    {0.001f, 0.12f, 0.45f, 0.2f, 1.4f, 1.5f},
-    /* 107: Koto */
-    {0.001f, 0.15f, 0.4f, 0.25f, 1.2f, 1.0f},
-    /* 108: Kalimba */
-    {0.001f, 0.2f, 0.35f, 0.3f, 0.8f, 2.0f},
-    /* 109: Bagpipe */
-    {0.04f, 0.2f, 0.75f, 0.25f, 1.5f, 2.0f},
-    /* 110: Fiddle */
-    {0.03f, 0.15f, 0.65f, 0.25f, 0.7f, 1.0f},
-    /* 111: Shanai */
-    {0.02f, 0.15f, 0.6f, 0.2f, 1.3f, 2.0f},
-    /* 112: Tinkle Bell */
-    {0.001f, 0.4f, 0.25f, 0.6f, 3.0f, 5.0f},
-    /* 113: Agogo */
-    {0.001f, 0.15f, 0.3f, 0.3f, 2.0f, 3.0f},
-    /* 114: Steel Drums */
-    {0.002f, 0.18f, 0.45f, 0.3f, 1.8f, 2.5f},
-    /* 115: Woodblock */
-    {0.001f, 0.08f, 0.2f, 0.2f, 1.0f, 1.0f},
-    /* 116: Taiko Drum */
-    {0.002f, 0.25f, 0.5f, 0.3f, 1.5f, 0.5f},
-    /* 117: Melodic Tom */
-    {0.002f, 0.2f, 0.4f, 0.3f, 1.0f, 1.0f},
-    /* 118: Synth Drum */
-    {0.001f, 0.2f, 0.3f, 0.3f, 3.0f, 0.5f},
-    /* 119: Reverse Cymbal */
-    {0.15f, 0.05f, 0.5f, 0.4f, 3.5f, 4.0f},
-    /* 120: Guitar Fret Noise */
-    {0.001f, 0.1f, 0.3f, 0.25f, 2.5f, 3.0f},
-    /* 121: Breath Noise */
-    {0.05f, 0.2f, 0.5f, 0.4f, 1.0f, 1.0f},
-    /* 122: Seashore */
-    {0.1f, 0.3f, 0.5f, 0.5f, 2.0f, 1.5f},
-    /* 123: Bird Tweet */
-    {0.005f, 0.1f, 0.3f, 0.3f, 4.0f, 6.0f},
-    /* 124: Telephone Ring */
-    {0.002f, 0.15f, 0.5f, 0.2f, 2.0f, 4.0f},
-    /* 125: Helicopter */
-    {0.05f, 0.25f, 0.5f, 0.4f, 3.0f, 2.0f},
-    /* 126: Applause */
-    {0.05f, 0.3f, 0.5f, 0.45f, 1.5f, 2.0f},
-    /* 127: Gunshot */
-    {0.001f, 0.25f, 0.4f, 0.3f, 4.0f, 1.0f},
-};
-
-/* Default patch for unknown programs */
-static const FMPatch g_default_patch = {0.01f, 0.1f, 0.7f, 0.2f, 1.0f, 1.0f};
+/* For midi_note_on() without a MidiFile (called from tone player when
+ * there's no .midi target): we route to a global "default" EAS instance
+ * with an open MIDI stream. Created on first midi_init(). */
+static EAS_DATA_HANDLE g_default_eas = NULL;
+static EAS_HANDLE      g_default_stream = NULL;
 
 /* ------------------------------------------------------------------
- * v23: GM percussion (channel 9 / drum map, notes 27..87).
- * Each drum is one FM voice (carrier + modulator) with exponential
- * decay, optional pitch sweep (kick/toms) and a noise blend
- * (snares/hats/cymbals/shakers). choke_group 1 = open hi-hat, cut by
- * a closed/pedal hi-hat start.
+ * v36.90 [MIDI-PERF]: runtime configuration + live-instance registry.
+ *
+ * Polyphony is applied per EAS instance via EAS_IntSetStrmParam(
+ * PARSER_DATA_POLYPHONY) — the AOSP voice manager (VMSetPolyphony)
+ * then caps the pool allocation, so the synth never runs more voices
+ * than requested. Filter/reverb are plain global gates read by the
+ * engine hot paths (see eas_host_nojme.c for the rationale).
+ *
+ * The registry lets midi_set_polyphony() retune ALREADY-LOADED files
+ * (games keep players alive for the whole session). All registry
+ * access is under its own tiny mutex: midi_load() is called from Java
+ * threads without g_audio_mutex in createPlayer, so the caller's locks
+ * cannot be relied on. Lock order is always g_audio_mutex (caller,
+ * optional) -> g_midi_cfg_mutex; the reverse is never taken.
  * ------------------------------------------------------------------ */
-typedef struct {
-    uint8_t  note;        /* GM percussion note number */
-    float    freq_mult;   /* frequency multiplier on the note pitch */
-    float    sweep_start; /* initial pitch multiplier (sweeps down to 1.0) */
-    float    sweep_tau;   /* pitch sweep time constant in seconds (0 = none) */
-    float    decay;       /* time to -60 dB in seconds */
-    float    mod_index;   /* FM brightness */
-    float    mod_ratio;   /* FM harmonic ratio (high = metallic) */
-    float    noise_mix;   /* 0..1 noise blend */
-    uint8_t  choke_group; /* 1 = open hat (choked), 0 = none */
-} DrumPatch;
+#define MIDI_MAX_INSTANCES 16
 
-static const DrumPatch g_drum_patches[] = {
-    {27,  1.0f, 1.0f, 0.00f, 0.06f, 3.0f, 7.0f,  0.30f, 0}, /* High Q */
-    {28,  1.0f, 1.0f, 0.00f, 0.08f, 2.0f, 3.0f,  0.80f, 0}, /* Slap */
-    {29,  1.5f, 1.0f, 0.00f, 0.05f, 2.0f, 5.0f,  0.80f, 0}, /* Scratch Push */
-    {30,  1.2f, 1.0f, 0.00f, 0.05f, 2.0f, 5.0f,  0.80f, 0}, /* Scratch Pull */
-    {31,  1.0f, 1.0f, 0.00f, 0.03f, 1.5f, 4.0f,  0.60f, 0}, /* Sticks */
-    {32,  1.0f, 1.0f, 0.00f, 0.02f, 1.0f, 2.0f,  0.20f, 0}, /* Square Click */
-    {33,  2.0f, 1.0f, 0.00f, 0.03f, 2.0f, 6.0f,  0.50f, 0}, /* Metronome Click */
-    {34,  2.0f, 1.0f, 0.00f, 0.15f, 3.0f, 5.0f,  0.20f, 0}, /* Metronome Bell */
-    {35,  1.0f, 2.0f, 0.05f, 0.25f, 0.7f, 1.0f,  0.05f, 0}, /* Acoustic Bass Drum */
-    {36,  1.0f, 2.4f, 0.04f, 0.30f, 0.8f, 1.0f,  0.03f, 0}, /* Bass Drum 1 */
-    {37,  1.0f, 1.0f, 0.00f, 0.04f, 2.0f, 4.0f,  0.70f, 0}, /* Side Stick */
-    {38,  1.0f, 1.0f, 0.00f, 0.16f, 1.2f, 1.0f,  0.55f, 0}, /* Acoustic Snare */
-    {39,  1.0f, 1.0f, 0.00f, 0.12f, 1.5f, 2.0f,  0.85f, 0}, /* Hand Clap */
-    {40,  1.2f, 1.0f, 0.00f, 0.14f, 2.5f, 1.5f,  0.45f, 0}, /* Electric Snare */
-    {41,  0.85f, 1.7f, 0.09f, 0.30f, 0.8f, 1.0f, 0.05f, 0}, /* Low Floor Tom */
-    {42,  1.0f, 1.0f, 0.00f, 0.05f, 3.5f, 12.0f, 0.60f, 0}, /* Closed Hi-Hat */
-    {43,  1.0f, 1.6f, 0.08f, 0.28f, 0.8f, 1.0f,  0.05f, 0}, /* High Floor Tom */
-    {44,  1.0f, 1.0f, 0.00f, 0.04f, 3.5f, 12.0f, 0.60f, 0}, /* Pedal Hi-Hat */
-    {45,  0.9f, 1.7f, 0.08f, 0.25f, 0.9f, 1.0f,  0.05f, 0}, /* Low Tom */
-    {46,  1.0f, 1.0f, 0.00f, 0.40f, 3.5f, 12.0f, 0.55f, 1}, /* Open Hi-Hat */
-    {47,  1.0f, 1.6f, 0.08f, 0.24f, 0.9f, 1.0f,  0.05f, 0}, /* Low-Mid Tom */
-    {48,  1.1f, 1.6f, 0.07f, 0.22f, 0.9f, 1.0f,  0.05f, 0}, /* Hi-Mid Tom */
-    {49,  1.0f, 1.0f, 0.00f, 1.20f, 3.0f, 8.0f,  0.40f, 0}, /* Crash Cymbal 1 */
-    {50,  1.2f, 1.6f, 0.07f, 0.20f, 0.9f, 1.0f,  0.05f, 0}, /* High Tom */
-    {51,  1.0f, 1.0f, 0.00f, 1.00f, 2.5f, 9.0f,  0.35f, 0}, /* Ride Cymbal 1 */
-    {52,  0.9f, 1.0f, 0.00f, 0.90f, 4.0f, 7.0f,  0.45f, 0}, /* Chinese Cymbal */
-    {53,  1.3f, 1.0f, 0.00f, 0.60f, 3.0f, 6.0f,  0.25f, 0}, /* Ride Bell */
-    {54,  1.5f, 1.0f, 0.00f, 0.18f, 3.0f, 10.0f, 0.60f, 0}, /* Tambourine */
-    {55,  1.3f, 1.0f, 0.00f, 0.70f, 3.5f, 8.0f,  0.50f, 0}, /* Splash Cymbal */
-    {56,  1.0f, 1.0f, 0.00f, 0.25f, 1.5f, 1.5f,  0.10f, 0}, /* Cowbell */
-    {57,  0.95f, 1.0f, 0.00f, 1.40f, 3.0f, 8.0f, 0.40f, 0}, /* Crash Cymbal 2 */
-    {58,  1.2f, 1.0f, 0.00f, 0.30f, 2.5f, 5.0f,  0.50f, 0}, /* Vibraslap */
-    {59,  1.05f, 1.0f, 0.00f, 1.10f, 2.5f, 9.0f, 0.35f, 0}, /* Ride Cymbal 2 */
-    {60,  1.3f, 1.5f, 0.06f, 0.15f, 1.0f, 1.0f,  0.08f, 0}, /* Hi Bongo */
-    {61,  0.9f, 1.5f, 0.07f, 0.18f, 1.0f, 1.0f,  0.08f, 0}, /* Low Bongo */
-    {62,  1.1f, 1.4f, 0.04f, 0.10f, 1.0f, 1.0f,  0.05f, 0}, /* Mute Hi Conga */
-    {63,  1.1f, 1.5f, 0.07f, 0.25f, 1.0f, 1.0f,  0.05f, 0}, /* Open Hi Conga */
-    {64,  0.8f, 1.5f, 0.08f, 0.30f, 1.0f, 1.0f,  0.05f, 0}, /* Low Conga */
-    {65,  1.2f, 1.0f, 0.00f, 0.15f, 1.5f, 2.0f,  0.30f, 0}, /* High Timbale */
-    {66,  0.9f, 1.0f, 0.00f, 0.18f, 1.5f, 2.0f,  0.30f, 0}, /* Low Timbale */
-    {67,  1.5f, 1.0f, 0.00f, 0.12f, 2.0f, 3.0f,  0.15f, 0}, /* High Agogo */
-    {68,  1.0f, 1.0f, 0.00f, 0.14f, 2.0f, 3.0f,  0.15f, 0}, /* Low Agogo */
-    {69,  1.0f, 1.0f, 0.00f, 0.12f, 2.0f, 8.0f,  0.85f, 0}, /* Cabasa */
-    {70,  1.0f, 1.0f, 0.00f, 0.06f, 2.0f, 9.0f,  0.90f, 0}, /* Maracas */
-    {71,  2.0f, 1.0f, 0.00f, 0.10f, 0.5f, 1.0f,  0.10f, 0}, /* Short Whistle */
-    {72,  2.0f, 1.0f, 0.00f, 0.40f, 0.5f, 1.0f,  0.10f, 0}, /* Long Whistle */
-    {73,  1.0f, 1.0f, 0.00f, 0.10f, 2.0f, 5.0f,  0.70f, 0}, /* Short Guiro */
-    {74,  1.0f, 1.0f, 0.00f, 0.30f, 2.0f, 5.0f,  0.70f, 0}, /* Long Guiro */
-    {75,  1.1f, 1.0f, 0.00f, 0.08f, 0.8f, 2.0f,  0.05f, 0}, /* Claves */
-    {76,  1.3f, 1.0f, 0.00f, 0.06f, 1.0f, 2.0f,  0.10f, 0}, /* Hi Wood Block */
-    {77,  0.9f, 1.0f, 0.00f, 0.08f, 1.0f, 2.0f,  0.10f, 0}, /* Low Wood Block */
-    {78,  1.2f, 1.0f, 0.00f, 0.10f, 1.5f, 2.0f,  0.30f, 0}, /* Mute Cuica */
-    {79,  1.2f, 1.0f, 0.00f, 0.25f, 1.5f, 2.0f,  0.30f, 0}, /* Open Cuica */
-    {80,  2.2f, 1.0f, 0.00f, 0.20f, 3.0f, 10.0f, 0.15f, 0}, /* Mute Triangle */
-    {81,  2.2f, 1.0f, 0.00f, 0.50f, 3.0f, 10.0f, 0.15f, 0}, /* Open Triangle */
-    {82,  1.0f, 1.0f, 0.00f, 0.08f, 2.0f, 9.0f,  0.90f, 0}, /* Shaker */
-    {83,  1.8f, 1.0f, 0.00f, 0.40f, 3.0f, 10.0f, 0.40f, 0}, /* Jingle Bell */
-    {84,  2.5f, 1.0f, 0.00f, 0.90f, 3.0f, 8.0f,  0.20f, 0}, /* Belltree */
-    {85,  1.5f, 1.0f, 0.00f, 0.05f, 2.0f, 8.0f,  0.70f, 0}, /* Castanets */
-    {86,  0.6f, 1.5f, 0.05f, 0.15f, 0.8f, 1.0f,  0.05f, 0}, /* Mute Surdo */
-    {87,  0.6f, 1.6f, 0.08f, 0.35f, 0.8f, 1.0f,  0.05f, 0}, /* Open Surdo */
-};
+#ifndef _WIN32
+#include <pthread.h>
+#else
+#include "win_thread_shim.h"
+#endif
 
-#define DRUM_PATCH_COUNT (sizeof(g_drum_patches) / sizeof(g_drum_patches[0]))
+static pthread_mutex_t g_midi_cfg_mutex = PTHREAD_MUTEX_INITIALIZER;
+static MidiFile*       g_midi_instances[MIDI_MAX_INSTANCES];
+static int             g_midi_polyphony   = 24;  /* fast default (GoF needs <=16) */
 
-/* Calculate note frequency */
+/* v36.91 [MIDI-GAIN]: пост-рендерный цифровой гейн MIDI-выхода.
+ *
+ * ПОЧЕМУ: Sonivox по умолчанию рендерит заметно тише, чем PCM/WAV-путь.
+ * Замер (scripts/measure_midi_level.c, GoF_InGame.MID, 20 с, x86):
+ *   EAS vol 0.90 (дефолт v36.90): peak -8.8 dBFS, RMS -25.2 dBFS
+ *   EAS vol 1.00               : ВНУТРЕННИЙ САТУРАТОР синтезатора
+ *                                (peak в clamp на плотных аккордах GoF)
+ *   EAS 0.90 + пост-гейн x2.0  : peak -2.8 dBFS, RMS -19.2 dBFS — +6 дБ
+ *                                громкости БЕЗ клиппинга
+ * Типичный игровой WAV у полной шкалы: RMS -12..-18 dBFS — поэтому MIDI
+ * слышно «намного тише PCM». Гейн применяется в midi_generate_samples
+ * (одна точка для всех потребителей: SMF-файлы, device://tone и
+ * device://midi сырые потоки). Дефолт 2.0 (+6 дБ); настройки:
+ * settings midi_gain (проценты, 100..400) и env NOJME_MIDI_GAIN. */
+static float g_midi_gain = 2.0f;
+
+static void midi_apply_polyphony(MidiFile* midi) {
+    if (!midi || !midi->eas_data || !midi->eas_stream) return;
+    /* 0 = "reset to build max" per VMSetPolyphony; both SMF (via the
+     * synth-handle fallback in EAS_IntSetStrmParam) and raw MIDI
+     * streams (NM_SetData) understand it. */
+    EAS_IntSetStrmParam((EAS_DATA_HANDLE) midi->eas_data,
+                        (EAS_HANDLE) midi->eas_stream,
+                        PARSER_DATA_POLYPHONY,
+                        (EAS_I32) g_midi_polyphony);
+}
+
+static void midi_registry_add(MidiFile* midi) {
+    if (!midi) return;
+    pthread_mutex_lock(&g_midi_cfg_mutex);
+    for (int i = 0; i < MIDI_MAX_INSTANCES; i++) {
+        if (!g_midi_instances[i]) {
+            g_midi_instances[i] = midi;
+            break;
+        }
+    }
+    /* full registry: player simply runs at the build-default polyphony
+     * until a midi_set_polyphony()/reload; not fatal */
+    pthread_mutex_unlock(&g_midi_cfg_mutex);
+
+    midi_apply_polyphony(midi);
+}
+
+static void midi_registry_remove(MidiFile* midi) {
+    if (!midi) return;
+    pthread_mutex_lock(&g_midi_cfg_mutex);
+    for (int i = 0; i < MIDI_MAX_INSTANCES; i++) {
+        if (g_midi_instances[i] == midi) {
+            g_midi_instances[i] = NULL;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_midi_cfg_mutex);
+}
+
+int midi_set_polyphony(int voices) {
+    if (voices < 0)   voices = 0;      /* 0 = reset to build max */
+    if (voices > 32)  voices = 32;     /* hard cap = MAX_SYNTH_VOICES (Makefile) */
+
+    pthread_mutex_lock(&g_midi_cfg_mutex);
+    g_midi_polyphony = voices;
+    for (int i = 0; i < MIDI_MAX_INSTANCES; i++) {
+        if (g_midi_instances[i])
+            midi_apply_polyphony(g_midi_instances[i]);
+    }
+    pthread_mutex_unlock(&g_midi_cfg_mutex);
+
+    /* also retune the global default stream (tone/MIDIControl players) */
+    if (g_default_eas && g_default_stream) {
+        EAS_IntSetStrmParam(g_default_eas, g_default_stream,
+                            PARSER_DATA_POLYPHONY, (EAS_I32) voices);
+    }
+    MEDIA_DEBUG("midi_set_polyphony(%d)", voices);
+    return g_midi_polyphony;
+}
+
+int midi_get_polyphony(void) {
+    return g_midi_polyphony;
+}
+
+/* v36.91 [MIDI-GAIN]: 1.0 = не трогать выход Sonivox; 2.0 = +6 дБ (дефолт).
+ * Диапазон 0.25..4.0: выше — повальный клиппинг плотных аккордов
+ * (сатурация в generate-пути есть, но музыкально это уже мусор). */
+void midi_set_gain(float gain) {
+    if (gain < 0.25f) gain = 0.25f;
+    if (gain > 4.0f)  gain = 4.0f;
+    g_midi_gain = gain;
+    MEDIA_DEBUG("midi_set_gain(%.2f)", gain);
+}
+
+float midi_get_gain(void) {
+    return g_midi_gain;
+}
+
+void midi_set_filter_enabled(int on) {
+    g_nojme_voice_filter = on ? 1 : 0;
+    MEDIA_DEBUG("midi_set_filter_enabled(%d)", g_nojme_voice_filter);
+}
+
+int midi_get_filter_enabled(void) {
+    return g_nojme_voice_filter;
+}
+
+void midi_set_reverb_enabled(int on) {
+    g_nojme_reverb = on ? 1 : 0;
+    MEDIA_DEBUG("midi_set_reverb_enabled(%d)", g_nojme_reverb);
+}
+
+int midi_get_reverb_enabled(void) {
+    return g_nojme_reverb;
+}
+
+/* ------------------------------------------------------------------
+ * Note frequency table — kept for ABI compatibility with any caller
+ * that touches g_note_frequencies (none in current NOJME, but the
+ * symbol is exported). Sonivox computes its own frequencies.
+ * ------------------------------------------------------------------ */
+#define MIDI_NOTE_COUNT 128
+static float g_note_frequencies[MIDI_NOTE_COUNT];
+
 static void init_note_frequencies(void) {
-    /* A4 = 440 Hz, MIDI note 69 */
     for (int i = 0; i < MIDI_NOTE_COUNT; i++) {
         g_note_frequencies[i] = 440.0f * powf(2.0f, (i - 69) / 12.0f);
     }
 }
 
-/* Get patch for program */
-static const FMPatch* get_patch(uint8_t program) {
-    if (program < sizeof(g_patches) / sizeof(g_patches[0])) {
-        return &g_patches[program];
-    }
-    return &g_default_patch;
-}
-
-/* v23: drum patch lookup (GM percussion map, notes 27..87) */
-static const DrumPatch* get_drum_patch(uint8_t note) {
-    if (note < 27 || note > 87) return NULL;
-    return &g_drum_patches[note - 27];
-}
-
-/* v23: per-sample exponential decay coefficient so the envelope falls to
- * -60 dB (0.1%) over `decay_s` seconds at `rate`. */
-static float drum_decay_coeff(float decay_s, uint32_t rate) {
-    if (decay_s < 0.01f) decay_s = 0.01f;
-    return expf(-6.9078f / (decay_s * (float)rate));
-}
-
-/* v23: (re)compute the tick timing after tempo/header changes */
-static void midi_recompute_timing(MidiSequencer* seq) {
-    if (seq->smpte) {
-        /* us_per_tick was fixed from the SMPTE division at load time */
-    } else if (seq->ticks_per_beat > 0) {
-        seq->us_per_tick = (double)seq->microseconds_per_beat /
-                           (double)seq->ticks_per_beat;
-    } else {
-        seq->us_per_tick = 500.0;
-    }
-    if (seq->us_per_tick < 1.0) seq->us_per_tick = 1.0;
-    seq->samples_per_tick = (double)seq->sample_rate * seq->us_per_tick / 1000000.0;
-}
-
-/* v36.27: пройтись по треку БЕЗ синтеза и посчитать время конца в
- * МИКРОСЕКУНДАХ с учётом КАРТЫ ТЕМПА (сегменты между FF 51-событиями;
- * для SMPTE темп фиксирован заголовком). Прежние midi_get_length/
- * midi_get_duration_ms трактовали ДЛИНУ ТРЕКА В БАЙТАХ как тики —
- * Player.getDuration() врал на порядок для каждого файла. Семантика
- * статус/running-status зеркалит process_event (lenient). */
-static uint32_t read_var_len(uint8_t* data, uint32_t* pos, uint32_t max); /* forward */
-
-static uint64_t scan_track_time_us(const MidiSequencer* seq,
-                                   const uint8_t* data, uint32_t len) {
-    uint32_t pos = 0;
-    uint64_t time_us = 0;
-    uint32_t tick = 0;          /* позиция в тиках (для сегментов темпа) */
-    uint32_t seg_start = 0;     /* тик начала текущего темп-сегмента */
-    uint32_t seg_upb = 500000;  /* темп текущего сегмента (дефолт 120 BPM) */
-    uint8_t run = 0;
-    while (pos < len) {
-        /* delta time */
-        uint32_t v = 0;
-        uint8_t b;
-        do {
-            if (pos >= len) break;
-            b = data[pos++];
-            v = (v << 7) | (b & 0x7F);
-        } while (b & 0x80);
-        tick += v;
-        if (pos >= len) break;
-        uint8_t st = data[pos];
-        if (st < 0x80) {
-            st = run; /* running status: статус-байт не потребляется */
-        } else {
-            pos++;
-            run = (st < 0xF0) ? st : run; /* lenient, как в process_event */
-        }
-        uint8_t hi = st & 0xF0;
-        if (st == 0xFF) {
-            if (pos >= len) break;
-            uint8_t mt = data[pos++];
-            uint32_t ml = read_var_len((uint8_t*)data, &pos, len);
-            if (mt == 0x51 && ml == 3 && pos + 3 <= len && !seq->smpte) {
-                /* закрыть предыдущий сегмент, открыть новый темп */
-                time_us += (uint64_t)(tick - seg_start) * seg_upb /
-                           (seq->ticks_per_beat ? seq->ticks_per_beat : 480);
-                seg_start = tick;
-                seg_upb = ((uint32_t)data[pos] << 16) |
-                          ((uint32_t)data[pos + 1] << 8) | data[pos + 2];
-            }
-            pos += ml;
-        } else if (st == 0xF0 || st == 0xF7) {
-            while (pos < len && data[pos] != 0xF7) pos++;
-            if (pos < len) pos++;
-        } else if (st == 0xF1 || st == 0xF3) {
-            if (pos < len) pos++;
-        } else if (st == 0xF2) {
-            if (pos + 1 < len) pos += 2;
-        } else if (hi == 0x80 || hi == 0x90 || hi == 0xA0 ||
-                   hi == 0xB0 || hi == 0xE0) {
-            pos += 2;
-        } else if (hi == 0xC0 || hi == 0xD0) {
-            pos += 1;
-        }
-        if (pos > len) pos = len;
-    }
-    if (seq->smpte) {
-        /* SMPTE: фиксированные тики-в-секунду, us_per_tick задан заголовком */
-        return (uint64_t)((double)tick * seq->us_per_tick);
-    }
-    time_us += (uint64_t)(tick - seg_start) * seg_upb /
-               (seq->ticks_per_beat ? seq->ticks_per_beat : 480);
-    return time_us;
-}
-
-/* Initialize MIDI subsystem */
+/* ------------------------------------------------------------------
+ * midi_init: called once from media.c at startup. Initializes a
+ * default EAS instance used by midi_note_on() / midi_control_change()
+ * when no MidiFile target is set (e.g. tone-only players).
+ * ------------------------------------------------------------------ */
 int midi_init(uint32_t sample_rate) {
     g_sample_rate = sample_rate;
     init_note_frequencies();
+
+    /* v36.90 [MIDI-PERF]: one-time runtime config from the environment.
+ * settings.ini goes through midi_set_* wrappers (switch frontend main.c
+ * / libretro core options); the env vars are the headless/desktop path.
+ * NOJME_MIDI_POLYPHONY=4..64, NOJME_MIDI_FILTER=0/1,
+ * NOJME_MIDI_REVERB=0/1. */
+    {
+        static int s_cfg_done = 0;
+        if (!s_cfg_done) {
+            s_cfg_done = 1;
+            const char* e;
+            if ((e = getenv("NOJME_MIDI_POLYPHONY")) != NULL && e[0]) {
+                int v = atoi(e);
+                if (v >= 0 && v <= 32) midi_set_polyphony(v);
+            }
+            if ((e = getenv("NOJME_MIDI_FILTER")) != NULL && e[0])
+                midi_set_filter_enabled(strcmp(e, "0") != 0);
+            if ((e = getenv("NOJME_MIDI_REVERB")) != NULL && e[0])
+                midi_set_reverb_enabled(strcmp(e, "0") != 0);
+            /* v36.91 [MIDI-GAIN]: пост-гейн выход Sonivox, проценты
+             * 25..400 (100 = как в v36.90, 200 = дефолт = +6 дБ). */
+            if ((e = getenv("NOJME_MIDI_GAIN")) != NULL && e[0])
+                midi_set_gain(atof(e) / 100.0f);
+        }
+    }
+
+    SONIVOX_TRACE("midi_init sr=%u", (unsigned) sample_rate);
+
+    /* Boot the default EAS instance for global MIDI channel. */
+    if (!g_default_eas) {
+        EAS_RESULT r = EAS_Init(&g_default_eas);
+        SONIVOX_TRACE("midi_init EAS_Init result=%ld eas=%p",
+                      (long) r, (void*) g_default_eas);
+        if (r == EAS_SUCCESS && g_default_eas) {
+            EAS_RESULT r2 = EAS_OpenMIDIStream(g_default_eas, &g_default_stream, NULL);
+            SONIVOX_TRACE("midi_init EAS_OpenMIDIStream result=%ld stream=%p",
+                          (long) r2, (void*) g_default_stream);
+            if (r2 != EAS_SUCCESS) {
+                g_default_stream = NULL;
+            } else {
+                /* v36.90 [MIDI-PERF]: settings/env may have been applied
+                 * BEFORE this init (switch main.c pushes them at session
+                 * start) — the fresh default stream must inherit the
+                 * configured polyphony, not the build max. */
+                EAS_IntSetStrmParam(g_default_eas, g_default_stream,
+                                    PARSER_DATA_POLYPHONY,
+                                    (EAS_I32) g_midi_polyphony);
+            }
+            /* Default volume 90 (matches Sonivox's own default) */
+            EAS_SetVolume(g_default_eas, NULL, 90);
+        }
+    }
     return 0;
 }
 
-/* Shutdown MIDI subsystem */
 void midi_shutdown(void) {
+    if (g_default_stream) {
+        EAS_CloseMIDIStream(g_default_eas, g_default_stream);
+        g_default_stream = NULL;
+    }
+    if (g_default_eas) {
+        EAS_Shutdown(g_default_eas);
+        g_default_eas = NULL;
+    }
     g_active_sequencer = NULL;
 }
 
-/* Read variable length value from MIDI data */
-static uint32_t read_var_len(uint8_t* data, uint32_t* pos, uint32_t max) {
-    uint32_t value = 0;
-    uint8_t byte;
-    
-    do {
-        if (*pos >= max) return value;
-        byte = data[(*pos)++];
-        value = (value << 7) | (byte & 0x7F);
-    } while (byte & 0x80);
-    
-    return value;
-}
+/* ------------------------------------------------------------------
+ * Helper: allocate & init a fresh MidiSequencer (sets default channel
+ * state, sample_rate, volume=1.0). The reverb/chorus buffers are
+ * zeroed but never used (Sonivox has its own effects).
+ * ------------------------------------------------------------------ */
+static MidiSequencer* alloc_sequencer(void) {
+    MidiSequencer* seq = (MidiSequencer*) calloc(1, sizeof(MidiSequencer));
+    if (!seq) return NULL;
 
-/* Parse MIDI file header */
-static int parse_header(MidiFile* midi, uint32_t* pos) {
-    if (midi->size < 14) return -1;
-    
-    /* Check "MThd" */
-    if (memcmp(midi->data, "MThd", 4) != 0) return -1;
-    
-    uint32_t header_len = ((uint32_t)(midi->data[4]) <<  24) | (midi->data[5] << 16) | 
-                          (midi->data[6] << 8) | midi->data[7];
-    
-    MidiHeader* hdr = &midi->sequencer->header;
-    hdr->format = (midi->data[8] << 8) | midi->data[9];
-    hdr->track_count = (midi->data[10] << 8) | midi->data[11];
-    hdr->division = (midi->data[12] << 8) | midi->data[13];
-    
-    /* Determine division type */
-    if (hdr->division & 0x8000) {
-        /* v23: SMPTE - high byte is negative fps (-24/-25/-29/-30), low byte
-         * is ticks-per-frame. Sequencing runs in ticks-per-second, so tempo
-         * meta events are ignored for these files (standard behavior). */
-        int neg_fps = (int)(int8_t)((hdr->division >> 8) & 0xFF);
-        int tpf = hdr->division & 0xFF;
-        double fps = (neg_fps == -29) ? 29.97 : (double)(-neg_fps);
-        if (fps <= 0.0) fps = 30.0;
-        if (tpf <= 0) tpf = 4;
-        hdr->division_type = 1;  /* SMPTE */
-        midi->sequencer->smpte = true;
-        midi->sequencer->us_per_tick = 1000000.0 / (fps * (double)tpf);
-        midi->sequencer->ticks_per_beat = 480;  /* nominal, unused for timing */
-    } else {
-        hdr->division_type = 0;  /* Ticks per beat */
-        uint32_t tpb = hdr->division & 0x7FFF;
-        midi->sequencer->ticks_per_beat = tpb ? tpb : 480;
+    seq->max_active_notes = 64;            /* Sonivox's MAX_SYNTH_VOICES */
+    seq->active_note_count = 0;
+    seq->active_notes = (MidiNote*) calloc((size_t) seq->max_active_notes,
+                                           sizeof(MidiNote));
+    seq->ticks_per_beat = 480;
+    seq->microseconds_per_beat = 500000;
+    seq->current_tempo = 120.0f;
+    seq->total_time_us = 0;
+    seq->smpte = false;
+    seq->us_per_tick = 500.0;
+    seq->end_reached = false;
+    seq->position = 0;
+    seq->playing = false;
+    seq->loop = false;
+    seq->volume = 1.0f;
+    seq->sample_rate = g_sample_rate;
+    seq->samples_per_tick = g_sample_rate * 500.0 / 1000000.0;
+    seq->sample_accumulator = 0.0;
+    seq->last_real_time_us = 0;
+    seq->tick_accumulator = 0.0;
+
+    /* diag counters reset to 0 by calloc */
+    for (int c = 0; c < MIDI_CHANNELS; c++) {
+        seq->channels[c].program = 0;
+        seq->channels[c].volume = 100;       /* GM default */
+        seq->channels[c].pan = 64;           /* center */
+        seq->channels[c].expression = 127;
+        seq->channels[c].sustain = 0;
+        seq->channels[c].pitch_bend = 1.0f;
+        seq->channels[c].bank = 0;
+        seq->channels[c].modulation = 0;
+        seq->channels[c].reverb = 0;
+        seq->channels[c].chorus = 0;
     }
-    
-    *pos = 8 + header_len;
-    return 0;
+    return seq;
 }
 
-/* Parse track header */
-static int parse_track(MidiFile* midi, int track_num, uint32_t* pos) {
-    if (*pos + 8 > midi->size) return -1;
-    
-    uint8_t* data = midi->data + *pos;
-    
-    /* Check "MTrk" */
-    if (memcmp(data, "MTrk", 4) != 0) return -1;
-    
-    MidiTrack* track = &midi->sequencer->tracks[track_num];
-    track->length = ((uint32_t)(data[4]) <<  24) | (data[5] << 16) | 
-                    (data[6] << 8) | data[7];
-    track->data = data + 8;
-    track->position = 0;
-    track->delta_time = read_var_len(track->data, &track->position, track->length);
-    track->running_status = 0;
-    track->ended = false;
-    
-    *pos += 8 + track->length;
-    return 0;
-}
-
-/* Load MIDI file from memory */
+/* ------------------------------------------------------------------
+ * midi_load: parse SMF bytes via Sonivox's SMF parser.
+ * We do NOT keep our own copy of the data; Sonivox reads through the
+ * memory-backed locator. But media.c stores midi->data = NULL after
+ * free, so the caller's contract is "data must remain valid until
+ * midi_free".
+ * ------------------------------------------------------------------ */
 MidiFile* midi_load(const uint8_t* data, uint32_t size) {
     if (!data || size < 14) return NULL;
 
-    /* v36.28 DIAG: fingerprint of the incoming MIDI data (Asphalt 3 3D
-     * rasterizes its MIDIs through an Image drawRGB/getRGB roundtrip —
-     * any pixel corruption shows up here before parsing). */
-    {
-        uint32_t crc = 0x21630E17u; /* ascii "MIDI-CRC" seed */
-        for (uint32_t i = 0; i < size; i++) {
-            crc ^= data[i];
-            for (int b = 0; b < 8; b++)
-                crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1)));
-        }
-        char head[64];
-        for (int i = 0; i < 16; i++) snprintf(head + i * 2, 3, "%02X", data[i]);
-        MEDIA_DEBUG("midi_load size=%u crc=%08X head=%s", size, crc, head);
-    }
+    SONIVOX_TRACE("midi_load enter size=%u first4=%02x%02x%02x%02x",
+                  (unsigned) size,
+                  data[0], data[1], data[2], data[3]);
 
-    MidiFile* midi = (MidiFile*)calloc(1, sizeof(MidiFile));
+    MidiFile* midi = (MidiFile*) calloc(1, sizeof(MidiFile));
     if (!midi) return NULL;
-    
-    midi->data = (uint8_t*)malloc(size);
-    if (!midi->data) {
-        free(midi);
-        return NULL;
-    }
-    memcpy(midi->data, data, size);
+    midi->data = (uint8_t*) data;        /* borrowed, not owned */
     midi->size = size;
-    
-    midi->sequencer = (MidiSequencer*)calloc(1, sizeof(MidiSequencer));
-    if (!midi->sequencer) {
-        free(midi->data);
-        free(midi);
-        return NULL;
-    }
-    
-    /* Initialize channels */
-    for (int i = 0; i < MIDI_CHANNELS; i++) {
-        midi->sequencer->channels[i].program = 0;
-        midi->sequencer->channels[i].volume = 100;
-        midi->sequencer->channels[i].pan = 64;
-        midi->sequencer->channels[i].expression = 127;
-        midi->sequencer->channels[i].pitch_bend = 1.0f;
-        midi->sequencer->channels[i].sustain = 0;
-        midi->sequencer->channels[i].reverb = 40;  /* v23: GM-typical default send */
-        midi->sequencer->channels[i].chorus = 0;
-    }
-    
-    /* Parse header */
-    uint32_t pos = 0;
-    if (parse_header(midi, &pos) != 0) {
+
+    midi->sequencer = alloc_sequencer();
+    if (!midi->sequencer) { free(midi); return NULL; }
+
+    /* Init Sonivox EAS instance */
+    EAS_RESULT r_init = EAS_Init((EAS_DATA_HANDLE*) &midi->eas_data);
+    if (r_init != EAS_SUCCESS || !midi->eas_data) {
+        SONIVOX_TRACE("midi_load EAS_Init FAILED result=%ld", (long) r_init);
+        free(midi->sequencer->active_notes);
         free(midi->sequencer);
-        free(midi->data);
         free(midi);
         return NULL;
     }
-    
-    /* Allocate tracks */
-    midi->sequencer->tracks = (MidiTrack*)calloc(
-        midi->sequencer->header.track_count, sizeof(MidiTrack));
-    if (!midi->sequencer->tracks) {
+
+    /* Construct memory-backed EAS_FILE locator */
+    nojme_loc_handle *lh = (nojme_loc_handle*) calloc(1, sizeof(nojme_loc_handle));
+    nojme_eas_locator *loc = (nojme_eas_locator*) calloc(1, sizeof(nojme_eas_locator));
+    if (!lh || !loc) {
+        if (lh)  free(lh);
+        if (loc) free(loc);
+        EAS_Shutdown(midi->eas_data);
+        free(midi->sequencer->active_notes);
         free(midi->sequencer);
-        free(midi->data);
         free(midi);
         return NULL;
     }
-    
-    /* Parse tracks */
-    for (int i = 0; i < midi->sequencer->header.track_count; i++) {
-        if (parse_track(midi, i, &pos) != 0) {
-            midi_free(midi);
-            return NULL;
-        }
+    lh->data = data;
+    lh->size = (int) size;
+    loc->handle = lh;
+    loc->readAt = nojme_loc_readAt_real;
+    loc->size   = nojme_loc_size_real;
+    midi->eas_locator = loc;
+
+    /* Open the SMF file via the locator */
+    EAS_HANDLE stream = NULL;
+    EAS_RESULT r = EAS_OpenFile((EAS_DATA_HANDLE) midi->eas_data,
+                               (EAS_FILE_LOCATOR) loc, &stream);
+    SONIVOX_TRACE("midi_load EAS_OpenFile result=%ld stream=%p",
+                  (long) r, (void*) stream);
+    if (r != EAS_SUCCESS || !stream) {
+        SONIVOX_TRACE("midi_load FAILED at EAS_OpenFile (size=%u)", (unsigned) size);
+        free(lh); free(loc);
+        EAS_Shutdown(midi->eas_data);
+        free(midi->sequencer->active_notes);
+        free(midi->sequencer);
+        free(midi);
+        return NULL;
+    }
+    midi->eas_stream = stream;
+
+    /* Prepare for playback + parse metadata (duration) */
+    EAS_RESULT r_prep = EAS_Prepare((EAS_DATA_HANDLE) midi->eas_data, stream);
+    SONIVOX_TRACE("midi_load EAS_Prepare result=%ld", (long) r_prep);
+
+    EAS_I32 playLength = 0;
+    EAS_RESULT r_meta = EAS_ParseMetaData((EAS_DATA_HANDLE) midi->eas_data, stream, &playLength);
+    SONIVOX_TRACE("midi_load EAS_ParseMetaData result=%ld dur_ms=%ld",
+                  (long) r_meta, (long) playLength);
+    if (r_meta == EAS_SUCCESS && playLength > 0) {
+        midi->sequencer->total_time_us = (uint64_t) playLength * 1000ULL;
+    } else {
+        /* Fallback: estimate by file size (~120 BPM, 480 TPB, 4 bytes/event) */
+        midi->sequencer->total_time_us = (uint64_t) size * 4000ULL;
     }
 
-    /* v36.27: реальное время конца треков в мкс (для getDuration/getLength) */
-    {
-        MidiSequencer* sq = midi->sequencer;
-        uint64_t total = 0;
-        for (int i = 0; i < sq->header.track_count; i++) {
-            sq->tracks[i].end_time_us =
-                scan_track_time_us(sq, sq->tracks[i].data, sq->tracks[i].length);
-            if (sq->tracks[i].end_time_us > total) total = sq->tracks[i].end_time_us;
-        }
-        sq->total_time_us = total;
-    }
-    
-    /* Initialize sequencer */
-    midi->sequencer->microseconds_per_beat = DEFAULT_TEMPO;
-    midi->sequencer->current_tempo = 120.0f;
-    midi->sequencer->sample_rate = g_sample_rate;
-    midi->sequencer->volume = 1.0f;
-    midi->sequencer->playing = false;
-    midi->sequencer->last_real_time_us = 0;
-    midi->sequencer->tick_accumulator = 0.0;
+    /* Default master volume */
+    EAS_SetVolume((EAS_DATA_HANDLE) midi->eas_data, stream, 90);
 
-    /* v23: initialize the send-effect delay lengths for this sample rate */
-    {
-        double scale = (double)g_sample_rate / 44100.0;
-        static const int comb_base[4] = {1557, 1617, 1491, 1422};
-        static const int ap_base[2] = {225, 341};
-        for (int i = 0; i < 4; i++) {
-            int len = (int)(comb_base[i] * scale);
-            if (len < 16) len = 16;
-            if (len > 2048) len = 2048;
-            midi->sequencer->rv_comb_len[i] = len;
-            midi->sequencer->rv_comb_pos[i] = 0;
-        }
-        for (int i = 0; i < 2; i++) {
-            int len = (int)(ap_base[i] * scale);
-            if (len < 8) len = 8;
-            if (len > 512) len = 512;
-            midi->sequencer->rv_ap_len[i] = len;
-            midi->sequencer->rv_ap_pos[i] = 0;
-        }
-        int clen = (int)(2048 * scale);  /* ~46 ms maximum delay */
-        if (clen > 4096) clen = 4096;
-        if (clen < 64) clen = 64;
-        midi->sequencer->cho_len = clen;
-        midi->sequencer->cho_pos = 0;
-        midi->sequencer->cho_lfo = 0.0f;
-    }
+    midi->is_midi_stream = false;
+    midi->src_avail = 0; midi->src_pos = 0.0;
 
-    /* Calculate samples per tick (v23: via us_per_tick; SMPTE set in header) */
-    midi_recompute_timing(midi->sequencer);
-    
-    /* Allocate active notes */
-    midi->sequencer->max_active_notes = MAX_POLYPHONY;
-    midi->sequencer->active_notes = (MidiNote*)calloc(
-        MAX_POLYPHONY, sizeof(MidiNote));
-    
+    midi_registry_add(midi);   /* v36.90 [MIDI-PERF]: apply runtime polyphony */
+
+    SONIVOX_TRACE("midi_load OK size=%u dur_ms=%u",
+                  (unsigned) size,
+                  (unsigned)(midi->sequencer->total_time_us / 1000));
     return midi;
 }
 
-/* Free MIDI file */
+/* ------------------------------------------------------------------
+ * midi_load_empty: used by device://tone and device://midi players.
+ * Opens a raw MIDI stream (no SMF parser). midi_note_on_file() etc.
+ * feed it bytes via EAS_WriteMIDIStream.
+ * ------------------------------------------------------------------ */
+MidiFile* midi_load_empty(void) {
+    SONIVOX_TRACE("midi_load_empty enter");
+    MidiFile* midi = (MidiFile*) calloc(1, sizeof(MidiFile));
+    if (!midi) return NULL;
+
+    midi->sequencer = alloc_sequencer();
+    if (!midi->sequencer) { free(midi); return NULL; }
+
+    EAS_RESULT r_init = EAS_Init((EAS_DATA_HANDLE*) &midi->eas_data);
+    if (r_init != EAS_SUCCESS || !midi->eas_data) {
+        SONIVOX_TRACE("midi_load_empty EAS_Init FAILED result=%ld", (long) r_init);
+        free(midi->sequencer->active_notes);
+        free(midi->sequencer);
+        free(midi);
+        return NULL;
+    }
+
+    EAS_HANDLE stream = NULL;
+    EAS_RESULT r = EAS_OpenMIDIStream((EAS_DATA_HANDLE) midi->eas_data, &stream, NULL);
+    SONIVOX_TRACE("midi_load_empty EAS_OpenMIDIStream result=%ld stream=%p",
+                  (long) r, (void*) stream);
+    if (r != EAS_SUCCESS || !stream) {
+        EAS_Shutdown(midi->eas_data);
+        free(midi->sequencer->active_notes);
+        free(midi->sequencer);
+        free(midi);
+        return NULL;
+    }
+    midi->eas_stream = stream;
+    midi->is_midi_stream = true;
+    midi->src_avail = 0; midi->src_pos = 0.0;
+
+    EAS_SetVolume((EAS_DATA_HANDLE) midi->eas_data, stream, 90);
+    midi_registry_add(midi);   /* v36.90 [MIDI-PERF]: apply runtime polyphony */
+    SONIVOX_TRACE("midi_load_empty OK");
+    return midi;
+}
+
+/* ------------------------------------------------------------------
+ * midi_free: shutdown EAS instance, free all per-file state.
+ * ------------------------------------------------------------------ */
 void midi_free(MidiFile* midi) {
     if (!midi) return;
-    
-    if (midi->sequencer) {
-        if (midi->sequencer->tracks) {
-            free(midi->sequencer->tracks);
+
+    SONIVOX_TRACE("midi_free eas=%p stream=%p is_midi_stream=%d",
+                  (void*) midi->eas_data, (void*) midi->eas_stream,
+                  midi->is_midi_stream);
+    midi_registry_remove(midi);   /* v36.90 [MIDI-PERF] */
+
+    if (midi->eas_stream) {
+        if (midi->is_midi_stream) {
+            EAS_CloseMIDIStream((EAS_DATA_HANDLE) midi->eas_data,
+                                 (EAS_HANDLE) midi->eas_stream);
+        } else {
+            EAS_CloseFile((EAS_DATA_HANDLE) midi->eas_data,
+                          (EAS_HANDLE) midi->eas_stream);
         }
+        midi->eas_stream = NULL;
+    }
+    if (midi->eas_data) {
+        EAS_Shutdown((EAS_DATA_HANDLE) midi->eas_data);
+        midi->eas_data = NULL;
+    }
+    if (midi->eas_locator) {
+        nojme_eas_locator *loc = (nojme_eas_locator*) midi->eas_locator;
+        if (loc->handle) free(loc->handle);
+        free(loc);
+        midi->eas_locator = NULL;
+    }
+    if (midi->sequencer) {
         if (midi->sequencer->active_notes) {
             free(midi->sequencer->active_notes);
+            midi->sequencer->active_notes = NULL;
+        }
+        if (midi->sequencer->tracks) {
+            free(midi->sequencer->tracks);
+            midi->sequencer->tracks = NULL;
         }
         free(midi->sequencer);
-    }
-    if (midi->data) {
-        free(midi->data);
+        midi->sequencer = NULL;
     }
     free(midi);
 }
 
-/* Find free note slot */
-static int find_free_note(MidiSequencer* seq) {
-    for (int i = 0; i < seq->max_active_notes; i++) {
-        if (!seq->active_notes[i].active) {
-            return i;
-        }
-    }
-    /* v36.27: все слоты заняты — крадём ТИХИЙ голос (минимальная огибающая),
-     * а не «всегда слот 0»: старый код резал самый первый голос списка,
-     * который мог быть ведущей мелодией. */
-    int quiet = 0;
-    for (int i = 1; i < seq->max_active_notes; i++) {
-        if (seq->active_notes[i].envelope < seq->active_notes[quiet].envelope)
-            quiet = i;
-    }
-    return quiet;
-}
-
-/* Start note */
-static void start_note(MidiSequencer* seq, uint8_t channel,
-                       uint8_t note, uint8_t velocity) {
-    if (note >= MIDI_NOTE_COUNT) {
-        seq->diag_rejects++; /* v36.28 DIAG */
-        return;
-    }
-    if (!seq->active_notes || seq->max_active_notes <= 0) {
-        seq->diag_rejects++; /* v36.28 DIAG: no voice pool */
-        return;
-    }
-
-    int slot = find_free_note(seq);
-    MidiNote* n = &seq->active_notes[slot];
-    /* v36.27: слот мог содержать живой голос (кража) — счётчик активных
-     * обязан быть честным, иначе active_note_count полз вверх навсегда. */
-    if (n->active && seq->active_note_count > 0) seq->active_note_count--;
-
-    n->active = true;
-    n->channel = channel;
-    n->note = note;
-    n->velocity = velocity;
-    n->frequency = g_note_frequencies[note];
-    n->phase = 0.0f;
-    n->mod_phase = 0.0f;
-    n->envelope = 0.0f;
-    n->envelope_target = velocity / 127.0f;
-
-    /* v23: reset the drum/sustain state for every new voice */
-    n->drum = false;
-    n->key_held = true;
-    n->sweep_k = 0.0f;
-    n->noise_mix = 0.0f;
-    n->choke_group = 0;
-    n->rng = 0x9E3779B9u ^ ((uint32_t)note << 16) ^ (uint32_t)seq->position;
-    n->freq_target = n->frequency;
-
-    if (channel == 9) {
-        /* v23: GM percussion channel - synthesize the note as a drum.
-         * Melodic FM patches made drums sound like "fake piano". */
-        const DrumPatch* dp = get_drum_patch(note);
-        if (!dp) {
-            n->active = false;  /* outside the GM kit: silent */
-            return;
-        }
-
-        /* Choke: closed/pedal hi-hat cuts a ringing open hi-hat */
-        if (note == 42 || note == 44) {
-            for (int i = 0; i < seq->max_active_notes; i++) {
-                MidiNote* o = &seq->active_notes[i];
-                if (o->active && o != n && o->choke_group == 1) {
-                    o->envelope *= 0.25f;
-                    o->decay_k *= 0.02f;  /* fade out within a few ms */
-                }
-            }
-        }
-
-        n->drum = true;
-        n->freq_target = g_note_frequencies[note] * dp->freq_mult;
-        n->frequency = n->freq_target * dp->sweep_start;
-        n->decay_k = drum_decay_coeff(dp->decay, seq->sample_rate);
-        if (dp->sweep_tau > 0.0f) {
-            n->sweep_k = expf(-1.0f / (dp->sweep_tau * (float)seq->sample_rate));
-        }
-        n->mod_index = dp->mod_index;
-        n->mod_ratio = dp->mod_ratio;
-        n->noise_mix = dp->noise_mix;
-        n->choke_group = dp->choke_group;
-        n->envelope = velocity / 127.0f;  /* percussive: instant attack */
-        n->envelope_target = 0.0f;
-        seq->active_note_count++;
-        seq->diag_notes++; /* v36.28 DIAG */
-        return;
-    }
-
-    /* Get FM patch */
-    const FMPatch* patch = get_patch(seq->channels[channel].program);
-    n->mod_index = patch->mod_index;
-    n->mod_ratio = patch->mod_ratio;
-
-    seq->active_note_count++;
-    seq->diag_notes++; /* v36.28 DIAG */
-}
-
-/* Stop note */
-static void stop_note(MidiSequencer* seq, uint8_t channel, uint8_t note) {
-    /* v23: CC64 sustain - notes with the key released keep sounding while
-     * the pedal is down and are released when the pedal comes back up. */
-    bool sustained = seq->channels[channel].sustain >= 64;
-
-    for (int i = 0; i < seq->max_active_notes; i++) {
-        MidiNote* n = &seq->active_notes[i];
-        if (n->active && n->channel == channel && n->note == note) {
-            if (n->drum) continue;  /* one-shots ring out; choking handled at start */
-            n->key_held = false;
-            if (!sustained) {
-                n->envelope_target = 0.0f;  /* Release */
-            }
-        }
-    }
-}
-
-/* v23: release every note on this channel that is held only by the pedal.
- * channel > 15 releases on all channels (all-notes-off style). */
-static void release_sustained(MidiSequencer* seq, uint8_t channel) {
-    for (int i = 0; i < seq->max_active_notes; i++) {
-        MidiNote* n = &seq->active_notes[i];
-        if (n->active && !n->drum && !n->key_held &&
-            (channel > 15 || n->channel == channel)) {
-            n->envelope_target = 0.0f;
-        }
-    }
-}
-
-/* Process MIDI event */
-static void process_event(MidiSequencer* seq, MidiTrack* track) {
-    seq->diag_events++; /* v36.28 DIAG */
-    uint8_t status, data1, data2;
-    uint8_t* data = track->data;
-    uint32_t pos = track->position;
-    uint32_t len = track->length;
-    
-    if (pos >= len) {
-        track->ended = true;
-        return;
-    }
-    
-    status = data[pos++];
-    
-    if (status < 0x80) {
-        /* Running status */
-        status = track->running_status;
-        pos--;
-    } else if (status < 0xF0) {
-        /* v36.27 FIX: running status несут ТОЛЬКО channel-статусы
-         * (0x80..0xEF). Прежний код сохранял ЛЮБОЙ статус, включая
-         * 0xFF (meta) и 0xF0/0xF7 (sysex): после ЛЮБОГО meta-события
-         * (темп, названия, тексты — они есть чуть ли не в каждом файле)
-         * следующий event с пропущенным статус-байтом читался как
-         * мусорная meta — поток рассинхронизировался до следующего
-         * явного статуса. Симптомы: пропавшие/фантомные ноты и
-         * мусорная перезапись темпа — «играют не все инструменты».
-         * Компромиссное поведение (lenient, как у массовых плееров):
-         * channel-статусы обновляют running status, meta/sysex —
-         * оставляют прежний. */
-        track->running_status = status;
-    }
-    
-    uint8_t event_type = status & 0xF0;
-    uint8_t channel = status & 0x0F;
-    
-    switch (event_type) {
-        case MIDI_EVENT_NOTE_OFF:
-            if (pos + 1 < len) {
-                data1 = data[pos++];
-                data2 = data[pos++];
-                stop_note(seq, channel, data1);
-            }
-            break;
-            
-        case MIDI_EVENT_NOTE_ON:
-            if (pos + 1 < len) {
-                data1 = data[pos++];
-                data2 = data[pos++];
-                if (data2 == 0) {
-                    stop_note(seq, channel, data1);
-                } else {
-                    start_note(seq, channel, data1, data2);
-                }
-            }
-            break;
-            
-        case MIDI_EVENT_CONTROL_CHANGE:
-            if (pos + 1 < len) {
-                data1 = data[pos++];  /* Controller */
-                data2 = data[pos++];  /* Value */
-                
-                switch (data1) {
-                    case MIDI_CTRL_VOLUME:
-                        seq->channels[channel].volume = data2;
-                        break;
-                    case MIDI_CTRL_PAN:
-                        seq->channels[channel].pan = data2;
-                        break;
-                    case MIDI_CTRL_EXPRESSION:
-                        seq->channels[channel].expression = data2;
-                        break;
-                    case MIDI_CTRL_SUSTAIN: {
-                        /* v23: sustain pedal with release of held notes */
-                        uint8_t prev = seq->channels[channel].sustain;
-                        seq->channels[channel].sustain = data2;
-                        if (prev >= 64 && data2 < 64) {
-                            release_sustained(seq, channel);
-                        }
-                        break;
-                    }
-                    case MIDI_CTRL_BANK_SELECT:
-                        seq->channels[channel].bank = data2;
-                        break;
-                    case MIDI_CTRL_MODULATION:
-                        seq->channels[channel].modulation = data2;
-                        break;
-                    case MIDI_CTRL_REVERB:
-                        /* v23: reverb send level drives the send effect */
-                        seq->channels[channel].reverb = data2;
-                        break;
-                    case MIDI_CTRL_CHORUS:
-                        seq->channels[channel].chorus = data2;
-                        break;
-                }
-            }
-            break;
-            
-        case MIDI_EVENT_PROGRAM_CHANGE:
-            if (pos < len) {
-                seq->channels[channel].program = data[pos++];
-            }
-            break;
-            
-        case MIDI_EVENT_PITCH_BEND:
-            if (pos + 1 < len) {
-                data1 = data[pos++];
-                data2 = data[pos++];
-                int16_t bend = ((data2 << 7) | data1) - 8192;
-                seq->channels[channel].pitch_bend = powf(2.0f, bend / 8192.0f / 6.0f);
-            }
-            break;
-            
-        case MIDI_EVENT_SYSTEM:
-            if (status == 0xFF) {
-                /* Meta event */
-                if (pos >= len) break;
-                uint8_t meta_type = data[pos++];
-                uint32_t meta_len = read_var_len(data, &pos, len);
-                
-                if (meta_type == 0x51 && meta_len == 3 && pos + 3 <= len && !seq->smpte) {
-                    /* Tempo change (v23: ignored for SMPTE files) */
-                    seq->microseconds_per_beat = (data[pos] << 16) | 
-                                                  (data[pos+1] << 8) | data[pos+2];
-                    midi_recompute_timing(seq);
-                }
-                pos += meta_len;
-            } else if (status == 0xF1 || status == 0xF3) {
-                /* v36.27: system common с 1 байтом данных (MTC quarter
-                 * frame / song select). Раньше падали в «ничто» — pos
-                 * не двигался, следующий delta читался со статус-байта
-                 * (мусор). */
-                if (pos < len) pos++;
-            } else if (status == 0xF2) {
-                /* v36.27: song position pointer — 2 байта данных. */
-                if (pos + 1 < len) pos += 2;
-            } else if (status == 0xF0 || status == 0xF7) {
-                /* SysEx */
-                while (pos < len && data[pos] != 0xF7) pos++;
-                if (pos < len) pos++;
-            }
-            /* F4/F5/F6: без байтов данных — только статус (был потребован выше). */
-            break;
-            
-        default:
-            /* Skip unknown events */
-            if (pos < len) pos++;
-            if (pos < len) pos++;
-            break;
-    }
-    
-    track->position = pos;
-    
-    /* Read next delta time */
-    if (track->position < track->length) {
-        track->delta_time = read_var_len(track->data, &track->position, track->length);
-    } else {
-        track->ended = true;
-    }
-}
-
-/* Process sequencer tick */
-void midi_process_tick(MidiSequencer* seq) {
-    if (!seq || !seq->playing) return;
-    
-    /* Process all tracks */
-    bool all_ended = true;
-    
-    for (int i = 0; i < seq->header.track_count; i++) {
-        MidiTrack* track = &seq->tracks[i];
-        
-        if (track->ended) continue;
-        all_ended = false;
-        
-        while (track->delta_time == 0 && !track->ended) {
-            process_event(seq, track);
-        }
-        
-        if (!track->ended) {
-            track->delta_time--;
-        }
-    }
-    
-    seq->position++;  /* v23: sequencer position advances for getMediaTime() */
-    
-    /* Check if all tracks ended */
-    if (all_ended) {
-        if (seq->loop) {
-            /* Restart */
-            for (int i = 0; i < seq->header.track_count; i++) {
-                MidiTrack* track = &seq->tracks[i];
-                track->position = 0;
-                track->delta_time = read_var_len(track->data, &track->position, track->length);
-                track->running_status = 0;
-                track->ended = false;
-            }
-            /* v36.27 LOOP HYGIENE: следующий проход обязан стартовать
-             * «чистым телефоном». Раньше активные голоса (в т.ч.
-             * «залипшие» note-on без парного note-off) продолжали
-             * звучать поверх второго прохода, а состояния каналов
-             * (программы, громкости CC7, питч-бенд, сустейн) оставались
-             * от КОНЦА предыдущего — аранжировка второго и дальше
-             * кругов портилась. Голоса глушим, каналы сбрасываем в те
-             * же дефолты, что и при загрузке (темп/программы из
-             * tick-0 событий переприменятся сами при рестарте треков). */
-            for (int i = 0; i < seq->max_active_notes; i++) {
-                seq->active_notes[i].active = false;
-            }
-            seq->active_note_count = 0;
-            for (int c = 0; c < MIDI_CHANNELS; c++) {
-                MidiChannel* ch = &seq->channels[c];
-                ch->program = 0;
-                ch->volume = 100;
-                ch->pan = 64;
-                ch->expression = 127;
-                ch->sustain = 0;
-                ch->pitch_bend = 1.0f;
-                ch->bank = 0;
-                ch->modulation = 0;
-                ch->reverb = 40;
-                ch->chorus = 0;
-            }
-        } else {
-            seq->playing = false;
-            seq->end_reached = true;  /* v23: for PlayerListener END_OF_MEDIA */
-        }
-    }
-}
-
-/* Generate audio samples using FM synthesis */
-
-/* v23: xorshift white noise for percussion */
-static inline float drum_noise(uint32_t* st) {
-    uint32_t x = *st;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    *st = x;
-    return (float)(int32_t)x * (1.0f / 2147483648.0f);
-}
-
-/* v23: feedback comb (Schroeder reverb stage) */
-static inline float rv_comb_proc(float* buf, int len, int* pos, float in, float fb) {
-    float out = buf[*pos];
-    buf[*pos] = in + out * fb;
-    if (++*pos >= len) *pos = 0;
-    return out;
-}
-
-/* v23: allpass (Schroeder reverb stage) */
-static inline float rv_ap_proc(float* buf, int len, int* pos, float in) {
-    float bufout = buf[*pos];
-    float out = -in + bufout;
-    buf[*pos] = in + bufout * 0.5f;
-    if (++*pos >= len) *pos = 0;
-    return out;
-}
-
-void midi_generate_samples(MidiFile* midi, int16_t* buffer, int samples) {
-    if (!midi || !midi->sequencer || !buffer) return;
-
-    MidiSequencer* seq = midi->sequencer;
-
-    memset(buffer, 0, samples * 2 * sizeof(int16_t));  /* Stereo */
-
-    /* NOTE: Tick processing is now done via midi_advance_time() for time-based sync.
-     * This function only generates audio samples, does NOT advance the sequencer. */
-
-    for (int s = 0; s < samples; s++) {
-        /* Generate audio for all active notes */
-        float left = 0.0f, right = 0.0f;
-        float rv_in = 0.0f, cho_in = 0.0f;
-
-        if (seq->playing) {
-            for (int i = 0; i < seq->max_active_notes; i++) {
-                MidiNote* note = &seq->active_notes[i];
-                if (!note->active) continue;
-
-                MidiChannel* ch = &seq->channels[note->channel];
-                float sample;
-
-                if (note->drum) {
-                    /* v23: percussion - exponential decay, optional pitch
-                     * sweep and noise blend (channel 9 drum map) */
-                    note->envelope *= note->decay_k;
-                    if (note->envelope < 0.0008f) {
-                        note->active = false;
-                        seq->active_note_count--;
-                        continue;
-                    }
-                    if (note->sweep_k > 0.0f) {
-                        note->frequency += (note->freq_target - note->frequency) *
-                                           (1.0f - note->sweep_k);
-                    }
-
-                    float freq = note->frequency * ch->pitch_bend;
-                    float phase_inc = (2.0f * (float)M_PI * freq) / (float)seq->sample_rate;
-                    float mod_phase_inc = phase_inc * note->mod_ratio;
-                    float mod_wave = sinf(note->mod_phase);
-                    float carrier = sinf(note->phase + note->mod_index * mod_wave);
-                    float noise = drum_noise(&note->rng) * note->noise_mix;
-
-                    sample = (carrier * (1.0f - note->noise_mix) + noise) *
-                             note->envelope * (note->velocity / 127.0f);
-
-                    note->phase += phase_inc;
-                    note->mod_phase += mod_phase_inc;
-                    if (note->phase > 2.0f * (float)M_PI) note->phase -= 2.0f * (float)M_PI;
-                    if (note->mod_phase > 2.0f * (float)M_PI) note->mod_phase -= 2.0f * (float)M_PI;
-                } else {
-                    const FMPatch* patch = get_patch(ch->program);
-
-                    /* Apply envelope */
-                    float envelope_diff = note->envelope_target - note->envelope;
-                    if (note->envelope_target > note->envelope) {
-                        /* Attack */
-                        note->envelope += envelope_diff * patch->attack;
-                    } else {
-                        /* Release */
-                        note->envelope += envelope_diff * patch->release;
-                    }
-
-                    if (note->envelope < 0.001f && note->envelope_target == 0.0f) {
-                        note->active = false;
-                        seq->active_note_count--;
-                        continue;
-                    }
-
-                    /* Calculate frequency with pitch bend */
-                    float freq = note->frequency * ch->pitch_bend;
-
-                    /* FM synthesis */
-                    float mod_freq = freq * note->mod_ratio;
-                    float mod_wave = sinf(note->mod_phase);
-
-                    /* Phase increment */
-                    float phase_inc = (2.0f * (float)M_PI * freq) / seq->sample_rate;
-                    float mod_phase_inc = (2.0f * (float)M_PI * mod_freq) / seq->sample_rate;
-
-                    /* Carrier with FM */
-                    float carrier = sinf(note->phase + note->mod_index * mod_wave);
-
-                    /* Apply envelope and velocity */
-                    sample = carrier * note->envelope * (note->velocity / 127.0f);
-
-                    note->phase += phase_inc;
-                    note->mod_phase += mod_phase_inc;
-                    if (note->phase > 2.0f * (float)M_PI) note->phase -= 2.0f * (float)M_PI;
-                    if (note->mod_phase > 2.0f * (float)M_PI) note->mod_phase -= 2.0f * (float)M_PI;
-                }
-
-                /* v23: per-channel send levels (CC91/CC93) feed the effects */
-                rv_in += sample * (ch->reverb / 127.0f) * 0.30f;
-                cho_in += sample * (ch->chorus / 127.0f) * 0.30f;
-
-                /* Apply channel volume and expression */
-                sample *= (ch->volume / 127.0f) * (ch->expression / 127.0f);
-
-                /* Pan */
-                float pan = ch->pan / 127.0f;
-                left += sample * (1.0f - pan);
-                right += sample * pan;
-            }
-        }
-
-        /* v23: reverb send effect (4 feedback combs + 2 allpass, Schroeder).
-         * Runs while a tail is still ringing even if the note list is empty. */
-        if (rv_in != 0.0f || seq->rv_comb[0][seq->rv_comb_pos[0]] != 0.0f) {
-            float rv = 0.0f;
-            for (int c = 0; c < 4; c++) {
-                rv += rv_comb_proc(seq->rv_comb[c], seq->rv_comb_len[c],
-                                   &seq->rv_comb_pos[c], rv_in, 0.78f + 0.02f * c);
-            }
-            rv = rv_ap_proc(seq->rv_ap[0], seq->rv_ap_len[0], &seq->rv_ap_pos[0], rv);
-            rv = rv_ap_proc(seq->rv_ap[1], seq->rv_ap_len[1], &seq->rv_ap_pos[1], rv);
-            left += rv * 0.5f;
-            right += rv * 0.5f;
-        }
-
-        /* v23: chorus send effect (sine-modulated delay, slight feedback) */
-        if (cho_in != 0.0f || seq->cho_buf[seq->cho_pos] != 0.0f) {
-            seq->cho_lfo += (float)(2.0 * M_PI * 0.7) / (float)seq->sample_rate;
-            if (seq->cho_lfo > 2.0f * (float)M_PI) seq->cho_lfo -= 2.0f * (float)M_PI;
-
-            float delay = (float)seq->cho_len * 0.5f +
-                          (float)seq->cho_len * 0.25f * sinf(seq->cho_lfo);
-            float rpos = (float)seq->cho_pos - delay;
-            while (rpos < 0.0f) rpos += (float)seq->cho_len;
-            int i0 = (int)rpos;
-            float fr = rpos - (float)i0;
-            if (i0 >= seq->cho_len) i0 -= seq->cho_len;
-            int i1 = (i0 + 1 == seq->cho_len) ? 0 : i0 + 1;
-            float dout = seq->cho_buf[i0] + (seq->cho_buf[i1] - seq->cho_buf[i0]) * fr;
-
-            seq->cho_buf[seq->cho_pos] = cho_in + dout * 0.15f;
-            seq->cho_pos = (seq->cho_pos + 1 == seq->cho_len) ? 0 : seq->cho_pos + 1;
-
-            left += dout * 0.35f;
-            right += dout * 0.35f;
-        }
-
-        /* Apply master volume and clip */
-        left *= seq->volume;
-        right *= seq->volume;
-
-        if (left > 1.0f) left = 1.0f;
-        if (left < -1.0f) left = -1.0f;
-        if (right > 1.0f) right = 1.0f;
-        if (right < -1.0f) right = -1.0f;
-
-        /* Output */
-        buffer[s * 2] = (int16_t)(left * 32767);
-        buffer[s * 2 + 1] = (int16_t)(right * 32767);
-    }
-}
-
-/* Advance sequencer by real time (microseconds) - for time-based synchronization */
-void midi_advance_time(MidiFile* midi, uint64_t elapsed_us) {
-    if (!midi || !midi->sequencer || !midi->sequencer->playing) return;
-
-    MidiSequencer* seq = midi->sequencer;
-
-    /* Convert elapsed time to ticks */
-    /* v23: via us_per_tick so SMPTE (ticks-per-second) files advance correctly */
-    double ticks = (double)elapsed_us / seq->us_per_tick;
-    seq->tick_accumulator += ticks;
-
-    /* Process ticks */
-    while (seq->tick_accumulator >= 1.0) {
-        seq->tick_accumulator -= 1.0;
-        midi_process_tick(seq);
-    }
-}
-
-/* Start playback */
+/* ------------------------------------------------------------------
+ * Playback control
+ * ------------------------------------------------------------------ */
 void midi_play(MidiFile* midi) {
-    if (!midi || !midi->sequencer) return;
+    if (!midi || !midi->eas_data || !midi->eas_stream) return;
+    SONIVOX_TRACE("midi_play eas=%p stream=%p is_midi_stream=%d end_reached=%d",
+                  (void*) midi->eas_data, (void*) midi->eas_stream,
+                  midi->is_midi_stream, midi->sequencer->end_reached);
+    /* If we already reached the end, restart from the beginning */
+    if (midi->sequencer->end_reached && !midi->is_midi_stream) {
+        EAS_Locate((EAS_DATA_HANDLE) midi->eas_data,
+                   (EAS_HANDLE) midi->eas_stream, 0, EAS_FALSE);
+        midi->sequencer->end_reached = false;
+        midi->sequencer->position = 0;
+        midi->src_avail = 0; midi->src_pos = 0.0;
+    }
     midi->sequencer->playing = true;
+    EAS_RESULT r = EAS_Resume((EAS_DATA_HANDLE) midi->eas_data,
+                              (EAS_HANDLE) midi->eas_stream);
+    SONIVOX_TRACE("midi_play EAS_Resume result=%ld playing=%d",
+                  (long) r, midi->sequencer->playing ? 1 : 0);
     g_active_sequencer = midi->sequencer;
 }
 
-/* Stop playback */
 void midi_stop(MidiFile* midi) {
-    if (!midi || !midi->sequencer) return;
+    if (!midi || !midi->eas_data || !midi->eas_stream) return;
+    SONIVOX_TRACE("midi_stop eas=%p stream=%p",
+                  (void*) midi->eas_data, (void*) midi->eas_stream);
     midi->sequencer->playing = false;
-    
-    /* Stop all notes */
-    for (int i = 0; i < midi->sequencer->max_active_notes; i++) {
-        midi->sequencer->active_notes[i].active = false;
-    }
-    midi->sequencer->active_note_count = 0;
+    midi->sequencer->end_reached = true;
+    EAS_Pause((EAS_DATA_HANDLE) midi->eas_data,
+              (EAS_HANDLE) midi->eas_stream);
+    /* Reset leftover buffer so we don't replay stale samples */
+    midi->src_avail = 0; midi->src_pos = 0.0;
 }
 
-/* Pause playback */
 void midi_pause(MidiFile* midi) {
-    if (!midi || !midi->sequencer) return;
+    if (!midi || !midi->eas_data || !midi->eas_stream) return;
     midi->sequencer->playing = false;
+    EAS_Pause((EAS_DATA_HANDLE) midi->eas_data,
+              (EAS_HANDLE) midi->eas_stream);
 }
 
-/* Resume playback */
 void midi_resume(MidiFile* midi) {
-    if (!midi || !midi->sequencer) return;
+    if (!midi || !midi->eas_data || !midi->eas_stream) return;
     midi->sequencer->playing = true;
+    EAS_Resume((EAS_DATA_HANDLE) midi->eas_data,
+               (EAS_HANDLE) midi->eas_stream);
 }
 
-/* Set loop mode */
 void midi_set_loop(MidiFile* midi, bool loop) {
     if (!midi || !midi->sequencer) return;
     midi->sequencer->loop = loop;
 }
 
-/* Set volume */
 void midi_set_volume(MidiFile* midi, float volume) {
-    if (!midi || !midi->sequencer) return;
+    if (!midi || !midi->eas_data || !midi->eas_stream) return;
     if (volume < 0.0f) volume = 0.0f;
     if (volume > 1.0f) volume = 1.0f;
     midi->sequencer->volume = volume;
-}
-
-/* Get current position in seconds */
-float midi_get_position(MidiFile* midi) {
-    if (!midi || !midi->sequencer) return 0.0f;
-    
-    MidiSequencer* seq = midi->sequencer;
-    
-    /* Convert position (ticks) to seconds */
-    if (seq->us_per_tick > 0.0) {
-        return (float)((double)seq->position * seq->us_per_tick / 1000000.0);
-    }
-    
-    return 0.0f;
-}
-
-/* Get total length in seconds */
-float midi_get_length(MidiFile* midi) {
-    if (!midi || !midi->sequencer) return 0.0f;
-    
-    /* v36.27: честное время конца песни (карта темпов, скан при загрузке).
-     * Прежний код брал max(длин треков) В БАЙТАХ и выдавал байты за тики. */
-    return (float)((double)midi->sequencer->total_time_us / 1000000.0);
-}
-
-/* Direct note on */
-void midi_note_on(uint8_t channel, uint8_t note, uint8_t velocity) {
-    if (g_active_sequencer) {
-        start_note(g_active_sequencer, channel, note, velocity);
-    }
-}
-
-/* Direct note off */
-void midi_note_off(uint8_t channel, uint8_t note) {
-    if (g_active_sequencer) {
-        stop_note(g_active_sequencer, channel, note);
-    }
-}
-
-/* Direct control change (v23: full controller set, incl. sustain pedal,
- * bank select, modulation and the reverb/chorus send levels) */
-void midi_control_change(uint8_t channel, uint8_t controller, uint8_t value) {
-    if (!g_active_sequencer) return;
-    MidiChannel* ch = &g_active_sequencer->channels[channel];
-
-    switch (controller) {
-        case MIDI_CTRL_VOLUME:
-            ch->volume = value;
-            break;
-        case MIDI_CTRL_PAN:
-            ch->pan = value;
-            break;
-        case MIDI_CTRL_EXPRESSION:
-            ch->expression = value;
-            break;
-        case MIDI_CTRL_SUSTAIN: {
-            uint8_t prev = ch->sustain;
-            ch->sustain = value;
-            if (prev >= 64 && value < 64) {
-                release_sustained(g_active_sequencer, channel);
-            }
-            break;
-        }
-        case MIDI_CTRL_BANK_SELECT:
-            ch->bank = value;
-            break;
-        case MIDI_CTRL_MODULATION:
-            ch->modulation = value;
-            break;
-        case MIDI_CTRL_REVERB:
-            ch->reverb = value;
-            break;
-        case MIDI_CTRL_CHORUS:
-            ch->chorus = value;
-            break;
-    }
-}
-
-/* Direct program change */
-void midi_program_change(uint8_t channel, uint8_t program) {
-    if (g_active_sequencer) {
-        g_active_sequencer->channels[channel].program = program;
-    }
-}
-
-/* Direct pitch bend */
-void midi_pitch_bend(uint8_t channel, int16_t value) {
-    if (g_active_sequencer) {
-        g_active_sequencer->channels[channel].pitch_bend = 
-            powf(2.0f, value / 8192.0f / 6.0f);
-    }
-}
-
-/* Get active sequencer */
-MidiSequencer* midi_get_active_sequencer(void) {
-    return g_active_sequencer;
-}
-
-/* Get duration in milliseconds */
-uint32_t midi_get_duration_ms(MidiFile* midi) {
-    if (!midi || !midi->sequencer) return 0;
-    
-    /* v36.27: total_time_us — конец песни по карте темпов (скан при
-     * загрузке), а не байтовая длина трека. */
-    return (uint32_t)(midi->sequencer->total_time_us / 1000);
-}
-
-/* Get current position in milliseconds */
-uint32_t midi_get_position_ms(MidiFile* midi) {
-    if (!midi || !midi->sequencer) return 0;
-    
-    MidiSequencer* seq = midi->sequencer;
-    return (uint32_t)((double)seq->position * seq->us_per_tick / 1000.0);
-}
-
-/* Set position in milliseconds */
-void midi_set_position_ms(MidiFile* midi, uint32_t position_ms) {
-    if (!midi || !midi->sequencer) return;
-
-    MidiSequencer* seq = midi->sequencer;
-    if (seq->us_per_tick > 0.0) {
-        seq->position = (uint32_t)((double)position_ms * 1000.0 / seq->us_per_tick);
-    }
-    seq->end_reached = false;  /* v23: seeking re-arms END_OF_MEDIA */
-
-    /* v36.28 FIX («на главном экране Asphalt 3 3D тихо»): seek ДОЛЖЕН
-     * ре-инициализировать треки так же, как старт прохода лупа в
-     * midi_process_tick. Прежний код сбрасывал только byte-offset
-     * (track->position=0) и ended, оставляя:
-     *   - track->delta_time от СТАРОЙ позиции потока (мусор до десятков
-     *     тысяч тиков — ноты «не наступают» никогда);
-     *   - track->running_status от старой позиции (первый event после
-     *     seek с running-status читался чужим статусом);
-     *   - tick_accumulator (незакрытая дробь тика между сеансами).
-     * А так как track->position=0 — это НАЧАЛО ТРЕКА ВМЕСТЕ С ЗАГОЛОВКОМ
-     * "MTrk"+длиной, первые «события» парсились из байтов заголовка
-     * (только они и успевали: diag ev=7, notes=0 — затем гигантская
-     * мусорная дельта). Меню-мелодия Asphalt 3 (b(0,1): setMediaTime(0)
-     * перед КАЖДЫМ start()) молчала ВСЕГДА; луповая гоночная тема
-     * самовыздоравливала на рестарте лупа (там дельта перечитывается). */
-    seq->tick_accumulator = 0.0;
-    for (int i = 0; i < seq->header.track_count; i++) {
-        MidiTrack* track = &seq->tracks[i];
-        track->position = 0;
-        track->ended = false;
-        track->running_status = 0;
-        track->delta_time = read_var_len(track->data, &track->position,
-                                         track->length);
-    }
-
-    /* Seek на 0 — это рестарт: глушим голоса и сбрасываем каналы в те же
-     * дефолты, что и рестарт лупа (v36.27 LOOP HYGIENE), иначе программы/
-     * громкости/сустейн с прошлой позиции протекают в новое начало. */
-    for (int i = 0; i < seq->max_active_notes; i++) {
-        seq->active_notes[i].active = false;
-    }
-    seq->active_note_count = 0;
-    for (int c = 0; c < MIDI_CHANNELS; c++) {
-        MidiChannel* ch = &seq->channels[c];
-        ch->program = 0;
-        ch->volume = 100;
-        ch->pan = 64;
-        ch->expression = 127;
-        ch->sustain = 0;
-        ch->pitch_bend = 1.0f;
-        ch->bank = 0;
-        ch->modulation = 0;
-        ch->reverb = 40;
-        ch->chorus = 0;
-    }
-}
-
-/* Get channel volume */
-int midi_get_channel_volume(int channel) {
-    if (!g_active_sequencer || channel < 0 || channel >= MIDI_CHANNELS) return 100;
-    return g_active_sequencer->channels[channel].volume;
-}
-
-/* Get channel program */
-int midi_get_program(int channel) {
-    if (!g_active_sequencer || channel < 0 || channel >= MIDI_CHANNELS) return 0;
-    return g_active_sequencer->channels[channel].program;
+    /* EAS_SetVolume expects 0..100 (1 dB increments) */
+    EAS_SetVolume((EAS_DATA_HANDLE) midi->eas_data,
+                  (EAS_HANDLE) midi->eas_stream,
+                  (EAS_I32)(volume * 100.0f));
 }
 
 /* ------------------------------------------------------------------
- * v23: per-file direct commands - MIDIControl on a specific player's
- * synthesizer instead of the global active sequencer.
+ * midi_generate_samples: render samples into user's stereo int16
+ * buffer. Sonivox emits BUFFER_SIZE_IN_MONO_SAMPLES frames per call
+ * (where each frame = NUM_OUTPUT_CHANNELS samples = 2 for stereo).
+ * We loop until we've filled the request, draining src_buf first.
  * ------------------------------------------------------------------ */
 
-static MidiSequencer* file_seq(MidiFile* midi) {
-    return midi ? midi->sequencer : NULL;
+/* Sonivox eas_audioconst.h (when -D _SAMPLE_RATE_22050) sets
+ * BUFFER_SIZE_IN_MONO_SAMPLES = 128. Each EAS_Render call emits
+ * exactly 128 mono frames = 256 stereo shorts. We hardcode this
+ * because eas_audioconst.h pulls in too many other internals. */
+#define NOJME_EAS_BUFFER_FRAMES 128
+
+/* Sonivox internal synth rate (matches wt_22khz.c bank). NOJME's
+ * audio system runs at g_sample_rate (default 44100). We render at
+ * the bank's native rate (22050) and linearly upsample 2:1 to
+ * 44100 in midi_generate_samples — same approach as the WAV
+ * resampler in media.c. */
+#define SONIVOX_SRC_RATE 22050
+
+void midi_generate_samples(MidiFile* midi, int16_t* buffer, int samples) {
+    if (!midi || !midi->sequencer || !buffer) return;
+
+    /* Always zero the output buffer so silence is true silence even
+     * if EAS_Render is not called (e.g. paused or empty stream). */
+    memset(buffer, 0, (size_t) samples * 2 * sizeof(int16_t));
+
+    if (!midi->eas_data || !midi->eas_stream) {
+        SONIVOX_TRACE("midi_generate_samples: NO eas_data/stream (eas=%p stream=%p)",
+                      (void*) (midi ? midi->eas_data : NULL),
+                      (void*) (midi ? midi->eas_stream : NULL));
+        return;
+    }
+
+    /* v36.89 [SONIVOX-DIAG]: throttle to 1 log line per ~100 calls.
+     * v36.90: the whole block (incl. the peak scan) runs only when the
+     * trace is enabled — it used to scan the buffer unconditionally. */
+    static uint32_t s_gen_seq = 0;
+    static uint32_t s_gen_last = 0;
+    int log_this = 0;
+    if (sonivox_trace_enabled()) {
+        s_gen_seq++;
+        log_this = (s_gen_seq - s_gen_last >= 100);
+        if (log_this) s_gen_last = s_gen_seq;
+    }
+
+    /* src_ratio = 22050 / 44100 = 0.5 (one dst sample advances src_pos by 0.5) */
+    const double src_ratio = (double) SONIVOX_SRC_RATE / (double) g_sample_rate;
+    int samples_filled = 0;
+
+    /* Main render+upsample loop.
+     * src_buf layout (129 stereo frames = 258 shorts):
+     *   frame 0      = carryover sample from previous EAS_Render batch
+     *                  (or 0 on first call, for clean interp start)
+     *   frames 1..128 = current EAS_Render output
+     * src_pos is the fractional read position (in src_buf frame units).
+     * It advances by src_ratio (0.5) per dst sample filled. When
+     * src_pos >= 128 (we've used all 128 new frames + carryover), we
+     * carry the last frame to position 0 and render a new batch.
+     */
+    while (samples_filled < samples) {
+        /* Refill src_buf if we don't have enough to interpolate (need >= 2 frames) */
+        if (midi->src_avail < 2) {
+            /* If we have a carryover frame (src_avail == 1), keep it at
+             * position 0; render new batch into positions 1..128.
+             * If src_avail == 0 (first call), zero out position 0 (silent
+             * carryover) and render into positions 1..128. */
+            int offset;
+            if (midi->src_avail == 1) {
+                /* Already at position 0 from previous carry */
+                offset = 1;
+            } else {
+                /* First call: position 0 = silence */
+                midi->src_buf[0] = 0;
+                midi->src_buf[1] = 0;
+                midi->src_avail = 1;
+                offset = 1;
+            }
+
+            EAS_I32 generated = 0;
+            EAS_RESULT r = EAS_Render(
+                (EAS_DATA_HANDLE) midi->eas_data,
+                (EAS_PCM*) (midi->src_buf + offset * 2),
+                (EAS_I32) NOJME_EAS_BUFFER_FRAMES,
+                &generated);
+
+            if (log_this) {
+                SONIVOX_TRACE("midi_generate_samples: EAS_Render r=%ld gen=%ld playing=%d",
+                              (long) r, (long) generated,
+                              midi->sequencer->playing ? 1 : 0);
+            }
+
+            if (r != EAS_SUCCESS || generated <= 0) {
+                /* Render failed or stream ended */
+                EAS_STATE state = EAS_STATE_STOPPED;
+                EAS_State((EAS_DATA_HANDLE) midi->eas_data,
+                          (EAS_HANDLE) midi->eas_stream, &state);
+                if (log_this) {
+                    SONIVOX_TRACE("midi_generate_samples: render returned r=%ld gen=%ld state=%ld",
+                                  (long) r, (long) generated, (long) state);
+                }
+
+                if (state == EAS_STATE_STOPPED || state == EAS_STATE_EMPTY) {
+                    midi->sequencer->end_reached = true;
+                    midi->sequencer->playing = false;
+
+                    /* Loop support: rewind and resume for next render call */
+                    if (midi->sequencer->loop && !midi->is_midi_stream) {
+                        EAS_Locate((EAS_DATA_HANDLE) midi->eas_data,
+                                   (EAS_HANDLE) midi->eas_stream, 0, EAS_FALSE);
+                        EAS_Resume((EAS_DATA_HANDLE) midi->eas_data,
+                                   (EAS_HANDLE) midi->eas_stream);
+                        midi->sequencer->end_reached = false;
+                        midi->sequencer->playing = true;
+                        /* Discard carryover, restart src buffer */
+                        midi->src_avail = 0;
+                        midi->src_pos = 0.0;
+                        continue;
+                    }
+                }
+                /* Fill rest with silence (already zeroed) and bail */
+                break;
+            }
+
+            /* src_avail now = offset (carryover) + generated (new frames) */
+            midi->src_avail = offset + (int) generated;
+            /* src_pos unchanged: any fractional remainder past the previous
+             * src_avail-1 is preserved across the carry+refill */
+
+            /* [MIDI-LOOP-FIX] v36.95: natural end-of-file detection for
+             * SMF file players. EAS_Render keeps returning EAS_SUCCESS
+             * with a full buffer after the sequence has ended (silence +
+             * voice tails), so the old EOF check - reachable only when
+             * EAS_Render returns an error or zero samples - NEVER fired
+             * at a normal end of file. The sequencer stayed "playing"
+             * forever, mix_midi_player's loop-restart branch was dead
+             * code, and EVERY game with setLoopCount(-1..N) MIDI music
+             * faded into permanent silence after the first pass (Brick
+             * Breaker Revolution 3D and friends). END_OF_MEDIA for
+             * non-looping players was equally unreachable.
+             * Poll the parser state once per refill batch (~5.8 ms of
+             * audio): STOPPING = all tracks hit EndOfTrack (voices may
+             * still ring), STOPPED = tracks done and voices drained,
+             * EMPTY = parser reports nothing left. On detection mark
+             * end_reached and drop "playing" so the mixer-side loop
+             * policy (mix_midi_player) restarts the track or finishes
+             * the player exactly as designed. Raw MIDI streams
+             * (device://tone, MIDIControl) never end - skipped. */
+            if (midi->sequencer->playing && !midi->is_midi_stream) {
+                EAS_STATE eof_state = EAS_STATE_READY;
+                if (EAS_State((EAS_DATA_HANDLE) midi->eas_data,
+                              (EAS_HANDLE) midi->eas_stream,
+                              &eof_state) == EAS_SUCCESS &&
+                    (eof_state == EAS_STATE_STOPPING ||
+                     eof_state == EAS_STATE_STOPPED ||
+                     eof_state == EAS_STATE_EMPTY)) {
+                    midi->sequencer->end_reached = true;
+                    midi->sequencer->playing = false;
+                    SONIVOX_TRACE("midi EOF: parser state=%ld pos_ms=%u dur_ms=%u",
+                                  (long) eof_state,
+                                  (unsigned) midi_get_position_ms(midi),
+                                  (unsigned) (midi->sequencer->total_time_us / 1000));
+                }
+            }
+        }
+
+        /* Linear interpolation from src_buf (22050 Hz) to dst_buf (44100 Hz) */
+        while (midi->src_pos < (double)(midi->src_avail - 1) &&
+               samples_filled < samples) {
+            int i0 = (int) midi->src_pos;
+            double frac = midi->src_pos - (double) i0;
+            int16_t L0 = midi->src_buf[i0 * 2];
+            int16_t R0 = midi->src_buf[i0 * 2 + 1];
+            int16_t L1 = midi->src_buf[(i0 + 1) * 2];
+            int16_t R1 = midi->src_buf[(i0 + 1) * 2 + 1];
+            int32_t L = (int32_t)L0 + (int32_t)(((double)(L1 - L0)) * frac);
+            int32_t R = (int32_t)R0 + (int32_t)(((double)(R1 - R0)) * frac);
+            /* v36.91 [MIDI-GAIN]: компенсация тихого выхода Sonivox
+             * относительно PCM/WAV (замер и мотивация — у g_midi_gain).
+             * Сатурация здесь же: mix-путь дальше добавляет player volume
+             * к остальным источникам, и его sat16 остаётся честным. */
+            if (g_midi_gain != 1.0f) {
+                L = (int32_t)((float) L * g_midi_gain);
+                R = (int32_t)((float) R * g_midi_gain);
+                if (L < -32768) L = -32768; else if (L > 32767) L = 32767;
+                if (R < -32768) R = -32768; else if (R > 32767) R = 32767;
+            }
+            buffer[samples_filled * 2]     = (int16_t) L;
+            buffer[samples_filled * 2 + 1] = (int16_t) R;
+            samples_filled++;
+            midi->src_pos += src_ratio;
+        }
+
+        /* If we've consumed all interp-able frames in this batch, carry
+         * the last one to position 0 and shift src_pos so the fractional
+         * remainder is preserved across the batch boundary. */
+        if (midi->src_pos >= (double)(midi->src_avail - 1)) {
+            int last = midi->src_avail - 1;
+            midi->src_buf[0] = midi->src_buf[last * 2];
+            midi->src_buf[1] = midi->src_buf[last * 2 + 1];
+            midi->src_pos -= (double) last;
+            midi->src_avail = 1;
+        }
+    }
+
+    /* Advance the song position (audio clock, in 44100 Hz frames) */
+    midi->sequencer->position += (uint32_t) samples_filled;
+    midi->sequencer->active_note_count =
+        midi->sequencer->playing ? midi->sequencer->active_note_count : 0;
+
+    /* v36.89 [SONIVOX-DIAG]: report peak amplitude every ~100 calls */
+    if (log_this) {
+        int32_t peak = 0;
+        for (int i = 0; i < samples * 2; i++) {
+            int32_t a = buffer[i] < 0 ? -buffer[i] : buffer[i];
+            if (a > peak) peak = a;
+        }
+        SONIVOX_TRACE("midi_generate_samples: filled=%d/%d peak=%d pos_ms=%u playing=%d end=%d",
+                      samples_filled, samples, (int) peak,
+                      (unsigned) midi_get_position_ms(midi),
+                      midi->sequencer->playing ? 1 : 0,
+                      midi->sequencer->end_reached ? 1 : 0);
+    }
 }
 
+/* ------------------------------------------------------------------
+ * midi_advance_time: with Sonivox, the audio clock IS the song clock
+ * (EAS_Render both advances and renders). So this is a no-op —
+ * mix_midi_player in media.c still calls it, but we don't need to do
+ * anything. Kept for API compatibility.
+ * ------------------------------------------------------------------ */
+void midi_advance_time(MidiFile* midi, uint64_t elapsed_us) {
+    (void) midi;
+    (void) elapsed_us;
+}
+
+/* ------------------------------------------------------------------
+ * Position queries
+ * ------------------------------------------------------------------ */
+float midi_get_position(MidiFile* midi) {
+    if (!midi || !midi->sequencer) return 0.0f;
+    return (float) ((double) midi->sequencer->position / (double) g_sample_rate);
+}
+
+float midi_get_length(MidiFile* midi) {
+    if (!midi || !midi->sequencer) return 0.0f;
+    return (float) ((double) midi->sequencer->total_time_us / 1000000.0);
+}
+
+uint32_t midi_get_duration_ms(MidiFile* midi) {
+    if (!midi || !midi->sequencer) return 0;
+    return (uint32_t) (midi->sequencer->total_time_us / 1000ULL);
+}
+
+uint32_t midi_get_position_ms(MidiFile* midi) {
+    if (!midi || !midi->sequencer) return 0;
+    uint64_t us = (uint64_t) midi->sequencer->position * 1000000ULL / g_sample_rate;
+    return (uint32_t) (us / 1000ULL);
+}
+
+void midi_set_position_ms(MidiFile* midi, uint32_t position_ms) {
+    if (!midi || !midi->eas_data || !midi->eas_stream || midi->is_midi_stream)
+        return;
+    /* Locate quantizes to ~5.9ms resolution — acceptable for J2ME */
+    EAS_Locate((EAS_DATA_HANDLE) midi->eas_data,
+               (EAS_HANDLE) midi->eas_stream,
+               (EAS_I32) position_ms, EAS_FALSE);
+    /* Reset sample clock to match (so subsequent position queries are
+     * consistent until the next EAS_Render) */
+    midi->sequencer->position =
+        (uint32_t) ((uint64_t) position_ms * g_sample_rate / 1000ULL);
+    midi->src_avail = 0; midi->src_pos = 0.0;
+}
+
+/* ------------------------------------------------------------------
+ * Direct MIDI commands: feed raw MIDI bytes into the synth via
+ * EAS_WriteMIDIStream. Both the global (g_active_sequencer) and the
+ * per-file variants build a 2- or 3-byte MIDI message and ship it.
+ * ------------------------------------------------------------------ */
+
+/* Forward declaration for the global variant target (defined below) */
+static void eas_send_message(EAS_DATA_HANDLE eas, EAS_HANDLE stream,
+                             uint8_t status, uint8_t data1, uint8_t data2,
+                             int data_len);
+
+static void send_message_file(MidiFile* midi, uint8_t status,
+                              uint8_t data1, uint8_t data2, int data_len) {
+    if (!midi || !midi->eas_data || !midi->eas_stream) return;
+    eas_send_message((EAS_DATA_HANDLE) midi->eas_data,
+                     (EAS_HANDLE) midi->eas_stream,
+                     status, data1, data2, data_len);
+}
+
+static void eas_send_message(EAS_DATA_HANDLE eas, EAS_HANDLE stream,
+                             uint8_t status, uint8_t data1, uint8_t data2,
+                             int data_len) {
+    if (!eas || !stream) return;
+    uint8_t msg[3];
+    msg[0] = status;
+    if (data_len >= 2) msg[1] = data1;
+    if (data_len >= 3) msg[2] = data2;
+    EAS_WriteMIDIStream(eas, stream, msg, (EAS_I32) data_len);
+}
+
+/* Per-file variants — route to a specific player's EAS stream.
+ * For SMF-loaded MidiFiles (midi_load), this writes into the synth
+ * owned by the SMF parser's stream — Sonivox accepts live MIDI on top
+ * of an SMF stream. For midi_load_empty(), this is the primary path. */
 void midi_note_on_file(MidiFile* midi, uint8_t channel, uint8_t note, uint8_t velocity) {
-    MidiSequencer* seq = file_seq(midi);
-    if (seq) start_note(seq, channel, note, velocity);
+    if (velocity == 0) {
+        send_message_file(midi, (uint8_t)(0x80 | (channel & 0x0F)),
+                          note, 0, 2);
+    } else {
+        send_message_file(midi, (uint8_t)(0x90 | (channel & 0x0F)),
+                          note, velocity, 3);
+    }
+    if (midi && midi->sequencer) {
+        midi->sequencer->channels[channel & 0x0F].program =
+            midi->sequencer->channels[channel & 0x0F].program;
+    }
 }
 
 void midi_note_off_file(MidiFile* midi, uint8_t channel, uint8_t note) {
-    MidiSequencer* seq = file_seq(midi);
-    if (seq) stop_note(seq, channel, note);
+    send_message_file(midi, (uint8_t)(0x80 | (channel & 0x0F)),
+                      note, 0, 2);
 }
 
-void midi_control_change_file(MidiFile* midi, uint8_t channel, uint8_t controller, uint8_t value) {
-    MidiSequencer* seq = file_seq(midi);
-    if (!seq) return;
-    MidiChannel* ch = &seq->channels[channel];
-
-    switch (controller) {
-        case MIDI_CTRL_VOLUME:      ch->volume = value; break;
-        case MIDI_CTRL_PAN:         ch->pan = value; break;
-        case MIDI_CTRL_EXPRESSION:  ch->expression = value; break;
-        case MIDI_CTRL_SUSTAIN: {
-            uint8_t prev = ch->sustain;
-            ch->sustain = value;
-            if (prev >= 64 && value < 64) release_sustained(seq, channel);
-            break;
+void midi_control_change_file(MidiFile* midi, uint8_t channel,
+                              uint8_t controller, uint8_t value) {
+    send_message_file(midi, (uint8_t)(0xB0 | (channel & 0x0F)),
+                      controller, value, 3);
+    if (midi && midi->sequencer) {
+        MidiChannel* ch = &midi->sequencer->channels[channel & 0x0F];
+        switch (controller) {
+            case MIDI_CTRL_VOLUME:      ch->volume = value; break;
+            case MIDI_CTRL_PAN:         ch->pan = value; break;
+            case MIDI_CTRL_EXPRESSION:  ch->expression = value; break;
+            case MIDI_CTRL_SUSTAIN:     ch->sustain = value; break;
+            case MIDI_CTRL_BANK_SELECT: ch->bank = value; break;
+            case MIDI_CTRL_MODULATION:  ch->modulation = value; break;
+            case MIDI_CTRL_REVERB:      ch->reverb = value; break;
+            case MIDI_CTRL_CHORUS:      ch->chorus = value; break;
+            default: break;
         }
-        case MIDI_CTRL_BANK_SELECT: ch->bank = value; break;
-        case MIDI_CTRL_MODULATION:  ch->modulation = value; break;
-        case MIDI_CTRL_REVERB:      ch->reverb = value; break;
-        case MIDI_CTRL_CHORUS:      ch->chorus = value; break;
     }
 }
 
 void midi_program_change_file(MidiFile* midi, uint8_t channel, uint8_t program) {
-    MidiSequencer* seq = file_seq(midi);
-    if (seq) seq->channels[channel].program = program;
+    send_message_file(midi, (uint8_t)(0xC0 | (channel & 0x0F)),
+                      program, 0, 2);
+    if (midi && midi->sequencer) {
+        midi->sequencer->channels[channel & 0x0F].program = program;
+    }
 }
 
 int midi_get_channel_volume_file(MidiFile* midi, int channel) {
-    MidiSequencer* seq = file_seq(midi);
-    if (!seq || channel < 0 || channel >= MIDI_CHANNELS) return 100;
-    return seq->channels[channel].volume;
+    if (!midi || !midi->sequencer) return 0;
+    if (channel < 0 || channel >= MIDI_CHANNELS) return 0;
+    return midi->sequencer->channels[channel].volume;
 }
 
 int midi_get_program_file(MidiFile* midi, int channel) {
-    MidiSequencer* seq = file_seq(midi);
-    if (!seq || channel < 0 || channel >= MIDI_CHANNELS) return 0;
-    return seq->channels[channel].program;
+    if (!midi || !midi->sequencer) return 0;
+    if (channel < 0 || channel >= MIDI_CHANNELS) return 0;
+    return midi->sequencer->channels[channel].program;
 }
 
-/* v23: minimal valid MIDI file (header + track with only EOT) used as the
- * synthesizer target for device://tone and device://midi players so that
- * MIDIControl can drive a synth attached to that player. */
-MidiFile* midi_load_empty(void) {
-    static const uint8_t empty_midi[] = {
-        'M', 'T', 'h', 'd', 0x00, 0x00, 0x00, 0x06,  /* MThd, len 6 */
-        0x00, 0x00,                                   /* format 0 */
-        0x00, 0x01,                                   /* 1 track */
-        0x01, 0xE0,                                   /* 480 ticks per beat */
-        'M', 'T', 'r', 'k', 0x00, 0x00, 0x00, 0x04,  /* MTrk, len 4 */
-        0x00, 0xFF, 0x2F, 0x00                        /* delta 0, End of Track */
-    };
-    MidiFile* m = midi_load(empty_midi, (uint32_t)sizeof(empty_midi));
-    return m;
+/* Global variants — for tone players that have no specific MidiFile
+ * target. Routes to the global default MIDI stream (g_default_stream). */
+void midi_note_on(uint8_t channel, uint8_t note, uint8_t velocity) {
+    if (velocity == 0) {
+        eas_send_message(g_default_eas, g_default_stream,
+                         (uint8_t)(0x80 | (channel & 0x0F)), note, 0, 2);
+    } else {
+        eas_send_message(g_default_eas, g_default_stream,
+                         (uint8_t)(0x90 | (channel & 0x0F)), note, velocity, 3);
+    }
+}
+
+void midi_note_off(uint8_t channel, uint8_t note) {
+    eas_send_message(g_default_eas, g_default_stream,
+                     (uint8_t)(0x80 | (channel & 0x0F)), note, 0, 2);
+}
+
+void midi_control_change(uint8_t channel, uint8_t controller, uint8_t value) {
+    eas_send_message(g_default_eas, g_default_stream,
+                     (uint8_t)(0xB0 | (channel & 0x0F)), controller, value, 3);
+}
+
+void midi_program_change(uint8_t channel, uint8_t program) {
+    eas_send_message(g_default_eas, g_default_stream,
+                     (uint8_t)(0xC0 | (channel & 0x0F)), program, 0, 2);
+}
+
+void midi_pitch_bend(uint8_t channel, int16_t value) {
+    /* MIDI pitch bend: status 0xEn, 14-bit value split into LSB/MSB */
+    uint8_t lsb = (uint8_t)(value & 0x7F);
+    uint8_t msb = (uint8_t)((value >> 7) & 0x7F);
+    eas_send_message(g_default_eas, g_default_stream,
+                     (uint8_t)(0xE0 | (channel & 0x0F)), lsb, msb, 3);
+}
+
+int midi_get_channel_volume(int channel) {
+    if (channel < 0 || channel >= MIDI_CHANNELS) return 0;
+    if (!g_active_sequencer) return 100;
+    return g_active_sequencer->channels[channel].volume;
+}
+
+int midi_get_program(int channel) {
+    if (channel < 0 || channel >= MIDI_CHANNELS) return 0;
+    if (!g_active_sequencer) return 0;
+    return g_active_sequencer->channels[channel].program;
+}
+
+MidiSequencer* midi_get_active_sequencer(void) {
+    return g_active_sequencer;
+}
+
+/* ------------------------------------------------------------------
+ * midi_process_tick: NOJME's media.c calls this in some legacy paths
+ * (e.g. when the wall-clock driven approach was used). With Sonivox
+ * the song clock is driven by EAS_Render, so this is a no-op.
+ * ------------------------------------------------------------------ */
+void midi_process_tick(MidiSequencer* seq) {
+    (void) seq;
 }

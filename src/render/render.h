@@ -585,6 +585,13 @@ int nojme_2d_scalar_forced(void);
 void nojme_convert_xrgb8888_to_rgb565(const uint32_t* restrict src, uint16_t* restrict dst,
                                       int width, int height);
 
+/* v36.100 [CREATERGB-FOLD] SIMD stages for midp_image_create_from_rgb
+ * (bit-identical to the scalar loops they replace — see render.c):
+ *   nojme_span_or_opaque    dst[i] = 0xFF000000 | (src[i] & 0x00FFFFFF)
+ *   nojme_span_all_alpha_ff 1 <=> every (p>>24) == 0xFF  (exact scan) */
+void nojme_span_or_opaque(uint32_t* dst, const uint32_t* src, size_t n);
+int  nojme_span_all_alpha_ff(const uint32_t* p, size_t n);
+
 /* 2D micro-benchmark (env NOJME_2D_BENCH=1): times every optimized 2D
  * primitive scalar-vs-fast on a 240x320 screen and reports Mpx/s.
  * Returns 0. */

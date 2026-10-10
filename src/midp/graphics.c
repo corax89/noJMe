@@ -447,7 +447,12 @@ MidpImage* midp_image_create(int width, int height, bool mutable) {
     MidpImage* img = (MidpImage*)malloc(sizeof(MidpImage));
     if (!img) return NULL;
     
-    img->pixels = (uint32_t*)calloc(pixel_count, sizeof(uint32_t));
+    /* v36.100 [CREATERGB-FOLD]: calloc -> malloc. Every caller fills the
+     * pixel buffer before any read: mutable images take the white memset
+     * below, create_from_rgb / create_from_data overwrite every pixel in
+     * their conversion loops. The 300 KB zero-fill of a full-screen
+     * createRGBImage was pure waste on every dynamic-effect frame. */
+    img->pixels = (uint32_t*)malloc(pixel_count * sizeof(uint32_t));
     if (!img->pixels) {
         free(img);
         return NULL;
@@ -518,18 +523,24 @@ MidpImage* midp_image_create_from_rgb(const jint* rgb, int width, int height,
     MidpImage* img = midp_image_create(width, height, false);
     if (!img) return NULL;
     
-    bool has_nonopaque = false; /* v34.51: exact scan, folded into the copy */
-    for (int i = 0; i < width * height; i++) {
-        if (process_alpha) {
-            img->pixels[i] = (uint32_t)rgb[i];
-            if ((img->pixels[i] >> 24) != 0xFFu) has_nonopaque = true;
-        } else {
-            img->pixels[i] = 0xFF000000 | ((uint32_t)rgb[i] & 0xFFFFFF);
-        }
+    /* v36.100 [CREATERGB-FOLD]: the scalar per-pixel loop (branch on
+     * process_alpha + non-opaque scan per pixel) became a frame-rate tax
+     * for Gameloft-style dynamic effects (getRGB -> JAVA tint loop ->
+     * createRGBImage -> drawImage, full-screen 240x320 per frame).
+     * Bit-identical SIMD stages (render.c):
+     *   process_alpha=0 : nojme_span_or_opaque  (0xFF000000 | src&0xFFFFFF)
+     *   process_alpha=1 : memcpy + nojme_span_all_alpha_ff exact scan
+     * The host PixelBench measured the old loop at ~6 ms per full-screen
+     * createRGBImage; the folded stages run at memcpy speed. */
+    const size_t total = (size_t)width * (size_t)height;
+    if (!process_alpha) {
+        nojme_span_or_opaque(img->pixels, (const uint32_t*)rgb, total);
+        img->alpha = false;
+    } else {
+        memcpy(img->pixels, rgb, total * sizeof(uint32_t));
+        img->alpha = !nojme_span_all_alpha_ff(img->pixels, total);
     }
-    
-    img->alpha = process_alpha && has_nonopaque;
-    img->alpha_scan_valid = JNI_TRUE;      /* exact knowledge from this loop */
+    img->alpha_scan_valid = JNI_TRUE;      /* exact knowledge from the scan */
     img->alpha_all_opaque = !img->alpha;
     return img;
 }

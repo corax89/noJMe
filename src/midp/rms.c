@@ -123,6 +123,10 @@ typedef struct {
 
 /* Forward declaration */
 static jlong rms_current_time_ms(void);
+/* v37.01 [RMS-ZOMBIE-HEAL]: вызывается из rms_load_store_file (строка ~1022),
+ * определена ниже (компакция слотов свапом последнего — тот же путь, что
+ * deleteRecord). */
+static void rms_remove_record_slot(NativeRecordStore* store, int slot);
 
 /* Record stores (static table - handles are indexes and must stay stable) */
 static NativeRecordStore record_stores[MAX_RECORD_STORES];
@@ -258,9 +262,71 @@ static char rms_game_name[256] = {0};  /* e.g. "game" (from game.jar filename) *
 /* Magic bytes and version for RMS save file format.
  * v1: magic, ver=1, next_id, count, records{id,size,data}...
  * v2: magic, ver=2, next_id, count, store_version, last_modified(u64),
- *     authmode, writable, records{id,size,data}... */
+ *     authmode, writable, records{id,size,data}...
+ * v3 (v36.106 [RMS-SAVEGUARD]): как v2 + замыкающий u32 CRC32 ВСЕХ
+ *     предшествующих байтов файла (poly 0xEDB88320, reflected, init/
+ *     final xor 0xFFFFFFFF — стандартный zip-CRC). Назначение: битый
+ *     сейв (мусор из-под смерти процесса в памяти, полустёртая SD,
+ *     обрыв записи) опознаётся ДО разбора и не подменяет прогресс —
+ *     загрузчик уходит на резерв .rms.old (см. rms_load_store_from_disk).
+ *     Читатель принимает v1..v3 (легаси без CRC — только структурная
+ *     проверка границ). */
 #define RMS_FILE_MAGIC  0x524D5300  /* "RMS\0" */
-#define RMS_FILE_VERSION 2
+#define RMS_FILE_VERSION 3
+
+/* v36.106 [RMS-SAVEGUARD]: CRC32 (zip-полином), локальная реализация —
+ * ноль зависимостей линковки (miniz оставлен JAR-ридеру). Нибл-таблица —
+ * компромисс размер/скорость как в miniz; данные сторов — единицы КБ. */
+static uint32_t rms_crc32(uint32_t crc, const uint8_t* p, size_t n) {
+    static const uint32_t t[16] = {
+        0, 0x1db71064, 0x3b6e20c8, 0x26d930ac, 0x76dc4190, 0x6b6b51f4,
+        0x4db26158, 0x5005713c, 0xedb88320, 0xf00f9344, 0xd6d6a3e8,
+        0xcb61b38c, 0x9b64c2b0, 0x86d3d2d4, 0xa00ae278, 0xbdbdf21c
+    };
+    crc ^= 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) {
+        crc = (crc >> 4) ^ t[(crc & 0xF) ^ (p[i] & 0xF)];
+        crc = (crc >> 4) ^ t[(crc & 0xF) ^ ((uint32_t)p[i] >> 4)];
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+/* Помощники записи «в файл + в CRC» — порядок байтов идентичен
+ * rms_write_u32/rms_write_u64 (маленький конец), чтобы читатель-валидатор
+ * считал ровно те же байты. Ошибки fwrite копятся в *err (одна проверка
+ * в конце записи — не на каждый вызов). */
+static void rms_w_u32(FILE* f, uint32_t* crc, int* err, uint32_t v) {
+    uint8_t b[4] = { (uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24) };
+    if (fwrite(b, 1, 4, f) != 4) *err = 1;
+    if (crc) *crc = rms_crc32(*crc, b, 4);  /* NULL = трейлер: сам CRC не хешируется */
+}
+static void rms_w_u64(FILE* f, uint32_t* crc, int* err, uint64_t v) {
+    rms_w_u32(f, crc, err, (uint32_t)(v & 0xFFFFFFFFu));
+    rms_w_u32(f, crc, err, (uint32_t)(v >> 32));
+}
+static void rms_w_data(FILE* f, uint32_t* crc, int* err, const void* p, uint32_t n) {
+    if (n == 0) return;
+    if (fwrite(p, 1, n, f) != n) *err = 1;
+    else *crc = rms_crc32(*crc, (const uint8_t*)p, n);
+}
+
+/* v36.106 [RMS-SAVEGUARD]: событие защиты сохранений в полевой лог
+ * (sw_trace_force — та же лента, что [RMS]/diag, видна на Switch в
+ * log.txt при включённом «Лог»). Без троттлинга: события редкие и
+ * каждое — приговор/спасение прогресса. */
+static void rms_guard_note(const char* fmt, ...) {
+    char body[224];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(body, sizeof(body), fmt, ap);
+    va_end(ap);
+    extern void sw_trace_force(const char* fmt, ...) __attribute__((weak));
+    if (&sw_trace_force && sw_trace_force) {
+        sw_trace_force("[RMS-SAVEGUARD] %s", body);
+    } else {
+        fprintf(stderr, "[RMS-SAVEGUARD] %s\n", body);
+    }
+}
 
 /* v36.52 [RMS-DIR-MEMO]: mkdir на СУЩЕСТВУЮЩЕМ каталоге возвращает
  * EEXIST(-1), и старый rms_ensure_dir принимал это за «надо строить
@@ -463,17 +529,6 @@ static void rms_build_dirpath(char* out, int out_size) {
     snprintf(out, out_size, "%s/%s", rms_save_dir, rms_game_name);
 }
 
-/* Write a 32-bit little-endian value */
-static void rms_write_u32(FILE* f, uint32_t val) {
-    uint8_t buf[4] = {
-        (uint8_t)(val & 0xFF),
-        (uint8_t)((val >> 8) & 0xFF),
-        (uint8_t)((val >> 16) & 0xFF),
-        (uint8_t)((val >> 24) & 0xFF)
-    };
-    fwrite(buf, 1, 4, f);
-}
-
 /* Read a 32-bit little-endian value */
 static uint32_t rms_read_u32(FILE* f) {
     uint8_t buf[4];
@@ -481,11 +536,8 @@ static uint32_t rms_read_u32(FILE* f) {
     return buf[0] | (buf[1] << 8) | (buf[2] << 16) | ((uint32_t)(buf[3]) << 24);
 }
 
-/* Write a 64-bit little-endian value */
-static void rms_write_u64(FILE* f, uint64_t val) {
-    rms_write_u32(f, (uint32_t)(val & 0xFFFFFFFFu));
-    rms_write_u32(f, (uint32_t)(val >> 32));
-}
+/* (v36.106 [RMS-SAVEGUARD]: старые rms_write_u32/rms_write_u64 удалены —
+ * запись идёт только через помощники rms_w_* с CRC; читатели остались.) */
 
 /* Read a 64-bit little-endian value */
 static uint64_t rms_read_u64(FILE* f) {
@@ -567,34 +619,54 @@ static void rms_save_store_to_disk(int handle) {
         return;
     }
 
-    /* Write header (v2) */
-    rms_write_u32(f, RMS_FILE_MAGIC);
-    rms_write_u32(f, RMS_FILE_VERSION);
-    rms_write_u32(f, (uint32_t)store->next_id);
+    /* v36.106 [RMS-SAVEGUARD]: тело записи идёт через помощники
+     * «write+CRC» и завершается ЗАМЫКАЮЩИМ CRC32 всего файла (формат v3).
+     * Любая ошибка fwrite откладывается в werr и проверяется ОДИН раз
+     * перед финальным fflush/fsync — частично записанный .tmp не
+     * доезжает до rename и просто удаляется, прежний .rms не тронут. */
+    uint32_t crc = 0;
+    int werr = 0;
+
+    /* Write header (v3) */
+    rms_w_u32(f, &crc, &werr, RMS_FILE_MAGIC);
+    rms_w_u32(f, &crc, &werr, RMS_FILE_VERSION);
+    rms_w_u32(f, &crc, &werr, (uint32_t)store->next_id);
 
     /* Count records */
     uint32_t record_count = 0;
     for (int i = 0; i < store->record_count; i++) {
         if (store->records[i].valid) record_count++;
     }
-    rms_write_u32(f, record_count);
+    rms_w_u32(f, &crc, &werr, record_count);
 
     /* v2 metadata: version counter, lastModified, authmode, writable */
-    rms_write_u32(f, (uint32_t)store->version);
-    rms_write_u64(f, (uint64_t)store->last_modified);
-    rms_write_u32(f, (uint32_t)store->authmode);
-    rms_write_u32(f, store->writable ? 1u : 0u);
+    rms_w_u32(f, &crc, &werr, (uint32_t)store->version);
+    rms_w_u64(f, &crc, &werr, (uint64_t)store->last_modified);
+    rms_w_u32(f, &crc, &werr, (uint32_t)store->authmode);
+    rms_w_u32(f, &crc, &werr, store->writable ? 1u : 0u);
 
     /* Write each record */
     for (int i = 0; i < store->record_count; i++) {
         if (!store->records[i].valid) continue;
 
-        rms_write_u32(f, (uint32_t)store->records[i].id);
-        rms_write_u32(f, (uint32_t)store->records[i].size);
+        rms_w_u32(f, &crc, &werr, (uint32_t)store->records[i].id);
+        rms_w_u32(f, &crc, &werr, (uint32_t)store->records[i].size);
 
         if (store->records[i].size > 0 && store->records[i].data) {
-            fwrite(store->records[i].data, 1, store->records[i].size, f);
+            rms_w_data(f, &crc, &werr, store->records[i].data,
+                       (uint32_t)store->records[i].size);
         }
+    }
+
+    /* v3 trailer: CRC32 всего файла выше — последним полем, в сам CRC
+     * не входит (порядок байтов тот же маленький конец). */
+    rms_w_u32(f, NULL, &werr, crc);
+
+    if (werr) {
+        RMS_DEBUG("RMS SAVE: write error on %s — aborting, old file kept", tmppath);
+        fclose(f);
+        nojme_pg_remove("rms-clean-tmp", tmppath); /* [PATHGUARD] v36.51 */
+        return;
     }
 
     /* v18 (audit R-2): flush everything to disk, then swap atomically */
@@ -606,8 +678,47 @@ static void rms_save_store_to_disk(int handle) {
 #endif
     fclose(f);
 
+    /* v36.106 [RMS-SAVEGUARD] — танец переименований «сначала резерв,
+     * потом замена». Полевой приоритет пользователя: ПРОШЛЫЕ сохранения
+     * важнее последних — в любой момент на диске есть хотя бы одна
+     * полная валидная копия стора:
+     *   1) прежний .rms переименовывается в .rms.old (ПОСЛЕДНЯЯ
+     *      УСПЕШНАЯ версия — становится откатной точкой);
+     *   2) .rms.tmp -> .rms (финальный rename: получатель УЖЕ ОТСУТСТВУЕТ
+     *      — одиночный rename атомарен и на POSIX, и на HOS-семантике
+     *      IFileSystem.RenameFile из v36.52 [RMS-REPLACE], где rename на
+     *      существующий получатель падает);
+     *   3) при отказе (2) — откат: .rms.old возвращается на место .rms.
+     * Окна смерти процесса:
+     *   - во время (1)/(2): .rms может отсутствовать, но .old цел —
+     *     загрузчик восстановит ([RMS-RECOVER]);
+     *   - во время записи .tmp: .rms прежний не тронут вовсе.
+     * Глубина цепочки — одно поколение (.old перезатирается каждой
+     * успешной записью), место на SD ограничено 2x размера стора. */
+    char oldpath[1040];
+    snprintf(oldpath, sizeof(oldpath), "%s.old", filepath);
+    nojme_pg_watch("rms:oldpath", oldpath, sizeof(oldpath)); /* [PATHGUARD] v36.51 */
+
+    struct stat rst;
+    int have_previous = (nojme_pg_stat("rms-sg-stat", filepath, &rst) == 0);
+    if (have_previous) {
+        nojme_pg_remove("rms-sg-delold", oldpath); /* [PATHGUARD] */
+        if (nojme_pg_rename("rms-sg-rotate", filepath, oldpath) != 0) {
+            /* Не смертельно: продолжаем без резерва — финальный rename
+             * сам разрулит замену (fallback v36.52 внутри portable_rename). */
+            rms_guard_note("store='%s': rotate .rms -> .rms.old failed — "
+                           "saving without a backup copy", store->name);
+            have_previous = 0;
+        }
+    }
+
     if (rms_portable_rename(tmppath, filepath) != 0) {
         RMS_DEBUG("RMS SAVE: atomic rename failed (%s -> %s)", tmppath, filepath);
+        rms_guard_note("store='%s': final rename failed — rolling back "
+                       "the previous good file", store->name);
+        if (have_previous) {
+            nojme_pg_rename("rms-sg-restore", oldpath, filepath); /* [PATHGUARD] */
+        }
         nojme_pg_remove("rms-clean-tmp", tmppath); /* [PATHGUARD] v36.51 */
         return;
     }
@@ -673,23 +784,95 @@ static void rms_flush_dirty_stores(void) {
     }
 }
 
-/* Load a single record store from disk (accepts v1 and v2 formats) */
-static bool rms_load_store_from_disk(NativeRecordStore* store) {
-    if (!store || !store->name) return false;
-    if (!rms_save_dir[0] || !rms_game_name[0]) {
-        /* v36.28 DIAG (sandbox RMS persistence debugging): the launcher sets
-         * both before the midlet runs — a miss here means an init-order bug. */
-        rms_trace_op("load '%s' SKIP: save_dir/game_name empty (dir='%s' game='%s')",
-                     store->name, rms_save_dir, rms_game_name);
-        return false;
+/* v36.106 [RMS-SAVEGUARD]: БЫСТРЫЙ заголовочный снифф — версия формата
+ * файла (без загрузки). 0 = файла нет / не читается / плохая магия
+ * (сегодняшний ленивый загрузчик точно так же отвергает плохую магию). */
+static uint32_t rms_file_version(const char* path) {
+    FILE* f = nojme_pg_fopen("rms-sniff", path, "rb");
+    if (!f) return 0;
+    uint8_t b[8];
+    size_t got = fread(b, 1, 8, f);
+    fclose(f);
+    if (got != 8) return 0;
+    uint32_t magic = b[0] | (b[1] << 8) | (b[2] << 16) | ((uint32_t)b[3] << 24);
+    if (magic != RMS_FILE_MAGIC) return 0;
+    uint32_t v = b[4] | (b[5] << 8) | (b[6] << 16) | ((uint32_t)b[7] << 24);
+    if (v < 1 || v > RMS_FILE_VERSION) return 0;
+    return v;
+}
+
+/* v36.106 [RMS-SAVEGUARD]: СТРОГАЯ валидация файла стора v3 без загрузки.
+ * Проходит весь файл: магия, версия, метаданные v2+, каждая запись
+ * (id >= 1, size <= MAX_RECORD_SIZE, данные целиком в границах файла),
+ * ЗАМЫКАЮЩИЙ CRC32 (считается в том же порядке, что писал rms_save_store_to_disk)
+ * и строго EOF после него. Возвращает 1 = цел, 0 = бит. Для v1/v2 не
+ * вызывается: без CRC отличить мусор от легаси-файла нельзя — они идут
+ * ленивым путём как раньше (обрыв хвоста сегодня спасает начало файла). */
+static int rms_store_file_valid(const char* path) {
+    FILE* f = nojme_pg_fopen("rms-validate", path, "rb");
+    if (!f) return 0;
+    uint32_t crc = 0;
+    uint8_t b[8];
+    int ok = 1;
+    uint32_t version = 0, count = 0;
+
+    if (fread(b, 1, 8, f) != 8) {
+        fclose(f);
+        return 0;
     }
+    crc = rms_crc32(crc, b, 8);
+    uint32_t magic = b[0] | (b[1] << 8) | (b[2] << 16) | ((uint32_t)b[3] << 24);
+    version = b[4] | (b[5] << 8) | (b[6] << 16) | ((uint32_t)b[7] << 24);
+    if (magic != RMS_FILE_MAGIC) ok = 0;
+    if (ok && (version < 1 || version > RMS_FILE_VERSION)) ok = 0;
 
-    /* Build file path */
-    char filepath[1024];
-    rms_build_filepath(store->name, filepath, sizeof(filepath));
-    if (!filepath[0]) return false;
-    nojme_pg_watch("rms:loadpath", filepath, sizeof(filepath)); /* [PATHGUARD] v36.51 */
+    if (ok) {  /* next_id + count */
+        if (fread(b, 1, 8, f) != 8) ok = 0;
+        else {
+            crc = rms_crc32(crc, b, 8);
+            count = b[4] | (b[5] << 8) | (b[6] << 16) | ((uint32_t)b[7] << 24);
+        }
+    }
+    if (ok && version >= 2) {  /* v2 metadata: 4+8+4+4 */
+        uint8_t meta[20];
+        if (fread(meta, 1, 20, f) != 20) ok = 0;
+        else crc = rms_crc32(crc, meta, 20);
+    }
+    if (ok) {
+        uint8_t skip[4096];
+        for (uint32_t r = 0; r < count && ok; r++) {
+            if (fread(b, 1, 8, f) != 8) { ok = 0; break; }
+            crc = rms_crc32(crc, b, 8);
+            uint32_t rec_id  = b[0] | (b[1] << 8) | (b[2] << 16) | ((uint32_t)b[3] << 24);
+            uint32_t rec_sz  = b[4] | (b[5] << 8) | (b[6] << 16) | ((uint32_t)b[7] << 24);
+            if (rec_id < 1 || rec_sz > MAX_RECORD_SIZE) { ok = 0; break; }
+            uint32_t left = rec_sz;
+            while (left > 0 && ok) {
+                uint32_t chunk = left > sizeof(skip) ? (uint32_t)sizeof(skip) : left;
+                if (fread(skip, 1, chunk, f) != chunk) { ok = 0; break; }
+                crc = rms_crc32(crc, skip, chunk);
+                left -= chunk;
+            }
+        }
+    }
+    if (ok && version >= 3) {
+        uint8_t cb[4];
+        if (fread(cb, 1, 4, f) != 4) ok = 0;
+        else {
+            uint32_t stored = cb[0] | (cb[1] << 8) | (cb[2] << 16) | ((uint32_t)cb[3] << 24);
+            if (stored != crc) ok = 0;
+        }
+        if (ok && fgetc(f) != EOF) ok = 0;  /* v3: после CRC — строго EOF */
+    }
+    fclose(f);
+    return ok;
+}
 
+/* v36.106 [RMS-SAVEGUARD]: ленивая загрузка из КОНКРЕТНОГО файла (главный
+ * .rms / резерв .rms.old / легаси .rms.bak) — прежнее тело без изменений:
+ * обрыв хвоста v1/v2 спасает начало (как было всегда), метаданные v2+,
+ * монотонный next_id. Возвращает true, если хоть одна запись прочитана. */
+static bool rms_load_store_file(NativeRecordStore* store, const char* filepath) {
     /* Open file for reading */
     FILE* f = nojme_pg_fopen("rms-load", filepath, "rb");
     if (!f) {
@@ -800,8 +983,156 @@ static bool rms_load_store_from_disk(NativeRecordStore* store) {
         store->next_id = (int)next_id;
     }
 
+    /* v37.01 [RMS-ZOMBIE-HEAL]: САМОЛЕЧЕНИЕ «зомби»-стора. Полевой кейс
+     * (Bounce Tales, лог 2026-10-10): файл ВАЛИДЕН по CRC v3 (спасгард
+     * молчит), но содержит единственную ПУСТУЮ запись с id=11 при
+     * next_id=12. Широчайшая идиома J2ME-игр (Bounce Tales и класс
+     * corax89-репозитория): «open; если getNumRecords()==0 —
+     * addRecord(null,0,0); setRecord(1, данные)» — жёстко зашитый id 1.
+     * На зомби-сторе getNumRecords()>0 (addRecord не вызывается),
+     * getRecord(1)/setRecord(1) вечно кидают InvalidRecordIDException:
+     * И ЧТЕНИЕ, И ЗАПИСЬ сломаны навсегда — в меню игры только «Новая
+     * игра», прогресс не сохраняется ни разу. Зомби рождается из
+     * исторических потерь записей (v34.92-v36.52: на HOS терялись ВСЕ
+     * RMS-записи; обрывы хвостов): стор «0 записей + stale next_id»
+     * даёт addRecord с id=next_id, setRecord(1) падает, стор
+     * фиксируется с одной пустой записью.
+     * Условие хила СТРОГО не трогает живые данные: срабатывает ТОЛЬКО
+     * когда (а) записи id=1 НЕТ, (б) ВСЕ оставшиеся записи ПУСТЫ (0
+     * байт полезной нагрузки — стор не несёт ни бита информации),
+     * (в) next_id>1. Действие: пустые записи удаляются, next_id=1
+     * (эквивалент свежего стора — как deleteRecordStore+create на
+     * реальном телефоне, единственное «лекарство» в поле), стор
+     * помечается dirty (чистое состояние персистентится ближайшим
+     * флашем). Следующий save игры получает id=1 — цикл сохранений
+     * восстанавливается. Рубильник NOJME_RMS_HEAL=0 (хост A/B). */
+    {
+        static int s_heal_on = -1;
+        if (s_heal_on < 0) {
+            const char* e = getenv("NOJME_RMS_HEAL");
+            s_heal_on = (e && e[0] && e[0] == '0') ? 0 : 1;
+        }
+        if (s_heal_on) {
+            bool has_id1 = false;
+            bool all_empty = true;
+            for (int i = 0; i < store->record_count; i++) {
+                if (!store->records[i].valid) continue;
+                if (store->records[i].id == 1) { has_id1 = true; break; }
+                if (store->records[i].size > 0) { all_empty = false; break; }
+            }
+            if (!has_id1 && all_empty && store->next_id > 1) {
+                int dropped = 0;
+                while (store->record_count > 0) {
+                    rms_remove_record_slot(store, 0);
+                    dropped++;
+                }
+                store->next_id = 1;
+                store->dirty = true;
+                store->dirty_since = rms_current_time_ms();
+                {
+                    char body[224];
+                    snprintf(body, sizeof(body),
+                             "store='%s': zombie store healed "
+                             "(no id 1, all %d records empty, next_id was %u) "
+                             "-> fresh state (next id will be 1)",
+                             store->name ? store->name : "?", dropped,
+                             (unsigned)next_id);
+                    extern void sw_trace_force(const char* fmt, ...)
+                        __attribute__((weak));
+                    if (&sw_trace_force && sw_trace_force) {
+                        sw_trace_force("[RMS-HEAL] %s", body);
+                    } else {
+                        fprintf(stderr, "[RMS-HEAL] %s\n", body);
+                    }
+                }
+                RMS_DEBUG("RMS HEAL: store '%s' reset to fresh (dropped %d "
+                          "empty records, next_id %u -> 1)",
+                          store->name, dropped, (unsigned)next_id);
+            }
+        }
+    }
+
     RMS_DEBUG("RMS LOAD: Loaded %u records for store '%s'", loaded, store->name);
     return loaded > 0;
+}
+
+/* Load a single record store from disk — v36.106 [RMS-SAVEGUARD] обёртка
+ * с цепочкой защиты: главный .rms проверяется СТРОГО (v3: CRC + границы);
+ * битый/отсутствующий главный файл уходит в карантин .rms.bad, прогресс
+ * восстанавливается из .rms.old (последняя успешная версия — ротация при
+ * каждом сохранении), затем из легаси .rms.bak (остатки fallback v36.52).
+ * Легаси v1/v2 без CRC грузятся лениво как раньше (полуоборванный файл
+ * отдаёт уцелевшее начало). Приоритет полевого запроса: ПРОШЛЫЙ прогресс
+ * важнее последнего сохранения. */
+static bool rms_load_store_from_disk(NativeRecordStore* store) {
+    if (!store || !store->name) return false;
+    if (!rms_save_dir[0] || !rms_game_name[0]) {
+        /* v36.28 DIAG (sandbox RMS persistence debugging): the launcher sets
+         * both before the midlet runs — a miss here means an init-order bug. */
+        rms_trace_op("load '%s' SKIP: save_dir/game_name empty (dir='%s' game='%s')",
+                     store->name, rms_save_dir, rms_game_name);
+        return false;
+    }
+
+    /* Build file path */
+    char filepath[1024];
+    rms_build_filepath(store->name, filepath, sizeof(filepath));
+    if (!filepath[0]) return false;
+    nojme_pg_watch("rms:loadpath", filepath, sizeof(filepath)); /* [PATHGUARD] v36.51 */
+
+    uint32_t ver = rms_file_version(filepath);
+    if (ver >= 1 && ver <= 2) {
+        /* Легаси без CRC: ленивый путь как раньше — сегодня такой файл
+         * грузится «что уцелело, то уцелело». */
+        return rms_load_store_file(store, filepath);
+    }
+    if (ver == 3 && rms_store_file_valid(filepath)) {
+        return rms_load_store_file(store, filepath);
+    }
+
+    /* Главный файл бит (v3 не прошёл CRC/структуру) или отсутствует
+     * (окно смерти между ротацией .rms->.old и финальным rename —
+     * v36.106). Если он ЕСТЬ — карантин .bad: улика для разбора и
+     * защита .old от замусоривания при следующем сохранении. */
+    {
+        struct stat qst;
+        if (nojme_pg_stat("rms-sg-qstat", filepath, &qst) == 0) {
+            char badpath[1040];
+            snprintf(badpath, sizeof(badpath), "%s.bad", filepath);
+            nojme_pg_watch("rms:badpath", badpath, sizeof(badpath));
+            nojme_pg_remove("rms-sg-delbad", badpath); /* [PATHGUARD] */
+            if (nojme_pg_rename("rms-sg-quarantine", filepath, badpath) == 0) {
+                rms_guard_note("store='%s': main file failed validation — "
+                               "QUARANTINED to .bad, trying backups",
+                               store->name);
+            } else {
+                rms_guard_note("store='%s': main file failed validation and "
+                               "could not be quarantined — trying backups",
+                               store->name);
+            }
+        }
+    }
+
+    /* Цепочка резервов: .rms.old (последняя успешная запись), затем
+     * легаси .rms.bak (переходный резерв fallback-rename v36.52). */
+    const char* suffixes[2] = { ".old", ".bak" };
+    for (int i = 0; i < 2; i++) {
+        char cand[1040];
+        snprintf(cand, sizeof(cand), "%s%s", filepath, suffixes[i]);
+        nojme_pg_watch("rms:candpath", cand, sizeof(cand));
+        uint32_t cver = rms_file_version(cand);
+        if (cver == 0) continue;
+        if (cver == 3 && !rms_store_file_valid(cand)) continue;
+        bool got = rms_load_store_file(store, cand);
+        rms_guard_note("store='%s': RECOVER from %s (previous good save)%s",
+                       store->name, suffixes[i], got ? "" : " — no records");
+        return got;
+    }
+
+    /* Ни главного, ни резервов: чистый старт (как было до v36.106,
+     * только с сохранённой уликой .bad). */
+    rms_trace_op("load '%s': no valid save (main and backups)", store->name);
+    return false;
 }
 
 /* Delete a record store file from disk */
@@ -812,6 +1143,16 @@ static void rms_delete_store_file(const char* name) {
     rms_build_filepath(name, filepath, sizeof(filepath));
     if (filepath[0]) {
         nojme_pg_remove("rms-del", filepath); /* [PATHGUARD] v36.51 */
+        /* v36.106 [RMS-SAVEGUARD]: удаляем и всю свиту стора — иначе
+         * «удалённая» игра воскресла бы из .rms.old при следующем открытии
+         * того же имени. Сюда же .tmp (мусор умершей записи), .bad (улика
+         * уже смотрена) и легаси .bak. */
+        char side[1040];
+        const char* suffixes[4] = { ".old", ".bak", ".bad", ".tmp" };
+        for (int i = 0; i < 4; i++) {
+            snprintf(side, sizeof(side), "%s%s", filepath, suffixes[i]);
+            nojme_pg_remove("rms-del-side", side); /* [PATHGUARD] */
+        }
         RMS_DEBUG("RMS: Deleted file %s", filepath);
     }
 }
@@ -870,47 +1211,125 @@ static void rms_scan_save_dir(rms_dir_cb cb, void* ud) {
  * - Windows: %APPDATA%\nojme\rms, fallback %USERPROFILE%\nojme\rms, fallback "rms"
  * - POSIX: $XDG_DATA_HOME/nojme/rms, fallback $HOME/.local/share/nojme/rms, fallback "rms"
  */
+/* v37.01 [RMS-GAME-SWITCH]: смена контекста сохранений (каталог или имя
+ * игры) ОБНУЛЯЕТ таблицу сторов в RAM. До этого таблица переживала
+ * переключение игры в меню фронтенда: игра Б, использующая то же имя
+ * стора (‘game’ — самое частое в J2ME), получала RAM reuse записей
+ * игры А — ЧТЕНИЕ чужих данных и ЗАПИСЬ своих поверх (затем под чужим
+ * каталогом при следующем флаше). Это и фабрика «зомби»-сторов: чужая
+ * игра с delete/add-циклами поднимает next_id, оставляет пустую запись
+ * без id=1 — и «idioma id 1» (см. [RMS-ZOMBIE-HEAL]) ломается навсегда.
+ * Порядок важен: сначала флаш dirty-сторов ПОД СТАРЫМ контекстом (верный
+ * каталог), затем полная очистка таблицы, затем присвоение новых путей.
+ * Тот же контекст (та же игра перезапущена) -> полный NO-OP, путь
+ * «RAM reuse» (v36.05) не тронут. Enum-registry/listeners сюда не
+ * входят: их чистит midp_rms_session_reset на teardown сессии —
+ * контекст меняется только между сессиями (запуск новой игры). */
+static void rms_apply_game_context(const char* new_dir, const char* new_game) {
+    /* caller holds the lock; globals still hold the PREVIOUS context */
+    if (strcmp(new_dir, rms_save_dir) == 0 &&
+        strcmp(new_game, rms_game_name) == 0) {
+        return; /* same game relaunched — RAM reuse intact */
+    }
+    int flushed = 0, freed_stores = 0;
+    /* 1) dirty-сторы — на диск ПОД СТАРЫМ именем (верный каталог);
+     * обычно это no-op: teardown прошлой сессии уже флашнул. */
+    for (int i = 0; i < MAX_RECORD_STORES; i++) {
+        if (record_stores[i].name && record_stores[i].dirty) {
+            rms_save_store_to_disk(i);
+            flushed++;
+        }
+    }
+    /* 2) полная очистка таблицы */
+    for (int i = 0; i < MAX_RECORD_STORES; i++) {
+        NativeRecordStore* st = &record_stores[i];
+        if (!st->name) continue;
+        for (int r = 0; r < st->record_count; r++) {
+            free(st->records[r].data);
+        }
+        free(st->records);
+        free(st->name);
+        memset(st, 0, sizeof(*st));
+        freed_stores++;
+    }
+    record_store_count = 0;
+    /* 3) новые пути (старые значения — в лог ДО перезаписи) */
+    {
+        char old_dir[512], old_game[256];
+        snprintf(old_dir, sizeof(old_dir), "%s", rms_save_dir);
+        snprintf(old_game, sizeof(old_game), "%s", rms_game_name);
+        snprintf(rms_save_dir, sizeof(rms_save_dir), "%s", new_dir);
+        snprintf(rms_game_name, sizeof(rms_game_name), "%s", new_game);
+        /* Лог — только на РЕАЛЬНОЙ смене контекста (прошлая игра -> новая);
+         * свежий процесс (пустые старые пути) стартовым присвоением не
+         * шумит — [RMS-GAME-SWITCH] в логе означает утечку данных между
+         * играми, prevented. */
+        if (old_dir[0] || old_game[0] || freed_stores || flushed) {
+            char body[2048];
+            snprintf(body, sizeof(body),
+                     "context switch dir='%.511s' game='%.255s' "
+                     "(was dir='%.511s' game='%.255s'): "
+                     "%d store(s) freed (%d flushed) — RAM store table is "
+                     "per-game now",
+                     new_dir, new_game, old_dir, old_game,
+                     freed_stores, flushed);
+            extern void sw_trace_force(const char* fmt, ...) __attribute__((weak));
+            if (&sw_trace_force && sw_trace_force) {
+                sw_trace_force("[RMS-GAME-SWITCH] %s", body);
+            } else {
+                fprintf(stderr, "[RMS-GAME-SWITCH] %s\n", body);
+            }
+        }
+    }
+    RMS_DEBUG("RMS GAME-SWITCH: dir='%s' game='%s' (freed %d stores, "
+              "flushed %d dirty)", new_dir, new_game, freed_stores, flushed);
+}
+
 void midp_rms_default_save_path(const char* game_name) {
     rms_lock();
 
+    char new_dir[512];
     const char* env_dir = getenv("NOJME_RMS_DIR");
     if (env_dir && env_dir[0]) {
-        strncpy(rms_save_dir, env_dir, sizeof(rms_save_dir) - 1);
-        rms_save_dir[sizeof(rms_save_dir) - 1] = '\0';
+        snprintf(new_dir, sizeof(new_dir), "%s", env_dir);
     } else {
 #ifdef _WIN32
         const char* appdata = getenv("APPDATA");
         if (appdata && appdata[0]) {
-            snprintf(rms_save_dir, sizeof(rms_save_dir), "%s\\nojme\\rms", appdata);
+            snprintf(new_dir, sizeof(new_dir), "%s\\nojme\\rms", appdata);
         } else {
             const char* up = getenv("USERPROFILE");
             if (up && up[0]) {
-                snprintf(rms_save_dir, sizeof(rms_save_dir), "%s\\nojme\\rms", up);
+                snprintf(new_dir, sizeof(new_dir), "%s\\nojme\\rms", up);
             } else {
-                snprintf(rms_save_dir, sizeof(rms_save_dir), "rms");
+                snprintf(new_dir, sizeof(new_dir), "rms");
             }
         }
 #else
         const char* xdg = getenv("XDG_DATA_HOME");
         if (xdg && xdg[0]) {
-            snprintf(rms_save_dir, sizeof(rms_save_dir), "%s/nojme/rms", xdg);
+            snprintf(new_dir, sizeof(new_dir), "%s/nojme/rms", xdg);
         } else {
             const char* home = getenv("HOME");
             if (home && home[0]) {
-                snprintf(rms_save_dir, sizeof(rms_save_dir), "%s/.local/share/nojme/rms", home);
+                snprintf(new_dir, sizeof(new_dir), "%s/.local/share/nojme/rms", home);
             } else {
-                snprintf(rms_save_dir, sizeof(rms_save_dir), "rms");
+                snprintf(new_dir, sizeof(new_dir), "rms");
             }
         }
 #endif
     }
 
+    /* v36.32 [RMS-PATH-FIX] semantics: NULL/empty game_name keeps the
+     * current name; v37.01 [RMS-GAME-SWITCH]: context change resets the
+     * in-RAM store table (flush first, under the OLD paths). */
+    char new_game[256];
     if (game_name && game_name[0]) {
-        /* v36.32 [RMS-PATH-FIX]: sanitize game_name ONCE at set time so the
-         * mkdir path (rms_build_dirpath) and the fopen path
-         * (rms_build_filepath) always agree on the same bytes */
-        rms_sanitize_store_name(game_name, rms_game_name, sizeof(rms_game_name));
+        rms_sanitize_store_name(game_name, new_game, sizeof(new_game));
+    } else {
+        snprintf(new_game, sizeof(new_game), "%s", rms_game_name);
     }
+    rms_apply_game_context(new_dir, new_game);
 
     /* Create <save_dir>/<game_name> eagerly so listRecordStores sees it */
     char dirpath[1024];
@@ -925,15 +1344,23 @@ void midp_rms_default_save_path(const char* game_name) {
 /* Set the save directory and game name (called from libretro core) */
 void midp_rms_set_save_path(const char* save_dir, const char* game_name) {
     rms_lock();
+    char new_dir[512];
     if (save_dir) {
-        strncpy(rms_save_dir, save_dir, sizeof(rms_save_dir) - 1);
-        rms_save_dir[sizeof(rms_save_dir) - 1] = '\0';
+        snprintf(new_dir, sizeof(new_dir), "%s", save_dir);
+    } else {
+        snprintf(new_dir, sizeof(new_dir), "%s", rms_save_dir);
     }
+    char new_game[256];
     if (game_name) {
         /* v36.32 [RMS-PATH-FIX]: sanitize here too — midp_rms_set_save_path
          * (libretro) and midp_rms_default_save_path must behave alike */
-        rms_sanitize_store_name(game_name, rms_game_name, sizeof(rms_game_name));
+        rms_sanitize_store_name(game_name, new_game, sizeof(new_game));
+    } else {
+        snprintf(new_game, sizeof(new_game), "%s", rms_game_name);
     }
+    /* v37.01 [RMS-GAME-SWITCH]: смена контента libretro — тот же сброс
+     * таблицы сторов, что и у фронтенда Switch. */
+    rms_apply_game_context(new_dir, new_game);
     RMS_DEBUG("RMS: save_dir='%s', game_name='%s'", rms_save_dir, rms_game_name);
     rms_unlock();
 }
@@ -1898,6 +2325,70 @@ static JavaValue native_rms_getRecordSize(JVM* jvm, JavaThread* thread,
     return NATIVE_RETURN_INT(size);
 }
 
+/* v37.02 [RMS-GAP-HEAL]: автовосстановление потерянных «хвостовых»
+ * записей в момент ЗАПИСИ. Полевой кейс (Zombie Infection, лог
+ * 2026-10-10: «загрузилось не то, что сохранялось»): стор 'a' нёс
+ * запись id=1 (настройки, 219 Б), а запись id=2 (прогресс) была
+ * потеряна историческими багами (v34.92-v36.52 теряли RMS-записи на
+ * HOS; перекрёстное заражение общей RAM-таблицы сторов до v37.01).
+ * Идиома Gameloft (декомпиляция класса g): бутстрап B(n) создаёт
+ * записи 1..n ТОЛЬКО при getNumRecords()==0 — пока жива запись 1,
+ * он не выполнится никогда; дальше getRecord(2) вечно кидает
+ * InvalidRecordIDException (g.c PC=14 — «нет сохранения»), а
+ * setRecord(2,...) гибнет в g.a PC=16 и ТИХО глотается catch: прогресс
+ * не пишется ни разу, настройки (запись 1) живут — ровно картина
+ * «на месте прогресса грузится чужое/старое».
+ *
+ * Лечение: setRecord(id) по несуществующему id >= next_id — ид не
+ * выдавался addRecord в этой жизни файла, значит игра пишет в «хвост»,
+ * который существовал до потери. Запись создаётся пустым слотом
+ * (данные кладёт обычный путь setRecord ниже), next_id продвигается за
+ * id. Для корректной игры путь недостижим (setRecord по спеке получает
+ * только живые в сторе id), поэтому семантика здоровых игр не меняется.
+ * Граница id <= next_id + RMS_GAP_HEAL_MAX_GAP защищает от дикого id.
+ * Автосоздание ТОЛЬКО в записи: getRecord/deleteRecord/getRecordSize
+ * сохраняют спеку — иначе цикл сканирования «for(i=1);;i++)
+ * getRecord(i) до исключения» уходит в бесконечный рост стора.
+ * Рубильник NOJME_RMS_GAP_HEAL=0 (хост A/B). */
+#define RMS_GAP_HEAL_MAX_GAP 64
+static bool rms_gap_heal_record(NativeRecordStore* store, int record_id) {
+    static int s_heal_on = -1;
+    if (s_heal_on < 0) {
+        const char* e = getenv("NOJME_RMS_GAP_HEAL");
+        s_heal_on = (e && e[0] && e[0] == '0') ? 0 : 1;
+    }
+    if (!s_heal_on) return false;
+    if (record_id < 1) return false;
+    if (record_id > 0x10000) return false; /* защита формата/лавины */
+    if (record_id < store->next_id) return false; /* удалённый id: спека */
+    if (record_id > store->next_id + RMS_GAP_HEAL_MAX_GAP) return false;
+
+    Record* rec = rms_alloc_record_slot(store, record_id, NULL, 0);
+    if (!rec) return false;
+    int old_next = store->next_id;
+    if (record_id + 1 > store->next_id) store->next_id = record_id + 1;
+    {
+        char body[256];
+        snprintf(body, sizeof(body),
+                 "store='%s': gap heal — setRecord id=%d auto-created "
+                 "(id >= next_id=%d: tail record lost by an old build), "
+                 "next_id -> %d",
+                 store->name ? store->name : "?", record_id, old_next,
+                 store->next_id);
+        extern void sw_trace_force(const char* fmt, ...)
+            __attribute__((weak));
+        if (&sw_trace_force && sw_trace_force) {
+            sw_trace_force("[RMS-HEAL] %s", body);
+        } else {
+            fprintf(stderr, "[RMS-HEAL] %s\n", body);
+        }
+    }
+    RMS_DEBUG("RMS GAP HEAL: store '%s' record id=%d created "
+              "(next_id %d -> %d)", store->name ? store->name : "?",
+              record_id, old_next, store->next_id);
+    return true;
+}
+
 /* RecordStore.setRecord(int, byte[], int, int) */
 static JavaValue native_rms_setRecord(JVM* jvm, JavaThread* thread,
                                       JavaValue* args, int arg_count) {
@@ -1938,18 +2429,29 @@ static JavaValue native_rms_setRecord(JVM* jvm, JavaThread* thread,
         return NATIVE_RETURN_VOID();
     }
 
-    int slot = rms_find_record_slot(store, record_id);
-    if (slot < 0) {
-        rms_throw(jvm, thread, "javax/microedition/rms/InvalidRecordIDException", NULL);
-        rms_unlock();
-        return NATIVE_RETURN_VOID();
-    }
-
-    /* Bounds check (zero-length is legal) */
+    /* Bounds check (zero-length is legal) — ДО gap-heal: вызов с битыми
+     * аргументами не должен оставлять фантомную пустую запись. */
     if (offset < 0 || length < 0 || (data && (offset + length > (jint)data->length))) {
         rms_throw(jvm, thread, "java/lang/ArrayIndexOutOfBoundsException", NULL);
         rms_unlock();
         return NATIVE_RETURN_VOID();
+    }
+
+    int slot = rms_find_record_slot(store, record_id);
+    if (slot < 0) {
+        /* v37.02 [RMS-GAP-HEAL]: потерянная «хвостовая» запись — лечение
+         * на месте, обычный путь ниже кладёт данные. Иначе — спека. */
+        if (!rms_gap_heal_record(store, record_id)) {
+            rms_throw(jvm, thread, "javax/microedition/rms/InvalidRecordIDException", NULL);
+            rms_unlock();
+            return NATIVE_RETURN_VOID();
+        }
+        slot = rms_find_record_slot(store, record_id);
+        if (slot < 0) {
+            rms_throw(jvm, thread, "javax/microedition/rms/InvalidRecordIDException", NULL);
+            rms_unlock();
+            return NATIVE_RETURN_VOID();
+        }
     }
 
     /* v34.74 (R-4): the OLD record's bytes are released by this replace, so
@@ -1986,6 +2488,14 @@ static JavaValue native_rms_setRecord(JVM* jvm, JavaThread* thread,
     /* Update version and lastModified */
     store->version++;
     store->last_modified = rms_current_time_ms();
+
+    /* v37.02: сторона ЗАПИСИ жизненного цикла сохранений — до этого
+     * трейсил только getRecord/addRecord, и полевой разбор Zombie
+     * Infection шёл вслепую (шесть неудачных setRecord(2) в логе
+     * выглядели как «открыл-закрыл без действия»). */
+    rms_trace_op("setRecord '%s' id=%d size=%d (records=%d)",
+                 store->name ? store->name : "?", record_id, length,
+                 store->record_count);
 
     /* Save to disk */
     int h = rms_get_handle(store);
@@ -2040,6 +2550,11 @@ static JavaValue native_rms_deleteRecord(JVM* jvm, JavaThread* thread,
     /* NOTE: next_id is NOT rolled back - IDs are monotonic and never reused */
     store->version++;
     store->last_modified = rms_current_time_ms();
+
+    /* v37.02: телеметрия удалений (жизненный цикл сохранений, см. setRecord) */
+    rms_trace_op("deleteRecord '%s' id=%d -> records=%d next_id=%d",
+                 store->name ? store->name : "?", record_id,
+                 store->record_count, store->next_id);
 
     /* Save to disk */
     int h = rms_get_handle(store);
@@ -3330,4 +3845,24 @@ void midp_rms_session_reset(void) {
             }
         }
     }
+}
+
+/* v37.01 [RMS-WAIT]: сколько сторов сейчас ЗАКРЫТО с отложенной записью
+ * (dirty) или ещё ОТКРЫТО (игра допишет и закроет их в destroyApp)?
+ * Используется фронтендом Switch перед destroyApp/teardown: если >0,
+ * выход потянет дисковые записи RMS (100-800 мс на стор на SD) — на это
+ * время в центре экрана рисуется «ожидается завершение сохранения».
+ * Лок сам инициализируется (CAS-схема) — безопасно даже если RMS в
+ * этом процессе ещё ни разу не использовался. */
+int midp_rms_exit_writes_pending(void) {
+    rms_lock();
+    int n = 0;
+    for (int i = 0; i < MAX_RECORD_STORES; i++) {
+        if (record_stores[i].name &&
+            (record_stores[i].open || record_stores[i].dirty)) {
+            n++;
+        }
+    }
+    rms_unlock();
+    return n;
 }

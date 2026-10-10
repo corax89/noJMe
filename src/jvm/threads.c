@@ -1881,6 +1881,12 @@ static CoopMonitor* get_monitor_named(JavaObject* obj, const char* site) {
  * игровая логика, см. serviceRepaints). */
 static __thread int64_t tls_paint_lock_deadline_ms = 0;
 static __thread int    tls_paint_lock_aborted = 0;
+/* v36.96 [KEY-BUDGET-FAST]: 1 = abort произошёл по ИСТЕЧЕНИЮ бюджета
+ * (классический [PAINT-LOCK] "gave up after N ms"); 0 = abort по другой
+ * причине — например [FENCE-DEADLOCK-BREAK] (владелец замка ждёт наш же
+ * фенс). display.c печатает [KEY-BUDGET "exceeded"] только при истечении,
+ * чтобы дедлок-разрыв не рапортовал ложное "exceeded 200 ms". */
+static __thread int    tls_paint_lock_deadline_hit = 0;
 
 /* v36.57 [MON-SITE]: сайт входа в monitor_enter (метод/класс кадра + тип
  * входа: блок или ACC_SYNC-метод) — пишут op_monitorenter/execute_method
@@ -1900,6 +1906,7 @@ void jvm_paint_lock_arm(uint32_t budget_ms) {
     int64_t now = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
     tls_paint_lock_deadline_ms = now + (int64_t)budget_ms;
     tls_paint_lock_aborted = 0;
+    tls_paint_lock_deadline_hit = 0;
 }
 void jvm_paint_lock_disarm(void) {
     tls_paint_lock_deadline_ms = 0;
@@ -1907,8 +1914,13 @@ void jvm_paint_lock_disarm(void) {
 int jvm_paint_lock_aborted(void) {
     return tls_paint_lock_aborted;
 }
+/* v36.96: 1 = abort по истечении бюджета (а не по дедлок-разрыву). */
+int jvm_paint_lock_budget_expired(void) {
+    return tls_paint_lock_deadline_hit;
+}
 void jvm_paint_lock_reset(void) {
     tls_paint_lock_aborted = 0;
+    tls_paint_lock_deadline_hit = 0;
     tls_paint_lock_deadline_ms = 0;
 }
 
@@ -2060,8 +2072,84 @@ int monitor_enter(JVM* jvm, JavaObject* obj) {
      * slice) also re-arms the GC-safepoint branch promptly. */
     long long mon_t0 = mon_wait_mono_ms();
     long long mon_last_log = 0;
+    long long mon_last_gate_log = 0; /* v36.92: свой троттл — не делит окно с [MON-WAIT] */
     int mon_steals = 0;
+    /* v36.92 [STEAL-GATE]: per-WAITER счётчик суммарного времени, которое
+     * владелец «работает» вместо сходящейся ожидаемой работы. _Thread_local:
+     * у каждого waiter-а свой эпизод ожидания; сбрасывается ниже при входе
+     * в новое ожидание. */
+    static _Thread_local long long tl_gate_working_total = 0;
+    tl_gate_working_total = 0;
     while (mon->entry_count > 0) {
+        /* v36.96 [FENCE-DEADLOCK-BREAK] (проверка ДО ожидания — ловит случай,
+         * когда владелец уже ждёт фенс в момент нашего входа): если мы —
+         * бюджетированная доставка фрейм-потока (tls_paint_lock_deadline_ms),
+         * а владелец монитора СПИН-ОЖИДАЕТ наш EXIT-FENCE
+         * (in_fence_wait, пишет jvm_frame_fence_wait_public) — это взаимная
+         * блокировка: наше окно Java не закончится (мы ждём его монитор), а
+         * владелец не выйдет из блока (ждёт наш фенс). ПОЛЕВОЙ КОРЕНЬ
+         * «очень коротких пауз» (Metal Slug 6, лог v36.95: 5 пауз ровно
+         * ~1000-1025 мс = истечение бюджета v36.94; до v36.94 тот же дедлок
+         * жил 22.5 с через цикл 2.5-с крышек фенса). Разрываем СРАЗУ:
+         * unwind снимает фенс (scope-guard execute_method), владелец
+         * доходит до monitorexit и освобождает монитор, ключ остаётся в
+         * очереди и доставляется следующей попыткой. Куча в безопасности:
+         * пока мы в monitor_enter, мы НЕ интерпретируем; после abort
+         * интерпретация владельца возобновляется ТОЛЬКО после снятия фенса. */
+        if (tls_paint_lock_deadline_ms && mon->owner_thread &&
+            mon->owner_thread->in_fence_wait) {
+            JavaThread* dl_owner = mon->owner_thread;
+            tls_paint_lock_aborted = 1;
+            {
+                static unsigned s_fence_dl_logs = 0;
+                if (++s_fence_dl_logs <= 40 || (s_fence_dl_logs % 500) == 0) {
+                    LOG_SAFE("[FENCE-DEADLOCK] delivery abort after %lld ms: "
+                             "monitor=%s owner t%d is fence-waiting on THIS "
+                             "frame-thread window (mutual deadlock) — breaking "
+                             "now, key re-queues\n",
+                             (long long)(mon_wait_mono_ms() - mon_t0),
+                             (obj && obj->header.clazz &&
+                              obj->header.clazz->class_name)
+                                 ? obj->header.clazz->class_name : "?",
+                             dl_owner->id);
+                    {
+                        extern void sw_trace_force(const char* fmt, ...)
+                            __attribute__((weak));
+                        if (&sw_trace_force && sw_trace_force) {
+                            sw_trace_force("[FENCE-DEADLOCK] owner t%d "
+                                           "fence-waits the pump's monitor "
+                                           "wait (site=%.40s) — delivery "
+                                           "aborted, key re-queued",
+                                           dl_owner->id,
+                                           tls_mon_site[0] ? tls_mon_site : "?");
+                        }
+                    }
+                }
+            }
+            /* v36.96 [STALLSTACK-ON-BUDGET]: владелец в фенс-ожидании НЕ
+             * мутирует кадры — seqlock-дамп сходится с первой попытки и
+             * называет ТОЧНОЕ место стояния (у MS6 это будет pc внутри
+             * at.run [605..700]). Троттл 10 с — дамп стоит 2-6 мс. */
+            {
+                static jlong s_fence_dl_dump_ms = -10000;
+                jlong dl_now = mon_wait_mono_ms();
+                if (dl_now - s_fence_dl_dump_ms >= 10000) {
+                    s_fence_dl_dump_ms = dl_now;
+                    extern void jvm_threads_dump_stall_frames(int tid)
+                        __attribute__((weak));
+                    if (&jvm_threads_dump_stall_frames &&
+                        jvm_threads_dump_stall_frames) {
+                        pthread_mutex_unlock(&mon->mutex);
+                        jvm_threads_dump_stall_frames(dl_owner->id);
+                        pthread_mutex_lock(&mon->mutex);
+                    }
+                }
+            }
+            pthread_mutex_unlock(&mon->mutex);
+            mon->entry_wait_count--;
+            if (self_jt) { self_jt->mon_enter_wait = 0; self_jt->mon_enter_ms = 0; }
+            return JNI_ERR;
+        }
         if (g_gc_safepoint_request) {
             pthread_mutex_unlock(&mon->mutex);
             jvm_gc_safepoint_park();
@@ -2091,6 +2179,7 @@ int monitor_enter(JVM* jvm, JavaObject* obj) {
              * owner_thread + его jsite + возраст его последнего натива). */
             if (tls_paint_lock_deadline_ms && mon_now >= tls_paint_lock_deadline_ms) {
                 tls_paint_lock_aborted = 1;
+                tls_paint_lock_deadline_hit = 1; /* v36.96: это ИСТЕЧЕНИЕ бюджета */
                 {
                     extern void sw_trace_force(const char* fmt, ...)
                         __attribute__((weak));
@@ -2116,6 +2205,30 @@ int monitor_enter(JVM* jvm, JavaObject* obj) {
                                            ? holder->park_why : "-");
                     }
                 }
+                /* v36.96 [STALLSTACK-ON-BUDGET]: владелец стоял без нативов
+                 >500 мс — печатаем его кадры + [STALL-RING] (seqlock,
+                 безопасно из чужого потока; живой владелец уводит seq и
+                 дамп молча отменяется). Троттл 10 с. */
+                {
+                    JavaThread* ss_holder = mon->owner_thread;
+                    long long ss_age = -1;
+                    if (ss_holder && ss_holder->last_native_ms)
+                        ss_age = mon_now - (long long)ss_holder->last_native_ms;
+                    if (ss_holder && ss_age > 500) {
+                        static jlong s_ss_dump_ms = -10000;
+                        if (mon_now - s_ss_dump_ms >= 10000) {
+                            s_ss_dump_ms = mon_now;
+                            extern void jvm_threads_dump_stall_frames(int tid)
+                                __attribute__((weak));
+                            if (&jvm_threads_dump_stall_frames &&
+                                jvm_threads_dump_stall_frames) {
+                                pthread_mutex_unlock(&mon->mutex);
+                                jvm_threads_dump_stall_frames(ss_holder->id);
+                                pthread_mutex_lock(&mon->mutex);
+                            }
+                        }
+                    }
+                }
                 pthread_mutex_unlock(&mon->mutex);
                 mon->entry_wait_count--;
                 if (self_jt) { self_jt->mon_enter_wait = 0; self_jt->mon_enter_ms = 0; }
@@ -2125,16 +2238,63 @@ int monitor_enter(JVM* jvm, JavaObject* obj) {
                 mon_last_log = mon_now;
                 mon_wait_report((void*)obj, mon_waited, mon, self_jt, "WAIT");
             }
+            /* v36.92 [STEAL-GATE]: крадём монитор у ВЛАДЕЛЬЦА только если тот
+             * НЕ подаёт признаков жизни. Полевая пара логов Metal Slug 6
+             * (v36.88 поле + v36.91 поле) доказала оба исхода безусловного
+             * MON-STEAL (20 с): (1) v36.91 — одиночный вызов at.bl держал
+             * монитор 12.5 с, ДИСПЕТЧИРУЯ нативы всплесками каждые 2.5-5 с
+             * (System.arraycopy в длинном чисто-Java вычислении) — вычисление
+             * СХОДИЛОСЬ и монитору вернулось само; (2) v36.88 — то же
+             * вычисление шло 20.2 с, MON-STEAL сработал РОВНО на пике,
+             * втащил waiter-а внутрь чужого synchronized-блока и испортил
+             * состояние игры (исходный репорт «игра зависает/глючит»).
+             * Владелец, диспетчирующий нативы свежее 6 с назад, ЖИВОЙ и
+             * работает — ожидание ПРОДОЛЖАЕМ (работа сходится); крадём
+             * только у владельца без единого натива дольше порога (вечный
+             * чисто-Java спин / клин внутри никогда не возвращающегося
+             * натива / утечка монитора при unwind). Предохранитель: если
+             * владелец «работает» дольше 90 с НЕПРЕРЫВНО — всё равно
+             * отпускаем ожидание кражей (защита от никогда не выходящего
+             * прогрессирующего цикла; декод MS6 укладывается в 25 с). */
             if (mon_waited >= 20000 && mon_steals < 8) {
-                mon_steals++;
-                mon_wait_report((void*)obj, mon_waited, mon, self_jt, "STEAL");
-                mon->entry_count = 0;
-                mon->owner = NULL;
-                mon->owner_thread = NULL;
-                mon->owner_pthread = (pthread_t)0;
-                mon->is_pthread = 0;
-                pthread_cond_broadcast(&mon->entry_cond);
-                /* loop re-checks: entry_count==0 -> fall through and acquire */
+                JavaThread* owner_probe = mon->owner_thread;
+                long long owner_age = -1;
+                if (owner_probe && owner_probe->last_native_ms)
+                    owner_age = mon_now - (long long)owner_probe->last_native_ms;
+                if (owner_age >= 0 && owner_age < 6000) {
+                    /* Владелец жив и работает — кража ОТМЕНЕНА. */
+                    tl_gate_working_total += 50; /* ~шаг цикла ожидания, мс */
+                    if (tl_gate_working_total >= 90000) {
+                        tl_gate_working_total = 0;
+                        mon_wait_report((void*)obj, mon_waited, mon, self_jt, "STEAL");
+                        LOG_SAFE("[STEAL-GATE] owner t%d working %lld s total — giving up on convergence, stealing anyway\n",
+                                 owner_probe ? owner_probe->id : -1,
+                                 (long long)(mon_waited / 1000));
+                        mon_steals++;
+                        mon->entry_count = 0;
+                        mon->owner = NULL;
+                        mon->owner_thread = NULL;
+                        mon->owner_pthread = (pthread_t)0;
+                        mon->is_pthread = 0;
+                        pthread_cond_broadcast(&mon->entry_cond);
+                    } else if (mon_now - mon_last_gate_log >= 5000) {
+                        mon_last_gate_log = mon_now;
+                        LOG_SAFE("[STEAL-GATE] steal suppressed: owner t%d dispatched a native %lld ms ago (working, convergent) — keep waiting (total %lld s)\n",
+                                 owner_probe ? owner_probe->id : -1, owner_age,
+                                 (long long)(tl_gate_working_total / 1000));
+                    }
+                } else {
+                    tl_gate_working_total = 0;
+                    mon_steals++;
+                    mon_wait_report((void*)obj, mon_waited, mon, self_jt, "STEAL");
+                    mon->entry_count = 0;
+                    mon->owner = NULL;
+                    mon->owner_thread = NULL;
+                    mon->owner_pthread = (pthread_t)0;
+                    mon->is_pthread = 0;
+                    pthread_cond_broadcast(&mon->entry_cond);
+                    /* loop re-checks: entry_count==0 -> fall through and acquire */
+                }
             }
         }
     }
@@ -2182,8 +2342,38 @@ int monitor_enter(JVM* jvm, JavaObject* obj) {
      * policy as the POSIX path above. */
     long long mon_t0 = mon_wait_mono_ms();
     long long mon_last_log = 0;
+    long long mon_last_gate_log = 0; /* v36.92: свой троттл (Windows twin) */
     int mon_steals = 0;
+    /* v36.92 [STEAL-GATE] (Windows twin): per-waiter working-owner total. */
+    static _Thread_local long long tl_gate_working_total = 0;
+    tl_gate_working_total = 0;
     while (mon->entry_count > 0) {
+        /* v36.96 [FENCE-DEADLOCK-BREAK] (Windows twin, см. POSIX-ветку):
+         * владелец монитора ждёт наш EXIT-FENCE => взаимный дедлок с
+         * бюджетированной доставкой фрейм-потока — абортируем немедленно. */
+        if (tls_paint_lock_deadline_ms && mon->owner_thread &&
+            mon->owner_thread->in_fence_wait) {
+            JavaThread* dl_owner = mon->owner_thread;
+            tls_paint_lock_aborted = 1;
+            {
+                static unsigned s_fence_dl_logs = 0;
+                if (++s_fence_dl_logs <= 40 || (s_fence_dl_logs % 500) == 0) {
+                    LOG_SAFE("[FENCE-DEADLOCK] delivery abort after %lld ms: "
+                             "monitor=%s owner t%d is fence-waiting on THIS "
+                             "frame-thread window (mutual deadlock) — breaking "
+                             "now, key re-queues\n",
+                             (long long)(mon_wait_mono_ms() - mon_t0),
+                             (obj && obj->header.clazz &&
+                              obj->header.clazz->class_name)
+                                 ? obj->header.clazz->class_name : "?",
+                             dl_owner->id);
+                }
+            }
+            LeaveCriticalSection(&mon->cs);
+            mon->entry_wait_count--;
+            if (self_jt) { self_jt->mon_enter_wait = 0; self_jt->mon_enter_ms = 0; }
+            return JNI_ERR;
+        }
         /* v34.10 GC safepoint poll (Windows twin of the POSIX branch):
          * release the monitor CS while parking so gc_collect() can run. */
         if (g_gc_safepoint_request) {
@@ -2201,6 +2391,7 @@ int monitor_enter(JVM* jvm, JavaObject* obj) {
             /* v36.57 [PAINT-BUDGET] (Windows twin) */
             if (tls_paint_lock_deadline_ms && mon_now >= tls_paint_lock_deadline_ms) {
                 tls_paint_lock_aborted = 1;
+                tls_paint_lock_deadline_hit = 1; /* v36.96: истечение бюджета */
                 LeaveCriticalSection(&mon->cs);
                 mon->entry_wait_count--;
                 if (self_jt) { self_jt->mon_enter_wait = 0; self_jt->mon_enter_ms = 0; }
@@ -2210,15 +2401,46 @@ int monitor_enter(JVM* jvm, JavaObject* obj) {
                 mon_last_log = mon_now;
                 mon_wait_report((void*)obj, mon_waited, mon, self_jt, "WAIT");
             }
+            /* v36.92 [STEAL-GATE] (Windows twin): same policy as POSIX above —
+             * a live, native-dispatching owner is doing convergent work
+             * (Metal Slug 6 decode); only a silent owner gets stolen from. */
             if (mon_waited >= 20000 && mon_steals < 8) {
-                mon_steals++;
-                mon_wait_report((void*)obj, mon_waited, mon, self_jt, "STEAL");
-                mon->entry_count = 0;
-                mon->owner = NULL;
-                mon->owner_thread = NULL;
-                mon->owner_thread_id = 0;
-                mon->is_pthread = 0;
-                WakeAllConditionVariable(&mon->entry_cond);
+                JavaThread* owner_probe = mon->owner_thread;
+                long long owner_age = -1;
+                if (owner_probe && owner_probe->last_native_ms)
+                    owner_age = mon_now - (long long)owner_probe->last_native_ms;
+                if (owner_age >= 0 && owner_age < 6000) {
+                    tl_gate_working_total += 50;
+                    if (tl_gate_working_total >= 90000) {
+                        tl_gate_working_total = 0;
+                        mon_steals++;
+                        mon_wait_report((void*)obj, mon_waited, mon, self_jt, "STEAL");
+                        LOG_SAFE("[STEAL-GATE] owner t%d working %lld s total — giving up on convergence, stealing anyway\n",
+                                 owner_probe ? owner_probe->id : -1,
+                                 (long long)(mon_waited / 1000));
+                        mon->entry_count = 0;
+                        mon->owner = NULL;
+                        mon->owner_thread = NULL;
+                        mon->owner_thread_id = 0;
+                        mon->is_pthread = 0;
+                        WakeAllConditionVariable(&mon->entry_cond);
+                    } else if (mon_now - mon_last_gate_log >= 5000) {
+                        mon_last_gate_log = mon_now;
+                        LOG_SAFE("[STEAL-GATE] steal suppressed: owner t%d dispatched a native %lld ms ago (working, convergent) — keep waiting (total %lld s)\n",
+                                 owner_probe ? owner_probe->id : -1, owner_age,
+                                 (long long)(tl_gate_working_total / 1000));
+                    }
+                } else {
+                    tl_gate_working_total = 0;
+                    mon_steals++;
+                    mon_wait_report((void*)obj, mon_waited, mon, self_jt, "STEAL");
+                    mon->entry_count = 0;
+                    mon->owner = NULL;
+                    mon->owner_thread = NULL;
+                    mon->owner_thread_id = 0;
+                    mon->is_pthread = 0;
+                    WakeAllConditionVariable(&mon->entry_cond);
+                }
             }
         }
     }
@@ -2319,6 +2541,70 @@ int monitor_exit(JVM* jvm, JavaObject* obj) {
 #endif
 }
 
+/* =========================================================================
+ * v36.91 [MON-EXIT-FREE]: помощники для устойчивости op_monitorexit.
+ *
+ * ПОЛЕВОЙ КОРЕНЬ (Metal Slug 6 (I-Play), лог 2026-10-07): при выходе из
+ * игры игровой поток t2 зацикливался в обработчике исключения
+ * synchronized-блока: at.run PC=704..708 -> monitorexit бросает
+ * IllegalMonitorStateException -> таблица исключений [606,709)->704
+ * ловит ЕГО ЖЕ -> monitorexit снова -> ... вечный чисто-Java цикл
+ * ([EX-THROW] IMS at at.run PC=708, затем [SPIN-BREAK] site at.run@708,
+ * «catch recovers» — но не выздоравливает). Thread.join в destroyApp
+ * ждёт такой поток ВЕЧНО — игра не выходит, только kill.
+ *
+ * Монитор при этом может быть (а) уже свободен (двойной monitorexit
+ * после unwind-слива v34.99 MONITOR-UNWIND), (б) навсегда брошен
+ * владельцем (утечка/убитый поток — JVMS предписывает IMS, но это
+ * порождает цикл выше). Оба случая лечатся на стороне monitorexit:
+ * (а) — no-op «уже освобождён», (б) — принудительный слив после
+ * серии подряд идущих IMS (см. opcodes.c). */
+int monitor_is_free(JavaObject* obj) {
+    if (!obj) return 1;
+    CoopMonitor* mon = get_monitor(obj);
+    if (!mon) return 1;
+    int free_;
+#ifndef _WIN32
+    pthread_mutex_lock(&mon->mutex);
+    free_ = (mon->entry_count == 0 && mon->owner == NULL && !mon->is_pthread);
+    pthread_mutex_unlock(&mon->mutex);
+#else
+    EnterCriticalSection(&mon->cs);
+    free_ = (mon->entry_count == 0 && mon->owner == NULL && !mon->is_pthread);
+    LeaveCriticalSection(&mon->cs);
+#endif
+    return free_;
+}
+
+void monitor_force_release(JavaObject* obj) {
+    if (!obj) return;
+    CoopMonitor* mon = get_monitor(obj);
+    if (!mon) return;
+#ifndef _WIN32
+    pthread_mutex_lock(&mon->mutex);
+    mon->entry_count = 0;
+    mon->owner = NULL;
+    mon->owner_thread = NULL;
+    mon->owner_pthread = (pthread_t)0;
+    mon->is_pthread = 0;
+    pthread_cond_broadcast(&mon->entry_cond);
+    pthread_mutex_unlock(&mon->mutex);
+#else
+    EnterCriticalSection(&mon->cs);
+    mon->entry_count = 0;
+    mon->owner = NULL;
+    mon->owner_thread = NULL;
+    mon->owner_thread_id = 0;
+    mon->is_pthread = 0;
+    WakeAllConditionVariable(&mon->entry_cond);
+    LeaveCriticalSection(&mon->cs);
+#endif
+    LOG_SAFE("[MON-EXIT-FORCED] monitor of %s force-released (was leaked); "
+             "waiting threads may proceed\n",
+             (obj && obj->header.clazz && obj->header.clazz->class_name)
+                 ? obj->header.clazz->class_name : "?");
+}
+
 /* v34.9: live progress counters for the watchdog (which loop is a thread
  * parked in inside monitor_wait). */
 volatile int mondiag_dbg_state[16] = {0};   /* per tid: 0=idle 1=timedloop 2=reacquire 3=done */
@@ -2405,6 +2691,9 @@ void jvm_gc_safepoint_park(void) {
         JavaThread* self = thread_current(NULL);
         if (self) snprintf(self->park_why, sizeof(self->park_why), "gc-sp");
     }
+    /* v36.97 [VM-PERF]: суммарное время мутаторов в GC-safepoint парке за
+     * период (диагностика GC-штормов в полевом логе). */
+    jlong gcsp_t0 = jvm_exec_now_ms();
     pthread_mutex_lock(&g_sp_mutex);
     if (g_gc_safepoint_request) {
         g_sp_arrived++;
@@ -2419,6 +2708,11 @@ void jvm_gc_safepoint_park(void) {
         g_sp_arrived--;
     }
     pthread_mutex_unlock(&g_sp_mutex);
+    {
+        extern volatile uint32_t g_perf_gcsp_ms_acc;
+        jlong gcsp_dt = jvm_exec_now_ms() - gcsp_t0;
+        if (gcsp_dt > 0) __sync_fetch_and_add(&g_perf_gcsp_ms_acc, (uint32_t)gcsp_dt);
+    }
     {
         extern JavaThread* thread_current(JVM* jvm);
         JavaThread* self = thread_current(NULL);

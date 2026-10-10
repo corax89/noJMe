@@ -1012,9 +1012,14 @@ static bool run_midlet(Options* opts) {
  * запуска в полевом логе v36.46: после teardown не возвращалось ~155 МБ).
  * Что делает:
  *   1) лучший-усилие СБРОС RMS (прогресс игры!) — в потоке-помощнике со
- *      сторожевым таймаутом 1.5 с: застрявший поток мог оставить rms-мьютекс
- *      занятым, обычный flush дедлочил бы выход; помощник умирает вместе с
- *      процессом, дедлока нет НИКОГДА;
+ *      сторожевым таймаутом 8 с (v36.106 [RMS-SAVEGUARD]: было 1.5 с —
+ *      медленная SD тянет один стор 100-800 мс, сессия с несколькими
+ *      сторами не влезала и helper умирал СЕРЕДИННЫМ сохранением; полевой
+ *      приоритет пользователя — спасти прогресс ценой задержки выхода;
+ *      дедлока по-прежнему НИКОГДА: helper умирает вместе с процессом):
+ *      застрявший поток мог оставить rms-мьютекс занятым, обычный flush
+ *      дедлочил бы выход; помощник умирает вместе с процессом, дедлока
+ *      нет НИКОГДА;
  *   2) svcExitProcess() — на HOS убивает ВСЕ потоки атомно с адресным
  *      пространством: ОС возвращает ВСЮ память (хип VM, текстуры, стеки),
  *      ни один поток не исполняет разэмапленный код (класс 2168-0001).
@@ -1041,13 +1046,14 @@ static void nojme_bailout_exit(const char* reason) {
     fprintf(stderr, "[EXIT-RELEASE-ALL] %s\n", reason);
     fflush(stderr);
 
-    /* 1) RMS: сброс незаписанных сторов, ограничен 1.5 с */
+    /* 1) RMS: сброс незаписанных сторов, ограничен 8 с (v36.106: 1.5 -> 8,
+     * см. [RMS-SAVEGUARD] в комментарии к nojme_bailout_exit) */
     s_bailout_rms_done = 0;
     pthread_t fl;
     int flush_started = (pthread_create(&fl, NULL, bailout_rms_flush_thread,
                                         NULL) == 0);
     if (flush_started) {
-        for (int i = 0; i < 150 && !s_bailout_rms_done; i++) {
+        for (int i = 0; i < 800 && !s_bailout_rms_done; i++) {
             struct timespec ts = { .tv_sec = 0, .tv_nsec = 10 * 1000000L };
             nanosleep(&ts, NULL);
         }
@@ -1436,7 +1442,19 @@ int main(int argc, char** argv) {
          *   pg.flag       -> NOJME_PG_SCAN=1 (v36.60 [PSCAN-FLAG]: PTRSCAN-
          *                    проходы прибора PATHGUARD — только по флагу;
          *                    без него нулевая цена и нулевой спам.
-         *                    Включать, если вернётся InvalidAccess) */
+         *                    Включать, если вернётся InvalidAccess)
+         *   sched.flag    -> NOJME_SCHED_TRACE=1 (v36.99: статистика
+         *                    Thread.sleep/yield по потокам раз в 5 с —
+         *                    [SCHED] sleep: calls/req_ms/wall и
+         *                    [SCHED] yield: calls/rests/wall. Полевой
+         *                    разбор «куда уходит кадр» без пересборки)
+         *   env.txt       -> v36.99 [ENV-FILE]: произвольные ИМЯ=ЗНАЧЕНИЕ
+         *                    строки (до 64, до 255 байт каждая, '#'-
+         *                    комментарии) — полевой A/B ЛЮБЫХ env-руби́льников
+         *                    (NOJME_SPIN_BREAK_EVERY, NOJME_PAINT_SLEEP_MS,
+         *                    NOJME_TURBO_SLEEP_DIV, ...) без пересборки
+         *                    NRO. Файл читается при каждом запуске игры
+         *                    (до разрешения настроек сессии). */
         {
             static const struct { const char* flag; const char* var; const char* val; } k_diag[] = {
                 { "sdmc:/switch/j2me/textlog.flag",   "NOJME_TEXTLOG",          "1" },
@@ -1447,6 +1465,7 @@ int main(int argc, char** argv) {
                 { "sdmc:/switch/j2me/race.flag",      "NOJME_RACE_PROBE",       "1" },
                 { "sdmc:/switch/j2me/neon_scalar.flag", "NOJME_NEON_SCALAR",    "1" },
                 { "sdmc:/switch/j2me/pg.flag",          "NOJME_PG_SCAN",          "1" },
+                { "sdmc:/switch/j2me/sched.flag",       "NOJME_SCHED_TRACE",      "1" },
             };
             for (size_t i = 0; i < sizeof(k_diag) / sizeof(k_diag[0]); i++) {
                 FILE* probe = fopen(k_diag[i].flag, "rb");
@@ -1463,6 +1482,35 @@ int main(int argc, char** argv) {
                 if (probe) {
                     fclose(probe);
                     nojme_pg_mkdir("mkdir-snaps", "sdmc:/switch/j2me/snaps", 0777);
+                }
+            }
+            /* v36.99 [ENV-FILE]: sdmc:/switch/j2me/env.txt — построчный
+             * ИМЯ=ЗНАЧЕНИЕ -> setenv. Даёт полю возможность A/B любого
+             * env-рубильника без пересборки. Формат: одна пара на строку,
+             * до 255 байт; '#' в начале строки — комментарий; пустые
+             * строки игнорируются; максимум 64 применения. Никаких
+             * спец-подстановок — голый setenv(3). */
+            {
+                FILE* ef = fopen("sdmc:/switch/j2me/env.txt", "rb");
+                if (ef) {
+                    char line[256];
+                    int applied = 0;
+                    while (applied < 64 && fgets(line, sizeof(line), ef)) {
+                        size_t len = strlen(line);
+                        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+                            line[--len] = '\0';
+                        if (len == 0 || line[0] == '#') continue;
+                        char* eq = strchr(line, '=');
+                        if (!eq || eq == line) {
+                            LOG_SAFE("[ENV-FILE] пропущена строка без '=': %.48s\n", line);
+                            continue;
+                        }
+                        *eq = '\0';
+                        setenv(line, eq + 1, 1);
+                        applied++;
+                        LOG_SAFE("[ENV-FILE] %s=%s\n", line, eq + 1);
+                    }
+                    fclose(ef);
                 }
             }
         }
@@ -1667,6 +1715,25 @@ int main(int argc, char** argv) {
             LOG_SAFE("[SWITCH] session: %s (%dx%d), budget=%ld, audio=%d\n",
                      jar_path, opts.width, opts.height, g_jvm_thread_budget,
                      st->audio_enabled);
+
+            /* v36.90 [MIDI-PERF]: push the ini MIDI-synth config into the
+             * engine BEFORE the session opens players. midi_set_* are safe
+             * here even though the media subsystem may not be initialized
+             * yet — they only write plain globals / the (empty) registry;
+             * every midi_load()/midi_load_empty() re-applies the values. */
+            {
+                extern int  midi_set_polyphony(int voices);
+                extern void midi_set_filter_enabled(int on);
+                extern void midi_set_reverb_enabled(int on);
+                extern void midi_set_gain(float gain);
+                midi_set_polyphony(st->midi_polyphony);
+                midi_set_filter_enabled(st->midi_filter);
+                midi_set_reverb_enabled(st->midi_reverb);
+                midi_set_gain((float) st->midi_gain / 100.0f);
+                LOG_SAFE("[SWITCH] session: midi polyphony=%d filter=%d reverb=%d gain=%d%%\n",
+                         st->midi_polyphony, st->midi_filter, st->midi_reverb,
+                         st->midi_gain);
+            }
         }
 
         /* v36.21 [EXC-RESET]: a new session must start with a CLEAN error
@@ -1772,6 +1839,19 @@ int main(int argc, char** argv) {
             int waited_ms = 0;
             int killed_once = 0;
             sw_trace("game: session end"); /* v34.91 */
+            /* v37.00 [RMS-WAIT] (restored v37.01): перед teardown — если
+             * остались dirty-сторы (отложенные записи), cleanup() их
+             * флашнет (midp_session_reset -> rms_flush_dirty_stores —
+             * диск, 100-800 мс на стор): на это время в центре экрана
+             * висит «ожидается завершения сохранения». */
+#ifdef __SWITCH__
+            {
+                extern int midp_rms_exit_writes_pending(void);
+                extern void sdl_switch_save_wait_notice(void);
+                if (midp_rms_exit_writes_pending() > 0)
+                    sdl_switch_save_wait_notice();
+            }
+#endif
             /* v36.48 [EXIT-RELEASE-ALL] TESTHOOK: NOJME_TEST_BAILOUT=1 —
              * принудительно пройти аварийный путь выхода (RMS-сброс со
              * сторожем + svcExitProcess/_exit) сразу после конца сессии.

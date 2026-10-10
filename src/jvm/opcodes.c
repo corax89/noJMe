@@ -38,6 +38,35 @@
 #include "debug.h"    /* For g_j2me_runtime_debug and logging macros */
 #include "debug_macros.h"
 
+/* v36.100 [GFX-PERF]: total wall time of VM native dispatches (GFXP_NAT —
+ * the "how much of the frame is inside natives at all" denominator for the
+ * per-API graphics counters; see include/gfxperf.h). Depth-0 only: a native
+ * that re-enters Java (LayerManager.paint -> layer.paint -> drawImage)
+ * dispatches nested natives — the OUTER pair already spans them, counting
+ * again would double-book nat_ms. TLS: several VM threads dispatch natives
+ * concurrently. */
+#include "gfxperf.h"
+#include "perf_debug.h" /* v36.106 [PERF-GATE]: обёртки натив-тайминга */
+#if NOJME_PERF_DEBUG
+static __thread int s_gfxp_nat_depth = 0;
+#endif
+static inline int gfxp_nat_enter(uint64_t* t0) {
+#if NOJME_PERF_DEBUG
+    if (s_gfxp_nat_depth++ == 0) { *t0 = gfxp_now_us(); return 1; }
+    return 0;
+#else
+    (void)t0; return 0;  /* v36.106 [PERF-GATE]: ноль TLS-доступов на вызов */
+#endif
+}
+static inline void gfxp_nat_leave(int top, uint64_t t0) {
+#if NOJME_PERF_DEBUG
+    s_gfxp_nat_depth--;
+    if (top) gfxp_end(GFXP_NAT, t0);
+#else
+    (void)top; (void)t0;
+#endif
+}
+
 #ifndef J2ME_DEBUG
 #define J2ME_DEBUG 1
 #endif
@@ -2863,22 +2892,9 @@ int op_putstatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
  * which only covered the global hash cache. */
 uint16_t g_vm_cache_gen = 0;
 
-typedef struct InvokeRefCache {
-    JavaClass* target_class; /* virtual: receiver class this entry resolved
-                              * for (monomorphic site guard);
-                              * static/special: the resolved method's class */
-    JavaMethod* method;      /* resolved bytecode method (NULL => native/unresolved) */
-    void*       native_fn;   /* NativeMethod if resolved native */
-    const char* cls_name;    /* v34.42: CP-declared class name (native dispatch note) */
-    const char* mth_name;   /* v34.42: method name (native dispatch note) */
-    int16_t     java_argc;   /* compact arg count (J/D = 1), this INCLUDED for virtual */
-    uint16_t    gen;         /* g_vm_cache_gen at fill time (invalidation) */
-    uint8_t     arg_slots[12]; /* operand-stack slots per Java arg (1 or 2), 0-terminated */
-    uint8_t     kind;        /* 0=bytecode method, 1=native, 2=unresolved (never cached) */
-    uint8_t     ret_wide;    /* J/D return pushes 2 slots */
-    uint8_t     has_ret;     /* descriptor return != V */
-    uint8_t     valid;
-} InvokeRefCache;
+/* v36.103 [FAST-INVOKES]: typedef InvokeRefCache переехал в cp_caches.h
+ * (быстрое ядро execute.c читает IC напрямую); здесь — только заполнители
+ * и accessor. */
 
 /* Fast subclass test: walk oc's super chain looking for `of`. */
 bool jvm_class_is_subclass_of(JavaClass* oc, JavaClass* of) {
@@ -2901,13 +2917,58 @@ FieldRefCache* field_cache_entry(JavaFrame* frame, uint16_t index) {
     return clazz->field_cache ? &clazz->field_cache[index] : NULL;
 }
 
-static InvokeRefCache* invoke_cache_entry(JavaFrame* frame, uint16_t index) {
+InvokeRefCache* invoke_cache_entry(JavaFrame* frame, uint16_t index) {
     JavaClass* clazz = frame->clazz;
     if (!clazz || !clazz->constant_pool_count || index >= clazz->constant_pool_count) return NULL;
     if (!clazz->invoke_cache) {
         clazz->invoke_cache = (InvokeRefCache*)calloc(clazz->constant_pool_count, sizeof(InvokeRefCache));
     }
     return clazz->invoke_cache ? &clazz->invoke_cache[index] : NULL;
+}
+
+/* v36.103 [PIC]: polymorphic slot fill for virtual/interface sites —
+ * 1 monomorphic pair (target_class/method, the v34.35 fields) + 3 extra
+ * (pic_class/pic_method) pairs. Policy:
+ *   - same class as mono -> nothing to do;
+ *   - class already in a pic slot -> nothing to do;
+ *   - free pic slot -> fill it;
+ *   - all 4 busy (>4 live classes at the site) -> replace the mono pair
+ *     with the newest receiver (megamorphic degrade; a 5+-class site
+ *     stays slow for the evicted class only, exactly the pre-v36.103
+ *     behavior for EVERY class).
+ * Generation contract: ONE gen field covers the whole entry. If the gen
+ * changed since the entry was built, every slot is reset BEFORE any new
+ * fill (stale JavaMethod* after a methods[] realloc is use-after-free;
+ * the v34.35 code was safe because it overwrote the only pair on every
+ * fill — the PIC must extend that discipline to all four). */
+static void invoke_pic_fill(InvokeRefCache* ic, JavaClass* recv_class, JavaMethod* method) {
+    if (ic->gen != g_vm_cache_gen) {
+        ic->target_class = NULL;
+        ic->method = NULL;
+        for (int i = 0; i < 3; i++) {
+            ic->pic_class[i] = NULL;
+            ic->pic_method[i] = NULL;
+        }
+        ic->gen = g_vm_cache_gen;
+    }
+    if (ic->target_class == recv_class) return;
+    for (int i = 0; i < 3; i++) {
+        if (ic->pic_class[i] == recv_class) return;
+    }
+    if (!ic->target_class) {
+        ic->target_class = recv_class;
+        ic->method = method;
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        if (!ic->pic_class[i]) {
+            ic->pic_class[i] = recv_class;
+            ic->pic_method[i] = method;
+            return;
+        }
+    }
+    ic->target_class = recv_class;   /* megamorphic eviction */
+    ic->method = method;
 }
 
 /* v34.42 PERF: fill helper for the op_invokestatic inline cache.
@@ -3426,8 +3487,17 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                  * сначала правдоподобие, ПОТОМ deref [recv+0]; мусор уходит
                  * в медленный путь с валидацией (Ryujinx suppression
                  * давала тот же исход: сравнение провалено -> slow path). */
-                if (recv && !argguard_bad_ptr((uintptr_t)recv) &&
-                    recv->header.clazz == ic->target_class) {
+                if (recv && !argguard_bad_ptr((uintptr_t)recv)) {
+                    /* v36.103 [PIC]: mono pair first, then the 3 polymorphic
+                     * slots (2-class sites used to pay the FULL slow path
+                     * on every call — CallBench: 44% of invokes). */
+                    JavaMethod* hm = (recv->header.clazz == ic->target_class) ? ic->method : NULL;
+                    if (!hm) {
+                        for (int pi = 0; pi < 3 && !hm; pi++) {
+                            if (recv->header.clazz == ic->pic_class[pi]) hm = ic->pic_method[pi];
+                        }
+                    }
+                    if (hm) {
                     /* Hot path: compact args pop + direct execute_method. */
                     JavaValue args_buf[12];
                     JavaValue* args = (total_slots <= 12) ? args_buf
@@ -3443,14 +3513,15 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 
                         frame->pc += 2;   /* pc entered at opcode+1; invokevirtual is 3 bytes total */
                         JavaValue result;
-                        int ret = execute_method(jvm, thread, ic->method, args, &result);
+                        int ret = execute_method(jvm, thread, hm, args, &result);
                         if (args != args_buf) free(args);
                         if (ret != 0) return -1;   /* pending_exception set by callee */
-                        if (ic->method->is_native && ic->has_ret) {
+                        if (hm->is_native && ic->has_ret) {
                             PUSH(frame, result);
                             if (ic->ret_wide) PUSH(frame, result);
                         }
                         return 0;
+                    }
                     }
                 }
             }
@@ -4272,11 +4343,16 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                                  java_arg_count + 1, 1,
                                  __builtin_return_address(0), 1);
             int naf_slot = nargs_root_push(thread, args, java_arg_count + 1);
+            uint64_t gfxp_nat_t4294; int gfxp_nat_top_4294 = gfxp_nat_enter(&gfxp_nat_t4294);
             JavaValue result = native(jvm, thread, args, java_arg_count + 1);
+            gfxp_nat_leave(gfxp_nat_top_4294, gfxp_nat_t4294);
             argguard_check_ret(class_name, method_name, descriptor, &result,
                                __builtin_return_address(0));
             nargs_root_pop(thread, naf_slot);
             g_gc_in_native--;
+            /* v36.93 [NATIVE-RETURN-DIAG]: натив вернулся — снимаем флаг,
+             * чтобы td-дамп не показывал устаревший nat/age для простоя */
+            jvm_note_native_return(thread);
             
             /* UNPINNING: Unpin all object arguments after native method returns */
             for (int pi = 0; pi <= java_arg_count; pi++) {
@@ -4368,10 +4444,9 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                 }
                 if (ai != jac || (*dp != ')')) slots_ok = 0;
                 if (slots_ok) {
-                    ic->target_class = obj->header.clazz;
-                    ic->method = method;
+                    /* v36.103 [PIC]: polymorphic fill (manages gen itself). */
+                    invoke_pic_fill(ic, obj->header.clazz, method);
                     ic->java_argc = (int16_t)jac;
-                    ic->gen = g_vm_cache_gen;
                     ic->kind = 0;
                     const char* rp = strchr(descriptor, ')');
                     ic->has_ret = (rp && rp[1] != 'V' && rp[1] != '\0') ? 1 : 0;
@@ -4453,8 +4528,68 @@ int op_invokevirtual(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 
 int op_invokespecial(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     (void)thread; (void)frame;
+    /* v36.103 [SPECIAL-IC]: switch state hoisted to function scope (the
+     * fill at the tail shares it with the hit path at the top). */
+    static int s_special_ic_on = -1;
+    if (s_special_ic_on < 0) {
+        const char* e = getenv("NOJME_SPECIAL_IC");
+        s_special_ic_on = (e && e[0] == '0') ? 0 : 1;
+    }
+    /* v36.103 [SPECIAL-IC]: monomorphic inline cache for invokespecial —
+     * the LAST invoke opcode without one (virtual got its v34.35, static
+     * v34.42, interface v36.101). invokespecial resolution is
+     * CP-DETERMINISTIC (slow path: jvm_load_class(name from CP) +
+     * jvm_resolve_method — the receiver's runtime class NEVER influences
+     * which method runs, unlike invokevirtual), so the cache does not even
+     * need a receiver-class guard: fill after one clean resolution, hit
+     * forever until g_vm_cache_gen bumps. Contract mirrors the other ICs:
+     * frame->pc enters at opcode+1; on any miss (no entry, gen mismatch,
+     * null receiver, argguard implausible receiver, stack underflow) fall
+     * through to the original slow path which re-fetches everything and
+     * re-runs the ctor/native/compat hooks. Only kind 0 (bytecode method
+     * with code) is cached. Kill-switch: NOJME_SPECIAL_IC=0 (env.txt). */
+    {
+        if (s_special_ic_on) {
+            InvokeRefCache* ic = invoke_cache_entry(frame,
+                    (uint16_t)(((uint16_t)frame->code[frame->pc] << 8) | (uint16_t)frame->code[frame->pc + 1]));
+            if (ic && ic->valid && ic->kind == 0 && ic->java_argc >= 0 && ic->gen == g_vm_cache_gen) {
+                int total_slots = 1;   /* this */
+                for (int i = 0; i < ic->java_argc; i++) total_slots += ic->arg_slots[i];
+                if (frame->stack_top + 1 >= total_slots) {
+                    int base = frame->stack_top + 1 - total_slots;
+                    JavaObject* recv = (JavaObject*)frame->stack[base].ref;
+                    /* [ARGGUARD] v36.49: мусорный receiver — правдоподобие
+                     * ДО deref; мусор/null уходят в медленный путь (NPE). */
+                    if (recv && !argguard_bad_ptr((uintptr_t)recv)) {
+                        JavaValue args_buf[12];
+                        JavaValue* args = (total_slots <= 12) ? args_buf
+                            : (JavaValue*)malloc((size_t)total_slots * sizeof(JavaValue));
+                        if (args) {
+                            args[0] = frame->stack[base];
+                            int cur = base + 1;
+                            for (int i = 0; i < ic->java_argc; i++) {
+                                args[i + 1] = frame->stack[cur];   /* low slot of Java arg i */
+                                cur += ic->arg_slots[i];
+                            }
+                            frame->stack_top = (int16_t)(base - 1);
+                            frame->pc += 2;   /* pc entered at opcode+1; invokespecial is 3 bytes total */
+                            JavaValue result;
+                            int ret = execute_method(jvm, thread, ic->method, args, &result);
+                            if (args != args_buf) free(args);
+                            if (ret != 0) return -1;   /* pending_exception set by callee */
+                            if (ic->method->is_native && ic->has_ret) {
+                                PUSH(frame, result);
+                                if (ic->ret_wide) PUSH(frame, result);
+                            }
+                            return 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
     uint16_t index = FETCH_U2(frame);
-    
+
     /* Get method reference */
     const char* class_name = NULL;
     const char* method_name = NULL;
@@ -4820,11 +4955,16 @@ int op_invokespecial(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                                  arg_count + 1, 1,
                                  __builtin_return_address(0), 1);
             int naf_slot = nargs_root_push(thread, args, arg_count + 1);
+            uint64_t gfxp_nat_t4847; int gfxp_nat_top_4847 = gfxp_nat_enter(&gfxp_nat_t4847);
             JavaValue result = native(jvm, thread, args, arg_count + 1);
+            gfxp_nat_leave(gfxp_nat_top_4847, gfxp_nat_t4847);
             argguard_check_ret(class_name, method_name, descriptor, &result,
                                __builtin_return_address(0));
             nargs_root_pop(thread, naf_slot);
             g_gc_in_native--;
+            /* v36.93 [NATIVE-RETURN-DIAG]: натив вернулся — снимаем флаг,
+             * чтобы td-дамп не показывал устаревший nat/age для простоя */
+            jvm_note_native_return(thread);
             
             /* UNPINNING: Unpin all object arguments after native method returns */
             for (int pi = 0; pi <= arg_count; pi++) {
@@ -5221,7 +5361,47 @@ int op_invokespecial(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     JavaValue result;
     memset(&result, 0, sizeof(result));
     int ret = execute_method(jvm, thread, method, args, &result);
-    
+
+    /* v36.103 [SPECIAL-IC]: fill the inline cache after one CLEAN
+     * resolution + execution (kind 0 = bytecode method with code; the
+     * native-dispatch and ctor-fallback branches above return early and
+     * never reach this fill). Mirrors the invokevirtual v34.35 fill:
+     * >11 Java args or unparsable descriptors stay uncached. Resolution
+     * is CP-deterministic, so no receiver class is recorded — the hit
+     * path only guards null/implausible receivers. Gated by the SAME
+     * NOJME_SPECIAL_IC switch as the hit path (the core-inline invoke
+     * path keys on ic->valid — an ungated fill would defeat the switch). */
+    if (s_special_ic_on && ret == 0 && !method->is_native &&
+        method->code.code && method->code.code_length > 0) {
+        int jac = count_java_args(descriptor);
+        if (jac >= 0 && jac <= 11) {
+            InvokeRefCache* ic = invoke_cache_entry(frame, index);
+            if (ic) {
+                const char* dp = descriptor;
+                if (*dp == '(') dp++;
+                int ai = 0, slots_ok = 1;
+                while (*dp && *dp != ')' && ai < jac) {
+                    if (*dp == 'J' || *dp == 'D') { ic->arg_slots[ai++] = 2; dp++; }
+                    else if (*dp == 'L') { ic->arg_slots[ai++] = 1; while (*dp && *dp != ';') dp++; if (*dp) dp++; }
+                    else if (*dp == '[') { ic->arg_slots[ai] = 1; dp++; if (*dp == 'L') { while (*dp && *dp != ';') dp++; if (*dp) dp++; } else if (*dp) dp++; ai++; }
+                    else { ic->arg_slots[ai++] = 1; dp++; }
+                }
+                if (ai != jac || (*dp != ')')) slots_ok = 0;
+                if (slots_ok) {
+                    ic->target_class = target_class;
+                    ic->method = method;
+                    ic->java_argc = (int16_t)jac;
+                    ic->gen = g_vm_cache_gen;
+                    ic->kind = 0;
+                    const char* rp = strchr(descriptor, ')');
+                    ic->has_ret = (rp && rp[1] != 'V' && rp[1] != '\0') ? 1 : 0;
+                    ic->ret_wide = (rp && (rp[1] == 'J' || rp[1] == 'D')) ? 1 : 0;
+                    ic->valid = 1;
+                }
+            }
+        }
+    }
+
     /* CRITICAL FIX: For native methods called via invokespecial, the result is returned
      * in the `result` parameter but NOT pushed to the caller's stack (unlike bytecode
      * methods which push via op_ireturn). We must push the result here. */
@@ -5333,8 +5513,13 @@ int op_invokestatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                         g_gc_in_native++;
 
                         jvm_note_native_call(thread, ic->cls_name, ic->mth_name);
+                        uint64_t gfxp_nat_t5365; int gfxp_nat_top_5365 = gfxp_nat_enter(&gfxp_nat_t5365);
                         JavaValue result = ((NativeMethod)ic->native_fn)(jvm, thread, args, ic->java_argc);
+                        gfxp_nat_leave(gfxp_nat_top_5365, gfxp_nat_t5365);
                         g_gc_in_native--;
+                        /* v36.93 [NATIVE-RETURN-DIAG]: натив вернулся — снимаем флаг,
+                         * чтобы td-дамп не показывал устаревший nat/age для простоя */
+                        jvm_note_native_return(thread);
 
                         for (int pi = 0; pi < ic->java_argc; pi++) {
                             if (args[pi].ref && is_heap_ptr_check(args[pi].ref)) {
@@ -5548,11 +5733,16 @@ int op_invokestatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                                      java_arg_count, 0,
                                      __builtin_return_address(0), 1);
                 int naf_slot = nargs_root_push(thread, args, java_arg_count);
+                uint64_t gfxp_nat_t5584; int gfxp_nat_top_5584 = gfxp_nat_enter(&gfxp_nat_t5584);
                 JavaValue result = native(jvm, thread, args, java_arg_count);
+                gfxp_nat_leave(gfxp_nat_top_5584, gfxp_nat_t5584);
                 argguard_check_ret(class_name, method_name, descriptor, &result,
                                    __builtin_return_address(0));
                 nargs_root_pop(thread, naf_slot);
                 g_gc_in_native--;
+                /* v36.93 [NATIVE-RETURN-DIAG]: натив вернулся — снимаем флаг,
+                 * чтобы td-дамп не показывал устаревший nat/age для простоя */
+                jvm_note_native_return(thread);
                 
                 /* Unpin arguments */
                 for (int pi = 0; pi < java_arg_count; pi++) {
@@ -5636,11 +5826,16 @@ int op_invokestatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                              java_arg_count, 0,
                              __builtin_return_address(0), 1);
         int naf_slot = nargs_root_push(thread, args, java_arg_count);
+        uint64_t gfxp_nat_t5675; int gfxp_nat_top_5675 = gfxp_nat_enter(&gfxp_nat_t5675);
         JavaValue result = native(jvm, thread, args, java_arg_count);
+        gfxp_nat_leave(gfxp_nat_top_5675, gfxp_nat_t5675);
         argguard_check_ret(class_name, method_name, descriptor, &result,
                            __builtin_return_address(0));
         nargs_root_pop(thread, naf_slot);
         g_gc_in_native--;
+        /* v36.93 [NATIVE-RETURN-DIAG]: натив вернулся — снимаем флаг,
+         * чтобы td-дамп не показывал устаревший nat/age для простоя */
+        jvm_note_native_return(thread);
         
         /* UNPINNING: Unpin all object arguments after native method returns */
         for (int pi = 0; pi < java_arg_count; pi++) {
@@ -5774,11 +5969,93 @@ int op_invokestatic(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
 }
 
 int op_invokeinterface(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
+    /* v36.103: switch state hoisted to function scope (the fill at the
+     * tail shares it with the hit path below). */
+    static int s_iface_ic_on = -1;
+    if (s_iface_ic_on < 0) {
+        const char* e = getenv("NOJME_IFACE_IC");
+        s_iface_ic_on = (e && e[0] == '0') ? 0 : 1;
+    }
+    /* v36.101 [IFACE-IC]: monomorphic inline cache for interface dispatch —
+     * the SAME pattern invokestatic (v34.42) and invokevirtual (v34.35)
+     * already use; interface was the last invoke without one and paid the
+     * FULL slow path per call: 3 descriptor parses (count_args /
+     * count_java_args / pop_args_compact), malloc'd args block and a
+     * name+descriptor string walk up the receiver's class chain. Zombie's
+     * engine is interface-heavy (java/util Enumeration/Runnable-style
+     * callbacks), and the v36.100 Switch field log showed the aggregate
+     * interpreter rate halving in exactly such code.
+     * Contract (identical to the other ICs): frame->pc enters at opcode+1;
+     * on any miss (no entry, generation mismatch, receiver class changed,
+     * argguard implausible receiver, stack underflow) fall through to the
+     * original slow path below, which re-fetches everything and re-runs
+     * the compat/null/argguard hooks. Only kind 0 (bytecode method) is
+     * cached; natives stay on the slow path. Kill-switch: NOJME_IFACE_IC=0
+     * (also via sdmc:/switch/j2me/env.txt on Switch). */
+    {
+        if (s_iface_ic_on) {
+            InvokeRefCache* ic = invoke_cache_entry(frame,
+                    (uint16_t)(((uint16_t)frame->code[frame->pc] << 8) | (uint16_t)frame->code[frame->pc + 1]));
+            if (ic && ic->valid && ic->kind == 0 && ic->java_argc >= 0 && ic->gen == g_vm_cache_gen) {
+                int total_slots = 1;   /* this */
+                for (int i = 0; i < ic->java_argc; i++) total_slots += ic->arg_slots[i];
+                if (frame->stack_top + 1 >= total_slots) {
+                    int base = frame->stack_top + 1 - total_slots;
+                    JavaObject* recv = (JavaObject*)frame->stack[base].ref;
+                    /* [ARGGUARD] v36.49: мусорный receiver — правдоподобие
+                     * ДО deref [recv+0]; мусор уходит в медленный путь. */
+                    if (recv && !argguard_bad_ptr((uintptr_t)recv)) {
+                        /* v36.103 [PIC]: mono pair + 3 polymorphic slots. */
+                        JavaMethod* hm = (recv->header.clazz == ic->target_class) ? ic->method : NULL;
+                        if (!hm) {
+                            for (int pi = 0; pi < 3 && !hm; pi++) {
+                                if (recv->header.clazz == ic->pic_class[pi]) hm = ic->pic_method[pi];
+                            }
+                        }
+                        if (hm) {
+                        /* Hot path: compact args pop + direct execute_method. */
+                        JavaValue args_buf[12];
+                        JavaValue* args = (total_slots <= 12) ? args_buf
+                            : (JavaValue*)malloc((size_t)total_slots * sizeof(JavaValue));
+                        if (args) {
+                            args[0] = frame->stack[base];
+                            int cur = base + 1;
+                            for (int i = 0; i < ic->java_argc; i++) {
+                                args[i + 1] = frame->stack[cur];   /* low slot of Java arg i */
+                                cur += ic->arg_slots[i];
+                            }
+                            frame->stack_top = (int16_t)(base - 1);
+
+                            frame->pc += 4;   /* pc entered at opcode+1; invokeinterface is 5 bytes total */
+                            JavaValue result;
+                            int ret = execute_method(jvm, thread, hm, args, &result);
+                            if (args != args_buf) free(args);
+                            if (ret != 0) return -1;   /* pending_exception set by callee */
+                            if (hm->is_native && ic->has_ret) {
+                                PUSH(frame, result);
+                                if (ic->ret_wide) PUSH(frame, result);
+                            }
+                            return 0;
+                        }
+                        }
+                    }
+                }
+            }
+        }
+    }
     uint16_t index = FETCH_U2(frame);
     uint8_t count = FETCH_U1(frame);
     uint8_t zero = FETCH_U1(frame);
     (void)zero;
-    
+    /* v36.101 [CALL-TAX]: вход в медленный путь = IC-промах (или первый
+     * вызов сайта). Полевой ivk=/ifc= в [VM-PERF] покажет реальную долю
+     * интерфейсных вызовов и качество попаданий.
+     * v36.103 [IVK-TLS]: per-thread счётчик вместо общего атомика.
+     * v36.106 [PERF-GATE]: только в диагностических сборках (NOJME_PERF=1). */
+#if NOJME_PERF_DEBUG
+    thread->perf_ifc++;
+#endif
+
     /* Get method reference */
     const char* class_name = NULL;
     const char* method_name = NULL;
@@ -5991,6 +6268,46 @@ int op_invokeinterface(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     }
     
     if (method) {
+        /* v36.101 [IFACE-IC]: fill the monomorphic cache (kind 0) for
+         * resolved BYTECODE implementations — mirror of the invokevirtual
+         * fill: keyed on the RECEIVER's runtime class, arg slot layout
+         * from the descriptor, generation-tagged. Methods with >11 java
+         * args / odd descriptors stay uncached (slow path forever, same
+         * as before). Natives are deliberately not cached here. */
+        /* v36.103: the fill is gated by the SAME NOJME_IFACE_IC switch as
+         * the hit path — the core-inline invoke path keys on ic->valid, so
+         * an ungated fill would keep interface calls fast even with the
+         * kill switch "off" (the switch must restore the v36.100 slow
+         * path for field A/B). */
+        if (s_iface_ic_on) {
+            int jac = count_java_args(descriptor);
+            if (jac >= 0 && jac <= 11 && method->code.code && method->code.code_length > 0) {
+                InvokeRefCache* ic = invoke_cache_entry(frame, index);
+                if (ic) {
+                    /* arg slot layout from the descriptor (J/D = 2 slots) */
+                    const char* dp = descriptor;
+                    if (*dp == '(') dp++;
+                    int ai = 0, slots_ok = 1;
+                    while (*dp && *dp != ')' && ai < jac) {
+                        if (*dp == 'J' || *dp == 'D') { ic->arg_slots[ai++] = 2; dp++; }
+                        else if (*dp == 'L') { ic->arg_slots[ai++] = 1; while (*dp && *dp != ';') dp++; if (*dp) dp++; }
+                        else if (*dp == '[') { ic->arg_slots[ai] = 1; dp++; if (*dp == 'L') { while (*dp && *dp != ';') dp++; if (*dp) dp++; } else if (*dp) dp++; ai++; }
+                        else { ic->arg_slots[ai++] = 1; dp++; }
+                    }
+                    if (ai != jac || (*dp != ')')) slots_ok = 0;
+                    if (slots_ok) {
+                        /* v36.103 [PIC]: polymorphic fill (manages gen itself). */
+                        invoke_pic_fill(ic, obj->header.clazz, method);
+                        ic->java_argc = (int16_t)jac;
+                        ic->kind = 0;
+                        const char* rp = strchr(descriptor, ')');
+                        ic->has_ret = (rp && rp[1] != 'V' && rp[1] != '\0') ? 1 : 0;
+                        ic->ret_wide = (rp && (rp[1] == 'J' || rp[1] == 'D')) ? 1 : 0;
+                        ic->valid = 1;
+                    }
+                }
+            }
+        }
         /* Execute the method */
         JavaValue result;
         memset(&result, 0, sizeof(result));
@@ -6042,11 +6359,16 @@ int op_invokeinterface(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
                              java_arg_count + 1, 1,
                              __builtin_return_address(0), 1);
         int naf_slot = nargs_root_push(thread, args, java_arg_count + 1);
+        uint64_t gfxp_nat_t6084; int gfxp_nat_top_6084 = gfxp_nat_enter(&gfxp_nat_t6084);
         JavaValue result = native(jvm, thread, args, java_arg_count + 1);
+        gfxp_nat_leave(gfxp_nat_top_6084, gfxp_nat_t6084);
         argguard_check_ret(class_name, method_name, descriptor, &result,
                            __builtin_return_address(0));
         nargs_root_pop(thread, naf_slot);
         g_gc_in_native--;
+        /* v36.93 [NATIVE-RETURN-DIAG]: натив вернулся — снимаем флаг,
+         * чтобы td-дамп не показывал устаревший nat/age для простоя */
+        jvm_note_native_return(thread);
         
         /* UNPINNING: Unpin all object arguments after native method returns */
         for (int pi = 0; pi <= java_arg_count; pi++) {
@@ -6451,6 +6773,12 @@ int op_instanceof(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     return 0;
 }
 
+/* v36.91 [MON-EXIT-FREE]: diagnostics + the IMS-loop breaker state.
+ * __thread: the 704->708-style handler loop runs on one OS thread; the
+ * streak resets on ANY successful monitor op on that thread. */
+static __thread unsigned long s_mon_exit_free_noops = 0;
+static __thread unsigned int  s_mon_ims_streak = 0;
+
 int op_monitorenter(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     JavaObject* obj = (JavaObject*)POP(frame).ref;
     
@@ -6518,9 +6846,75 @@ int op_monitorexit(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
         /* v18 (audit): JVMS monitorexit — releasing a monitor not owned by the
          * current thread must throw IllegalMonitorStateException as a normal
          * catchable exception, never abort the interpreter silently. */
+        /* v36.91 [MON-EXIT-FREE]: ДВА полевых случая, где строгий IMS
+         * превращается в вечную ловушку (Metal Slug 6, at.run@704..708):
+         *
+         * (1) ДВОЙНОЙ monitorexit: обработчик catch ВНУТРИ synchronized-
+         *     блока по JVMS ВЛАДЕЕТ монитором и обязан выполнить
+         *     monitorexit ([606,709)->704 в run()). Если монитор уже
+         *     освобождён (unwind-слив v34.99 для кадра вышел раньше
+         *     обработчика, MON-STEAL и т.п.) — IMS из monitorexit ловится
+         *     ТОЙ ЖЕ таблицей [606,709) -> цикл 704->708->IMS->704...,
+         *     поток никогда не умирает, Thread.join в destroyApp висит
+         *     вечно. Если монитор ПОЛНОСТЬЮ свободен (никто не владеет) —
+         *     считаем exit успешным no-op: протокол байткода
+         *     восстанавливается, исключение уходит дальше штатно.
+         *
+         * (2) УТЕЧКА монитора навсегда (владелец умер/ушёл из блока):
+         *     строго по JVMS каждый monitorexit бросает IMS, обработчик
+         *     снова monitorexit — та же вечная петля. Счётчик ПОДРЯД
+         *     идущих IMS на этом потоке (сбрасывается любым успешным
+         *     monitor-оператором) после 256 повторов принудительно
+         *     сливает монитор: следующий monitorexit обработчика
+         *     проходит (случай 1), unwind завершается, join освобождается.
+         *     Легитимный код 256 IMS подряд без единого успешного
+         *     monitor-оператора не исполняет никогда. */
+        if (monitor_is_free(obj)) {
+            if (frame) {
+                for (int mo_i = frame->mon_owned_n - 1; mo_i >= 0; mo_i--) {
+                    if (frame->mon_owned[mo_i] == obj) {
+                        for (int mo_k = mo_i; mo_k < frame->mon_owned_n - 1; mo_k++)
+                            frame->mon_owned[mo_k] = frame->mon_owned[mo_k + 1];
+                        frame->mon_owned[frame->mon_owned_n - 1] = NULL;
+                        frame->mon_owned_n--;
+                        break;
+                    }
+                }
+            }
+            s_mon_exit_free_noops++;
+            /* throttle: first 4 events, затем раз в 1024 */
+            if (s_mon_exit_free_noops <= 4 ||
+                (s_mon_exit_free_noops % 1024UL) == 0) {
+                LOG_SAFE("[MON-EXIT-FREE] %s.%s: monitorexit on an already-free monitor treated as released (double-exit after unwind/steal) #%lu\n",
+                         frame && frame->clazz && frame->clazz->class_name ? frame->clazz->class_name : "?",
+                         frame && frame->method && frame->method->name ? frame->method->name : "?",
+                         s_mon_exit_free_noops);
+            }
+            s_mon_ims_streak = 0;
+            return 0;
+        }
+        if (++s_mon_ims_streak >= 256) {
+            LOG_SAFE("[MON-EXIT-FORCE] %d consecutive monitorexit IMS — a catch handler is looping on a leaked monitor; force-releasing to break the cycle\n",
+                     s_mon_ims_streak);
+            s_mon_ims_streak = 0;
+            monitor_force_release(obj);
+            if (frame) {
+                for (int mo_i = frame->mon_owned_n - 1; mo_i >= 0; mo_i--) {
+                    if (frame->mon_owned[mo_i] == obj) {
+                        for (int mo_k = mo_i; mo_k < frame->mon_owned_n - 1; mo_k++)
+                            frame->mon_owned[mo_k] = frame->mon_owned[mo_k + 1];
+                        frame->mon_owned[frame->mon_owned_n - 1] = NULL;
+                        frame->mon_owned_n--;
+                        break;
+                    }
+                }
+            }
+            return 0;
+        }
         native_throw_illegal_monitor_state(jvm, thread);
         return -1;
     }
+    s_mon_ims_streak = 0;
     /* v34.99 MONITOR-UNWIND: drop the ownership record (last matching) so
      * the frame-exit drain does not double-release. */
     if (frame) {

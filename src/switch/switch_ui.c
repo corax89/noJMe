@@ -70,6 +70,11 @@ void switch_settings_defaults(SwitchSettings* s) {
     s->input_swap = NOJME_SWAP_OFF; /* v36.37: стик — цифры, D-pad — стрелки */
     s->stick_deadzone = NOJME_DEADZONE_DEFAULT; /* v36.37: 50% = пороги v36.36 */
     s->battery_display = NOJME_BATT_DEFAULT; /* [BATFIX] v36.41: индикатор заряда выкл */
+    /* v36.90 [MIDI-PERF]: быстрая конфигурация MIDI-синтезатора */
+    s->midi_polyphony = 24; /* голоса (0 = макс. сборки) */
+    s->midi_filter    = 0;  /* резонансный фильтр голоса — выкл */
+    s->midi_reverb    = 0;  /* Schroeder reverb — выкл */
+    s->midi_gain      = 200; /* v36.91 [MIDI-GAIN]: +6 дБ пост-гейн (дефолт) */
 #ifdef __SWITCH__
     /* v34.92: принятые папки по умолчанию — игры и сохранения живут
      * внутри sdmc:/switch/j2me (браузер всё равно позволяет подняться
@@ -246,6 +251,24 @@ static void parse_ini_line(char* line, SwitchSettings* s) {
         /* v36.48 [KEYHINT-REMOVE]: настройка удалена — ключ только
          * принимается (старые ini на устройствах), значение игнорируется
          * и НЕ пишется обратно при сохранении. */
+    } else if (strcmp(key, "midi_polyphony") == 0) {
+        /* v36.90 [MIDI-PERF]: полифония sonivox, 0..32 (0 = макс. сборки) */
+        int v = atoi(val);
+        if (v < 0) v = 0;
+        if (v > 32) v = 32;
+        s->midi_polyphony = v;
+    } else if (strcmp(key, "midi_filter") == 0) {
+        /* v36.90 [MIDI-PERF]: резонансный фильтр голоса (on/off) */
+        s->midi_filter = (strcmp(val, "on") == 0 || strcmp(val, "1") == 0) ? 1 : 0;
+    } else if (strcmp(key, "midi_reverb") == 0) {
+        /* v36.90 [MIDI-PERF]: Schroeder reverb на шине (on/off) */
+        s->midi_reverb = (strcmp(val, "on") == 0 || strcmp(val, "1") == 0) ? 1 : 0;
+    } else if (strcmp(key, "midi_gain") == 0) {
+        /* v36.91 [MIDI-GAIN]: пост-гейн MIDI-выхода, проценты 100..400 */
+        int v = atoi(val);
+        if (v < 100) v = 100;
+        if (v > 400) v = 400;
+        s->midi_gain = v;
     } else if (strcmp(key, "dpad") == 0) {
         /* v36.36→v36.37 МИГРАЦИЯ: старый ключ «Раскладка D-pad»
          * переосмыслен как «поменять местами стик и D-pad»
@@ -375,6 +398,11 @@ int switch_settings_save(const SwitchSettings* s) {
     fprintf(f, "battery=%s\n",
             s->battery_display == NOJME_BATT_ICON ? "icon" :
             s->battery_display == NOJME_BATT_NUM  ? "number" : "off");
+    /* v36.90 [MIDI-PERF]: рантайм-конфигурация MIDI-синтезатора */
+    fprintf(f, "midi_polyphony=%d\n", s->midi_polyphony);
+    fprintf(f, "midi_filter=%s\n", s->midi_filter ? "on" : "off");
+    fprintf(f, "midi_reverb=%s\n", s->midi_reverb ? "on" : "off");
+    fprintf(f, "midi_gain=%d\n", s->midi_gain);
     fclose(f);
     ui_log("settings saved to %s\n", path);
     return 0;
@@ -921,6 +949,13 @@ static const char* g_ui_texts[ST_TEXT_COUNT][2] = {
     /* ST_CTL_HINT_SWAP    */ { u8"Стик - цифры 2/4/6/8 или стрелки; крестовина наоборот.", "Stick sends digits 2/4/6/8 or arrows; D-pad the other way." },
     /* ST_CTL_HINT_BTN     */ { u8"Действие кнопки в игре; меню эмулятора не затрагивается.", "What the button does in game; emulator menus are not affected." },
     /* ST_CTL_HINT_RESET   */ { u8"Вернуть встроенную раскладку и диагонали для этой игры.", "Restore the built-in layout and diagonals for this game." },
+    /* v36.105 [KEYS-ROW-MERGE]: слитая строка MINUS/PLUS экрана кнопок
+     * (обе кнопки открывают одно меню паузы — v36.19). */
+    /* ST_KEYS_MINUSPLUS    */ { u8"MINUS / PLUS",                   "MINUS / PLUS" },
+    /* ST_KEYS_MINUSPLUS_V  */ { u8"Меню паузы",                    "Pause menu" },
+    /* v37.00 [RMS-WAIT] (восстановлено в v37.01): центр экрана на время
+     * RMS-записей при выходе — белый прямоугольник, чёрная надпись. */
+    /* ST_SAVE_WAIT         */ { u8"ожидается завершение сохранения", "waiting for save to complete" },
 };
 
 int switch_lang(void) { return switch_settings_get()->lang == NOJME_LANG_EN ? NOJME_LANG_EN : NOJME_LANG_RU; }
@@ -2975,8 +3010,10 @@ static void keys_draw(uint32_t* cv) {
         { ST_KEYS_ZR,    ST_KEYS_ZR_V    }, /* v36.36: R2 = цифра 0 */
         { ST_KEYS_TOUCH, ST_KEYS_TOUCH_V },
         { ST_KEYS_JC,    ST_KEYS_JC_V    }, /* [YSFIX2] v36.40 */
-        { ST_KEYS_MINUS, ST_KEYS_MINUS_V },
-        { ST_KEYS_PLUS,  ST_KEYS_PLUS_V  },
+        /* v36.105 [KEYS-ROW-MERGE]: MINUS и PLUS слиты в ОДНУ строку
+         * (обе = «Меню паузы» с v36.19) — 12-я строка при row_h=44
+         * вылезала за низ экрана, PLUS обрезалась (полевой запрос). */
+        { ST_KEYS_MINUSPLUS, ST_KEYS_MINUSPLUS_V },
     };
     static const struct { int name_id; int val_id; } menu_rows[] = {
         { ST_KEYS_AM,     ST_KEYS_AM_V     },
@@ -2985,9 +3022,10 @@ static void keys_draw(uint32_t* cv) {
         { ST_KEYS_HOME,   ST_KEYS_HOME_V   },
     };
 
-    /* вертикальный разделитель колонок ([YSFIX2] v36.40: 13 строк =
-     * заголовок + 12 строк game_rows после мержа L3/R3 в X/B) */
-    for (int yy = y0 - 8; yy < y0 + 13 * row_h; yy += 2)
+    /* вертикальный разделитель колонок ([YSFIX2] v36.40: высота левой
+     * колонки — заголовок + строки game_rows; v36.105 [KEYS-ROW-MERGE]:
+     * 12 строк = заголовок + 11 строк после мержа MINUS/PLUS) */
+    for (int yy = y0 - 8; yy < y0 + 12 * row_h; yy += 2)
         hline(cv, cw, SWITCH_UI_HEIGHT, 670, 670, yy, COL_LINE);
 
     int y = y0;
@@ -3559,10 +3597,17 @@ done:
     return result;
 }
 
-/* Version string for the main menu header. */
+/* Version string for the main menu header.
+ * v36.105 [CORAX-BRAND]: по полевому запросу пользователя фикс-надпись
+ * «core v corax89» вместо полного CORE_BUILD_ID (v36.104 рисовала
+ * «core v36.104-thread1-2026-10-09» — длинно и обрезалось за заголовком).
+ * v36.106 [VER-LABEL] (полевая правка): после «v» должен быть НОМЕР
+ * ВЕРСИИ — «core v36.106 corax89». Номер берётся из CORE_VERSION_NUM
+ * (core_version.h) — того же макроса, из которого собирается
+ * CORE_BUILD_ID, так что строка окна и лог не могут разойтись.
+ * Диагностический канал не тронут: полный build id по-прежнему пишет
+ * трейс (PATHGUARD/trace start/game: begin) в log.txt. */
+#include "core_version.h"
 const char* nojme_switch_version_string(void) {
-    extern const char* j2me_core_build_id(void);
-    static char buf[64];
-    if (!buf[0]) snprintf(buf, sizeof(buf), "core %s", j2me_core_build_id());
-    return buf;
+    return "core " CORE_VERSION_NUM " corax89";
 }

@@ -30,6 +30,7 @@
 extern volatile uint64_t g_instruction_counter;
 #include "debug.h"
 #include "debug_macros.h"
+#include "perf_debug.h" /* v36.106 [PERF-GATE]: горячие счётчики телеметрии */
 
 /* M3G debug logging - disabled by default */
 #ifndef M3G_DEBUG_LOG
@@ -39,6 +40,13 @@ extern volatile uint64_t g_instruction_counter;
 /* Forward declarations */
 int execute_method(JVM* jvm, JavaThread* thread, JavaMethod* method, JavaValue* args, JavaValue* result);
 static int interpret(JVM* jvm, JavaThread* thread, JavaFrame* frame);
+/* v36.104 [THREADED-DISPATCH]: feature gate (see the block before
+ * interpret() for the full design note). */
+#if !J2ME_DEBUG && !defined(NOJME_STKDIAG) && (defined(__GNUC__) || defined(__clang__))
+#define NOJME_THREADED_DISPATCH 1
+#else
+#define NOJME_THREADED_DISPATCH 0
+#endif
 
 /* v36.57 [SPIN-BREAK]: монотонные миллисунды для брейкера чисто-Java
  * спинов (интерпретатор вызывает это из cold-ветки slow-check — редкий
@@ -202,18 +210,84 @@ static JavaFrame* frame_create(JVM* jvm, JavaMethod* method, JavaClass* clazz) {
         }
         int max_locals = method->code.max_locals;
         int max_stack = method->code.max_stack + 4;  /* TEMPORARY FIX: Add 4 to max_stack */
-        
-        /* Try to reuse from pool (thread-local: see FIX(race) above) */
+
+        /* Try to reuse from pool (thread-local: see FIX(race) above).
+         * v36.103 [POOL-SCAN]: the old code only ever looked at the TOP
+         * entry — LIFO + alternating method sizes meant the minority size
+         * chronically missed and calloc'd a fresh frame (CallBench: 33%
+         * of ALL invokes missed the pool this way). Scan from the top for
+         * the first entry whose CAPACITY fits; swap it to the top and
+         * pop. Typical hit depth is 1-3 entries; a full-pool no-fit was
+         * a miss under the old policy anyway. */
         FramePool* fp = frame_pool_get();
         if (fp && fp->count > 0 && fp->count <= FRAME_POOL_SIZE) {
-                int idx = --fp->count;
-                JavaFrame* frame = (idx >= 0 && idx < FRAME_POOL_SIZE) ? fp->frames[idx] : NULL;
-                if (frame && fp->max_locals[idx] >= max_locals && fp->max_stack[idx] >= max_stack) {
-                        frame->locals = fp->locals_blocks[idx];
-                        frame->stack = fp->stack_blocks[idx];
-                        /* Clear only needed portions (not entire allocation) */
-                        memset(frame->locals, 0, max_locals * sizeof(JavaValue));
-                        memset(frame->stack, 0, max_stack * sizeof(JavaValue));
+                int idx = -1;
+                for (int i = fp->count - 1; i >= 0; i--) {
+                        if (fp->max_locals[i] >= max_locals && fp->max_stack[i] >= max_stack) {
+                                idx = i;
+                                break;
+                        }
+                }
+                if (idx >= 0) {
+                        int top = --fp->count;
+                        if (idx != top) {
+                                JavaFrame* tf = fp->frames[idx];
+                                JavaValue* tl = fp->locals_blocks[idx];
+                                JavaValue* ts = fp->stack_blocks[idx];
+                                int tml = fp->max_locals[idx];
+                                int tms = fp->max_stack[idx];
+                                fp->frames[idx] = fp->frames[top];
+                                fp->locals_blocks[idx] = fp->locals_blocks[top];
+                                fp->stack_blocks[idx] = fp->stack_blocks[top];
+                                fp->max_locals[idx] = fp->max_locals[top];
+                                fp->max_stack[idx] = fp->max_stack[top];
+                                fp->frames[top] = tf;
+                                fp->locals_blocks[top] = tl;
+                                fp->stack_blocks[top] = ts;
+                                fp->max_locals[top] = tml;
+                                fp->max_stack[top] = tms;
+                        }
+                        JavaFrame* frame = fp->frames[top];
+                        if (frame) {
+                        frame->locals = fp->locals_blocks[top];
+                        frame->stack = fp->stack_blocks[top];
+                        /* v36.103 [POOL-CAP]: preserve the block's TRUE
+                         * capacity (the pool entry), NOT the incoming
+                         * method's sizes — capacity is monotone per block
+                         * (see JavaFrame::cap_locals). */
+                        frame->cap_locals = (uint16_t)fp->max_locals[top];
+                        frame->cap_stack = (uint16_t)fp->max_stack[top];
+                        /* v36.103 [FRAME-ZERO-TAIL]: the old code memset the
+                         * ENTIRE locals AND operand stack on EVERY pooled
+                         * reuse — two block clears per Java call (300K+/s in
+                         * Zombie gameplay, ~200-400 bytes each) that also
+                         * evicted the callee's soon-to-be-hot cache lines.
+                         * Both are gone:
+                         *  - the operand stack is NOT a GC root beyond
+                         *    stack_top (heap.c mark scans [0..stack_top] and
+                         *    stack_top starts at -1), and valid bytecode
+                         *    never reads a slot it has not pushed — zeroing
+                         *    it bought nothing but cache misses;
+                         *  - locals [0..arg_end) are overwritten by the
+                         *    argument copy in execute_method, so only the
+                         *    TAIL [arg_end..max_locals) needs zeroing (GC
+                         *    scans all locals slots; read-before-write of a
+                         *    scratch local must still see 0). The tail zero
+                         *    now lives in execute_method right after the
+                         *    arg copy — for the common case locals ==
+                         * args it is a ZERO-length memset.
+                         * Kill-switch: NOJME_FRAME_ZERO=1 restores the old
+                         * full clears (env.txt on Switch) if some game turns
+                         * out to read uninitialised stack slots. */
+                        static int s_frame_zero = -1;
+                        if (s_frame_zero < 0) {
+                                const char* e = getenv("NOJME_FRAME_ZERO");
+                                s_frame_zero = (e && e[0] == '1') ? 1 : 0;
+                        }
+                        if (s_frame_zero) {
+                                memset(frame->locals, 0, max_locals * sizeof(JavaValue));
+                                memset(frame->stack, 0, max_stack * sizeof(JavaValue));
+                        }
                         /* Reset frame state */
                         frame->pc = 0;
                         frame->stack_top = -1;
@@ -233,9 +307,10 @@ static JavaFrame* frame_create(JVM* jvm, JavaMethod* method, JavaClass* clazz) {
                         frame->exception_table = method->code.exception_table;
                         frame->exception_table_length = method->code.exception_table_length;
                         return frame;
+                        }
                 }
-                /* Size mismatch or corrupt entry, put back and fall through to alloc */
-                fp->count++;
+                /* Scan found no fitting entry (or a corrupt slot):
+                 * fall through to alloc. count is untouched on a miss. */
         }
         
         /* Pool miss or empty - allocate new */
@@ -253,6 +328,7 @@ static JavaFrame* frame_create(JVM* jvm, JavaMethod* method, JavaClass* clazz) {
 
         /* Allocate locals */
         frame->max_locals = max_locals;
+        frame->cap_locals = (uint16_t)max_locals;   /* v36.103 [POOL-CAP] */
         if (frame->max_locals > 0) {
                 frame->locals = (JavaValue*)calloc(frame->max_locals, sizeof(JavaValue));
                 if (!frame->locals) {
@@ -264,6 +340,7 @@ static JavaFrame* frame_create(JVM* jvm, JavaMethod* method, JavaClass* clazz) {
 
         /* Allocate operand stack */
         frame->max_stack = max_stack;
+        frame->cap_stack = (uint16_t)max_stack;     /* v36.103 [POOL-CAP] */
         frame->stack_top = -1;
         if (frame->max_stack > 0) {
                 /* v36.04 STKDIAG: the frame pool reuses blocks across methods
@@ -304,8 +381,10 @@ static void frame_destroy(JavaFrame* frame) {
         fp->frames[idx] = frame;
         fp->locals_blocks[idx] = frame->locals;
         fp->stack_blocks[idx] = frame->stack;
-        fp->max_locals[idx] = frame->max_locals;
-        fp->max_stack[idx] = frame->max_stack;
+        /* v36.103 [POOL-CAP]: store the block CAPACITY (monotone), not
+         * the last-served method's sizes — see the take-side comment. */
+        fp->max_locals[idx] = frame->cap_locals ? (int)frame->cap_locals : (int)frame->max_locals;
+        fp->max_stack[idx] = frame->cap_stack ? (int)frame->cap_stack : (int)frame->max_stack;
         return;
     }
     
@@ -358,7 +437,13 @@ static int push_frame(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     if (!thread || !frame) return -1;
 
     frame->prev = thread->current_frame;
+    /* v36.101 [FRAME-DEPTH]: O(1) call-depth bookkeeping (see JavaFrame).
+     * push_frame is the ONLY place a frame enters a thread's chain, so the
+     * value stays exact across calls, exception unwinds and pool reuse. */
+    frame->depth = frame->prev ? (frame->prev->depth + 1) : 1;
     thread->current_frame = frame;
+    /* v36.94 [STALLSTACK-REMOTE]: seqlock-запись (мутация цепочки кадров). */
+    thread->frame_seq++;
 
     /* [DUMP-FENCE] v36.48: вход в exec-окно (внешний кадр) — обновить
      * снапшот сайта; вложенные вызовы обновит yield-гранулярность ниже. */
@@ -391,6 +476,8 @@ static JavaFrame* pop_frame(JVM* jvm, JavaThread* thread) {
 
     JavaFrame* frame = thread->current_frame;
     thread->current_frame = frame->prev;
+    /* v36.94 [STALLSTACK-REMOTE]: seqlock-запись (мутация цепочки кадров). */
+    thread->frame_seq++;
 
     EXEC_DEBUG("Popped frame, depth now: %d",
                thread->current_frame ? 1 : 0);
@@ -441,6 +528,22 @@ __thread int tls_os_thread_is_vm_runner = 0;
 void jvm_frame_fence_wait_public(void) {
     int waited_ms = 0;
     int ext_logged = 0;
+    /* v36.96 [FENCE-DEADLOCK-BREAK]: publish "I am fence-waiting" on this
+     * runner. monitor_enter's wait loop on the FRAME thread reads it: if the
+     * owner of the monitor the pump is blocked on is fence-waiting, the
+     * pump's own fenced window can never finish (it waits for that monitor)
+     * while the owner waits for the fence — mutual deadlock. The pump then
+     * aborts the delivery immediately instead of burning the whole budget
+     * (field: 5 pauses of exactly ~1 s in the Metal Slug 6 v36.95 log).
+     * park_why="fence" additionally makes the wait visible in td dumps
+     * ("state=run but frozen at a slow-check" was previously untagged). */
+    {
+        JavaThread* self_fw = thread_current(NULL);
+        if (self_fw) {
+            self_fw->in_fence_wait = 1;
+            snprintf(self_fw->park_why, sizeof(self_fw->park_why), "fence");
+        }
+    }
     while (g_vm_fiber_fence) {
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 2 * 1000000L };
         nanosleep(&ts, NULL);
@@ -466,9 +569,22 @@ void jvm_frame_fence_wait_public(void) {
                 }
             }
             LOG_SAFE("[FENCE] held >2.5s for a frame-thread Java window - proceeding\n");
+            {
+                JavaThread* self_fw = thread_current(NULL);
+                if (self_fw) { self_fw->in_fence_wait = 0; self_fw->park_why[0] = '\0'; }
+            }
+            /* v36.97 [VM-PERF]: cap-break exit still counts the whole hold. */
+            __sync_fetch_and_add(&g_perf_fence_ms_acc, (uint32_t)waited_ms);
             return;
         }
     }
+    {
+        JavaThread* self_fw = thread_current(NULL);
+        if (self_fw) { self_fw->in_fence_wait = 0; self_fw->park_why[0] = '\0'; }
+    }
+    /* v36.97 [VM-PERF]: суммарное стояние раннеров на EXIT-FENCE за период.
+     * Диагностический агрегат: гонкие инкременты допустимы. */
+    __sync_fetch_and_add(&g_perf_fence_ms_acc, (uint32_t)waited_ms);
 }
 
 /* execute_method scope guard: arm the fence when the caller is the frame/
@@ -643,12 +759,119 @@ void argguard_check_ret(const char* cname, const char* mname,
 }
 
 /* Execute a method */
+/* v36.101 [CALL-TAX] -> v36.103 [IVK-TLS]: телеметрия плотности вызовов
+ * переехала в per-thread поля JavaThread::perf_ivk/perf_fiv/perf_ifc
+ * (обычный инкремент по своей линии кэша — никакого RMW по общей).
+ * Определения глобальных счётчиков удалены; сумма печатается обходом
+ * jvm->threads[] в switch_trace [VM-PERF]. */
+static int exec_max_recursion_depth(void);   /* v36.103: shared cap (defined before interpret) */
+
+/* v36.104 [VM-OPS]: сумма per-thread гистограмм опкодов за период
+ * (сброс при чтении — та же допустимая потеря нескольких счётов на
+ * стыке окна телеметрии, что у jvm_perf_call_tax_sum). Печатается
+ * диагностикой [VM-OPS] — топ микса опкодов с выборки 1/64. */
+int jvm_perf_ops_hist_sum(void* jvm_v, uint32_t out[256]) {
+    JVM* jvm = (JVM*)jvm_v;
+    if (!out) return -1;
+    memset(out, 0, 256 * sizeof(uint32_t));
+    if (jvm && jvm->threads) {
+        jint n = jvm->thread_count;
+        if (n < 0) n = 0;
+        for (jint i = 0; i < n; i++) {
+            JavaThread* t = jvm->threads[i];
+            if (!t) continue;
+            for (int b = 0; b < 256; b++) {
+                out[b] += t->ops_hist[b];
+                t->ops_hist[b] = 0;
+            }
+        }
+    }
+    return 0;
+}
+
+/* v36.105 [VM-PAIRS]: процесс-широкая гистограмма ДИНАМИЧЕСКИХ пар
+ * «завершённая команда -> следующая» (выборка 1/64 в том же каденсе
+ * T_SLOW, что и [VM-OPS]). В точке выборки регистр op уже держит
+ * ЗАВЕРШЁННУЮ команду, а code[f_pc] — следующую — пара получается без
+ * единой лишней операции в горячем цикле. Не-атомарный ++ по общей
+ * таблице из нескольких потоков может терять единичные счёты — для
+ * статистики 1/64 это шум ниже порога печати. Назначение: доказательная
+ * база для выбора спарок [SUPERI] — топ пар прямо из поля. */
+uint32_t g_vm_pairs_hist[256][256];
+
+/* v36.105 [VM-PAIRS]: забрать топ-<kmax> пар с СбросОМ таблицы (та же
+ * семантика read-and-reset, что у jvm_perf_ops_hist_sum). Возвращает
+ * число найденных пар; *out_total (если не NULL) — полный объём выборки
+ * окна ДО выборки топа (доли пар считаются от него — сопоставимо с [VM-OPS]);
+ * 0 пар при шумовом окне < min_total. Индексы пар кодируются (first<<8)|second. */
+int jvm_perf_pairs_top(uint32_t out_pair[16], uint32_t out_cnt[16],
+                       int kmax, uint32_t min_total, uint64_t* out_total) {
+    uint64_t total = 0;
+    for (int a = 0; a < 256; a++) {
+        for (int b = 0; b < 256; b++) total += g_vm_pairs_hist[a][b];
+    }
+    if (out_total) *out_total = total;
+    if (total < (uint64_t)min_total) {
+        /* шумовое окно — таблицу всё равно чистим, чтобы не копилась */
+        if (total) memset(g_vm_pairs_hist, 0, sizeof(g_vm_pairs_hist));
+        return 0;
+    }
+    if (kmax > 16) kmax = 16;
+    if (kmax < 1) { memset(g_vm_pairs_hist, 0, sizeof(g_vm_pairs_hist)); return 0; }
+    for (int k = 0; k < kmax; k++) { out_pair[k] = 0; out_cnt[k] = 0; }
+    int picked = 0;
+    for (int k = 0; k < kmax; k++) {
+        uint32_t best = 0;
+        int ba = -1, bb = -1;
+        for (int a = 0; a < 256; a++) {
+            uint32_t* row = g_vm_pairs_hist[a];
+            for (int b = 0; b < 256; b++) {
+                if (row[b] > best) { best = row[b]; ba = a; bb = b; }
+            }
+        }
+        if (ba < 0) break;
+        out_pair[k] = ((uint32_t)ba << 8) | (uint32_t)bb;
+        out_cnt[k] = best;
+        g_vm_pairs_hist[ba][bb] = 0;
+        picked = k + 1;
+    }
+    memset(g_vm_pairs_hist, 0, sizeof(g_vm_pairs_hist));
+    return picked;
+}
+
+int jvm_perf_call_tax_sum(void* jvm_v, uint32_t* ivk, uint32_t* fiv, uint32_t* ifc) {
+    JVM* jvm = (JVM*)jvm_v;
+    uint32_t s_ivk = 0, s_fiv = 0, s_ifc = 0;
+    if (jvm && jvm->threads) {
+        jint n = jvm->thread_count;
+        if (n < 0) n = 0;
+        for (jint i = 0; i < n; i++) {
+            JavaThread* t = jvm->threads[i];
+            if (!t) continue;
+            s_ivk += t->perf_ivk; t->perf_ivk = 0;
+            s_fiv += t->perf_fiv; t->perf_fiv = 0;
+            s_ifc += t->perf_ifc; t->perf_ifc = 0;
+        }
+    }
+    if (ivk) *ivk = s_ivk;
+    if (fiv) *fiv = s_fiv;
+    if (ifc) *ifc = s_ifc;
+    return 0;
+}
+
 int execute_method(JVM* jvm, JavaThread* thread, JavaMethod* method,
                    JavaValue* args, JavaValue* result) {
     if (!jvm || !thread || !method) {
         ERROR_LOG("execute_method: NULL parameter");
         return -1;
     }
+
+    /* v36.101 [CALL-TAX] / v36.103 [IVK-TLS]: плотность вызовов.
+     * v36.106 [PERF-GATE]: инкремент только в диагностических сборках
+     * (NOJME_PERF=1); в боевых — ноль лишних операций на вызов. */
+#if NOJME_PERF_DEBUG
+    thread->perf_ivk++;
+#endif
 
     /* v36.30 [EXIT-FENCE]: hold VM runners while frame-thread Java runs.
      * Scope guard — armed only by the outermost frame-thread call. */
@@ -664,20 +887,21 @@ int execute_method(JVM* jvm, JavaThread* thread, JavaMethod* method,
      * nests two large C frames (execute_method + interpret), so 2048 Java frames
      * can exhaust a 1 MB Windows thread stack BEFORE this guard trips — a raw
      * SIGSEGV with no Java-visible StackOverflowError. Lower the cap if the
-     * host stack is small (see FIXES.txt v34.33). */
-    static int max_recursion_depth = -1;
-    if (max_recursion_depth < 0) {
-        max_recursion_depth = 2048;
-        const char* env = getenv("NOJME_MAX_RECURSION");
-        if (env && *env) {
-            int v = atoi(env);
-            if (v > 0) max_recursion_depth = v;
-        }
-    }
+     * host stack is small (see FIXES.txt v34.33).
+     * v36.103: cap resolution extracted to exec_max_recursion_depth() — the
+     * [FAST-INVOKES] core path shares the SAME limit (its inline pushes do
+     * not grow the C stack, but the frame chain / pool budget must stop at
+     * the same place a cold recursion would). */
+    int max_recursion_depth = exec_max_recursion_depth();
     int recursion_depth = 0;
+    /* v36.101 [FRAME-DEPTH]: O(1) — chain length from the top frame's
+     * cached depth (maintained by push_frame) instead of a prev-pointer
+     * walk on every call. Semantics identical: number of frames currently
+     * on this thread's chain (root frame has depth=1, so the count of
+     * existing frames == current_frame->depth). */
     {
-        JavaFrame* f = thread->current_frame;
-        while (f) { recursion_depth++; f = f->prev; }
+        JavaFrame* cf = thread->current_frame;
+        if (cf) recursion_depth = (int)cf->depth;
     }
     if (recursion_depth > max_recursion_depth) {
         /* Print call stack to identify which method is recursing */
@@ -835,19 +1059,69 @@ int execute_method(JVM* jvm, JavaThread* thread, JavaMethod* method,
      * For non-static: args[0]=this, args[1..]=method args
      * For static: args[0..]=method args
      * IMPORTANT: double/long take 2 slots in locals but only 1 entry in args[]
+     *
+     * v36.101 [ARG-LAYOUT]: the per-call descriptor walk below is a
+     * branchy, data-dependent parse that ran on EVERY Java invocation
+     * (the v36.100 Switch field log: gameplay halved to 8.4M instr/s vs
+     * 17-19M/s on parse loops; host CallBench keeps the C call tax ~9%,
+     * so the deficit is exactly this class of per-call scaffolding,
+     * amplified by the A57's weaker speculation). The walk is now
+     * memoized once per method into JavaMethod::args_layout (packed
+     * count + wide/ref masks) and the steady state is a tight bit-guided
+     * copy loop. Semantics identical
+     * (J/D fill both slots with the same value; L/[ take the argguard
+     * plausibility check when enabled; anything unparsable / >15 java
+     * args keeps args_layout=0 and runs the ORIGINAL loop below).
      */
     int args_start = is_static ? 0 : 1;
     int arg_idx = args_start;
-    const char* desc = method->descriptor;
-    
-    /* Skip past '(' */
-    if (*desc == '(') desc++;
-    
-    while (*desc && *desc != ')') {
-        /* Copy argument value to locals */
-        frame->locals[local_idx] = args[arg_idx];
+
+    /* Packed form: see JavaMethod::args_layout (jvm.h). One aligned
+     * 64-bit load — the memo is published by a single store, so readers
+     * see either 0 (walk the descriptor) or a complete plan. */
+    uint64_t layout = method->args_layout;
+    if (__builtin_expect((layout >> 63) != 0, 1)) {
+        int n = (int)(layout & 0xFF);
+        uint32_t wide = (uint32_t)((layout >> 8) & 0xFFFF);
+        uint32_t refm = (uint32_t)((layout >> 24) & 0xFFFF);
+        int ag_on = argguard_enabled();
+        for (int i = 0; i < n; i++) {
+            JavaValue v = args[arg_idx + i];
+            if ((refm & 1) && ag_on &&
+                argguard_bad_ptr((uintptr_t)v.ref)) {
+                argguard_report("arg",
+                                method->clazz ? method->clazz->class_name : NULL,
+                                method->name, method->descriptor, arg_idx + i,
+                                v.raw, __builtin_return_address(0));
+                v.ref = NULL;
+            }
+            frame->locals[local_idx] = v;
+            if (wide & 1) {
+                frame->locals[local_idx + 1] = v;
+                local_idx += 2;
+            } else {
+                local_idx += 1;
+            }
+            wide >>= 1;
+            refm >>= 1;
+        }
+    } else {
+        /* One-time memoization (or permanent fallback for odd
+         * descriptors): walk the descriptor exactly like the original
+         * loop, recording the layout when the parse is clean. */
+        int memo_jac = 0;
+        uint16_t memo_wide = 0, memo_ref = 0;
+        int memo_ok = 1;
+        const char* desc = method->descriptor;
+
+        /* Skip past '(' */
+        if (*desc == '(') desc++;
+
+        while (*desc && *desc != ')') {
+            /* Copy argument value to locals */
+            frame->locals[local_idx] = args[arg_idx];
         
-        switch (*desc) {
+            switch (*desc) {
             case 'J': case 'D':
                 /* FIX: args[] is a COMPACT list built by every caller
                  * (op_invoke* marshalling, jvm_invoke_*, natives): exactly one
@@ -857,6 +1131,9 @@ int execute_method(JVM* jvm, JavaThread* thread, JavaMethod* method,
                  * garbage doubles/longs (e.g. Rectangle area tests).
                  * Locals still occupy two slots - fill both with the SAME
                  * value, which is our two-slot representation convention. */
+                if (memo_jac < 16) memo_wide |= (uint16_t)(1u << memo_jac);
+                else memo_ok = 0;
+                memo_jac++;
                 frame->locals[local_idx] = args[arg_idx];
                 frame->locals[local_idx + 1] = args[arg_idx];
                 local_idx += 2;
@@ -864,6 +1141,7 @@ int execute_method(JVM* jvm, JavaThread* thread, JavaMethod* method,
                 desc++;
                 break;
             case 'B': case 'C': case 'F': case 'I': case 'S': case 'Z':
+                memo_jac++;
                 local_idx++;
                 arg_idx++;
                 desc++;
@@ -871,6 +1149,9 @@ int execute_method(JVM* jvm, JavaThread* thread, JavaMethod* method,
             case 'L':
                 /* [ARGGUARD] v36.49: ref-аргумент от моста — валидация
                  * при копировании (значение уже в locals, дефуз там же) */
+                if (memo_jac < 16) memo_ref |= (uint16_t)(1u << memo_jac);
+                else memo_ok = 0;
+                memo_jac++;
                 if (argguard_enabled() &&
                     argguard_bad_ptr((uintptr_t)frame->locals[local_idx].ref)) {
                     argguard_report("arg",
@@ -887,6 +1168,9 @@ int execute_method(JVM* jvm, JavaThread* thread, JavaMethod* method,
                 break;
             case '[':
                 /* [ARGGUARD] v36.49: массивный ref — та же валидация */
+                if (memo_jac < 16) memo_ref |= (uint16_t)(1u << memo_jac);
+                else memo_ok = 0;
+                memo_jac++;
                 if (argguard_enabled() &&
                     argguard_bad_ptr((uintptr_t)frame->locals[local_idx].ref)) {
                     argguard_report("arg",
@@ -903,9 +1187,44 @@ int execute_method(JVM* jvm, JavaThread* thread, JavaMethod* method,
                 if (*desc) desc++;
                 break;
             default:
+                /* Unknown descriptor char: layout unmemoizable (and the
+                 * original loop simply skipped the char — keep that). */
+                memo_ok = 0;
                 desc++;
                 break;
         }
+    }
+
+    /* v36.101 [ARG-LAYOUT]: commit the memo only for a CLEAN parse of the
+     * whole descriptor: arg count matches the compact entries actually
+     * consumed, closed by ')', <= 15 java args (masks are 16-bit). The
+     * commit is a SINGLE 64-bit store (valid bit 63 + count + both masks)
+     * — atomic on every supported target, so a concurrent first-call from
+     * another thread sees either "no plan" (walks the descriptor itself)
+     * or the complete plan, never a half-written one. */
+    if (memo_ok && method->descriptor && *desc == ')' && memo_jac >= 0 && memo_jac <= 15) {
+        uint64_t packed = ((uint64_t)1 << 63) |
+                          ((uint64_t)(uint8_t)memo_jac) |
+                          ((uint64_t)memo_wide << 8) |
+                          ((uint64_t)memo_ref << 24);
+        method->args_layout = packed;
+    }
+    }
+
+    /* v36.103 [FRAME-ZERO-TAIL]: zero ONLY the locals slots beyond the
+     * argument block. [0..local_idx) now holds this+args (valid values or
+     * argguard-defused NULLs); the GC mark phase scans locals up to
+     * max_locals REGARDLESS of liveness, and read-before-write of a
+     * scratch local by sloppy (obfuscated) bytecode must still observe
+     * the all-zero JavaValue — so the tail cannot be skipped, but the
+     * head MUST NOT be re-cleared (the args are already there). For the
+     * common small method (locals == args) this is a zero-length memset;
+     * frame_create no longer clears either block (see [FRAME-ZERO-TAIL]
+     * there). The calloc'd fresh-frame path below frame_create comes
+     * pre-zeroed, so this is only ever doing real work on POOLED reuse. */
+    if (local_idx < (int)frame->max_locals) {
+        memset(&frame->locals[local_idx], 0,
+               ((int)frame->max_locals - local_idx) * sizeof(JavaValue));
     }
 
 
@@ -1107,6 +1426,40 @@ long g_jvm_thread_budget = -1;  /* -1 = env/default, 0 = off, >0 = per-window */
  * slow-check block). Diagnostic aggregate shared across runner threads —
  * benign racy increments, reset by whichever thread crosses the window. */
 volatile uint32_t g_vmpace_sleep_ms = 0;
+
+/* ---------------- v36.97 [VM-PERF] telemetry ----------------
+ * Полевой вопрос (Zombie Infection K800i: 4 FPS на Switch при том, что
+ * хост-сборка держит собственный кадровый потолок игры 25 FPS на ~570K
+ * инструкциях/кадр) требует ОДНОГО ответа из полевого лога: куда уходит
+ * кадр на устройстве — в бюджет темпа, в EXIT-FENCE, в handshake
+ * serviceRepaints, в GC или в сырую скорость интерпретатора. Счётчики
+ * копятся по 2-мс шагам соответствующих парковочных циклов и читаются
+ * (take-and-reset) 5-с diag-строкой switch_trace.c. */
+volatile uint32_t g_perf_fence_ms_acc  = 0;  /* runners: EXIT-FENCE hold   */
+volatile uint32_t g_perf_srep_ms_acc   = 0;  /* runners: serviceRepaints handshake */
+volatile uint32_t g_perf_budget_ms_acc = 0;  /* runners: instruction-budget yield  */
+volatile uint32_t g_perf_gcsp_ms_acc   = 0;  /* mutators: GC safepoint park (threads.c) */
+/* v36.99 [SBC-CADENCE]: сколько раз за период РЕАЛЬНО исполнилась полная
+ * проверка спин-брейкера (часы + sibling-проход + цепочка кадров).
+ * Печатается как vsbc= в [VM-PERF]; полевое доказательство снижения
+ * частоты (v36.98: ~vi/64 за период; v36.99: ~vi/1024). */
+volatile uint32_t g_perf_sbcheck_acc   = 0;  /* spin-break full evaluations */
+/* v36.101 [CALL-TAX]: ivk=/ifc= — определения перенесены ВЫШЕ execute_method
+ * (инкремент ivk сидит на входе функции); см. блок перед execute_method. */
+
+/* Cumulative instruction counter of the live VM (delta = rate over the
+ * diag period). Safe on any thread: reads one aligned u64 of the only
+ * JVM instance. */
+uint64_t jvm_perf_instr_total(void) {
+    extern JVM* g_jvm_for_instanceof;
+    return g_jvm_for_instanceof ? g_jvm_for_instanceof->instr_count : 0;
+}
+
+/* Current runner budget (-1 unresolved, 0 = turbo/unlimited, >0 = per-16.6ms) */
+long jvm_perf_budget_value(void) { return g_jvm_thread_budget; }
+
+/* ms the runners slept pacing to the budget in the CURRENT 10 s window */
+uint32_t jvm_perf_vmpace_slept_ms(void) { return g_vmpace_sleep_ms; }
 /* v35.13: sleeping time reported for the LAST closed 10 s diagnostic window.
  * Together with g_vmpace_sleep_ms it answers "is the game VM-speed-bound
  * right now" for the frontend loading screen hint (jvm_vmpace_active). */
@@ -1358,6 +1711,137 @@ static void prof_sample(JavaFrame* frame) {
  * Each thread has its own call stack, so exceptions are propagated via return values.
  * This avoids the problem where Thread 2's jmp_buf would corrupt Thread 1's exception handling.
  */
+/* v36.103 [FAST-INVOKES]: field kill switch for the core-inline invoke
+ * path. Default ON; NOJME_FAST_INVOKES=0 (also via sdmc:/switch/j2me/env.txt
+ * on Switch) restores the v36.102 call semantics: every invoke goes
+ * cold_dispatch -> op_invoke* IC path -> execute_method. */
+static int fast_invokes_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("NOJME_FAST_INVOKES");
+        on = (e && e[0] == '0') ? 0 : 1;
+    }
+    return on;
+}
+
+/* v36.103: recursion cap, resolved ONCE and shared by execute_method and
+ * the interpreter core's inline invoke path — both dispatch paths must
+ * trip StackOverflowError at the SAME depth (the core path bails to the
+ * cold path one frame early so execute_method does the actual throw +
+ * call-stack log, byte-for-byte the v36.102 diagnostics). */
+static int exec_max_recursion_depth(void) {
+    static int cap = -1;
+    if (cap < 0) {
+        cap = 2048;
+        const char* env = getenv("NOJME_MAX_RECURSION");
+        if (env && *env) {
+            int v = atoi(env);
+            if (v > 0) cap = v;
+        }
+    }
+    return cap;
+}
+
+
+/* v36.104 [THREADED-DISPATCH]: env kill switch — NOJME_THREADED_DISPATCH=0
+ * routes every opcode through the cold handler table (the fast labels are
+ * never entered; semantics = per-opcode cold dispatch). Resolved once. */
+#if NOJME_THREADED_DISPATCH
+static int threaded_dispatch_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("NOJME_THREADED_DISPATCH");
+        on = (e && e[0] == '0') ? 0 : 1;
+    }
+    return on;
+}
+/* v36.105 [SUPERI]: спарки — слияние самой частотной пары опкодов в один
+ * диспетчерский шаг (данные [VM-PAIRS]/EffBench: istore+iload 7.1%,
+ * sipush+iand 5.2%, iload+{bipush,sipush,iload,imul} 17%, iand+istore 3.5%
+ * ... ≈50% всех динамических пар). Хендлер продюсера исполняет своё тело,
+ * подсматривает СЛЕДУЮЩИЙ опкод (тот самый байт, который хвост всё равно
+ * читает) и при совпадении исполняет тело консюмера INLINE — одна
+ * диспетчеризация на две команды вместо двух. Рубильник NOJME_SUPERI=0
+ * (env.txt на Switch) возвращает v36.104: таблица t_disp_superi не
+ * выбирается, слотенные метки недостижимы. */
+static int superi_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("NOJME_SUPERI");
+        on = (e && e[0] == '0') ? 0 : 1;
+    }
+    return on;
+}
+/* v36.105 [SUPERI]: консюмеры-группы. iload_n/fload_n/aload_n начинаются
+ * с опкода ≡ 2 (mod 4) => (op + 2) & 3 = индекс локаля 0-3 (то же
+ * тождество, что в их быстром хендлере); istore_n/... ≡ 3 (mod 4) =>
+ * (op + 1) & 3. Диапазоны: 0x1A-0x1D / 0x22-0x25 / 0x2A-0x2D (loads) и
+ * 0x3B-0x3E / 0x43-0x46 / 0x4B-0x4E (stores). */
+#define SUPERI_IS_LOAD_N(o) \
+    (((o) >= OPC_ILOAD_0 && (o) <= OPC_ILOAD_3) || \
+     ((o) >= OPC_FLOAD_0 && (o) <= OPC_FLOAD_3) || \
+     ((o) >= OPC_ALOAD_0 && (o) <= OPC_ALOAD_3))
+#define SUPERI_IS_STORE_N(o) \
+    (((o) >= OPC_ISTORE_0 && (o) <= OPC_ISTORE_3) || \
+     ((o) >= OPC_FSTORE_0 && (o) <= OPC_FSTORE_3) || \
+     ((o) >= OPC_ASTORE_0 && (o) <= OPC_ASTORE_3))
+/* The dispatch tail, expanded at the end of EVERY fast handler: fetch the
+ * next opcode and jump through the per-site indirect branch. Order mirrors
+ * the v36.103 loop head exactly: bounds + liveness, 64-cadence countdown,
+ * icount, prof sample window, instruction limit, opcode fetch, 1000-cadence
+ * countdown, dispatch. (The F12 debug check moved to the 64-cadence body:
+ * the cold path keeps the flag COLD per-opcode once engaged, so the tracer
+ * still sees every opcode from the moment it trips.) */
+#define NOJME_NEXT() do { \
+        if (__builtin_expect(f_pc >= code_len || !jvm->running, 0)) goto T_EXIT; \
+        if (__builtin_expect(--slow_check_countdown == 0, 0)) goto T_SLOW; \
+        icount++; \
+        if (__builtin_expect(prof_real_local && (icount & 0x3FFFULL) == 0, 0)) goto T_PROF; \
+        if (__builtin_expect(limit > 0 && icount > limit, 0)) goto T_LIMIT; \
+        op = code[f_pc]; \
+        if (__builtin_expect(--sched_countdown == 0, 0)) goto T_YIELD; \
+        goto *disp[op]; \
+    } while (0)
+/* v36.105 [SUPERI]: хвост после СЛИТОЙ пары. Счёт консюмера платится ЗДЕСЬ,
+ * ДО каденса: T_SLOW синхронизирует jvm->instr_count = icount (увидит обе
+ * команды пары), а эпилог T_SLOW считает (+1) только ОЖИДАЮЩУЮ команду —
+ * как и в обычном хвосте, где счёт происходит на диспетчеризации. Эпилог
+ * T_SLOW идентичен и для обоих хвостов. Отчётные сдвиги семантики против
+ * v36.104 (документированы, все — статистические): prof-окна 0x3FFF могут
+ * пропускать нечётные границы (шаг счётчика 2); J2ME_MAX_INSTRUCTIONS
+ * может перелететь лимит на 1 на границе спарки; каденс T_SLOW — раз на
+ * ~64 ДИСПЕТЧЕРИЗАЦИИ (до ~128 команд при 100% спарок) — задержка сейфпоинта
+ * GC/спин-брейкера удваивается в худшем случае (микросекунды против
+ * миллисекундных порогов). */
+#define NOJME_NEXT2() do { \
+        icount++;  /* счёт слитого консюмера — ДО каденса и выходов */ \
+        if (__builtin_expect(f_pc >= code_len || !jvm->running, 0)) goto T_EXIT; \
+        if (__builtin_expect(--slow_check_countdown == 0, 0)) goto T_SLOW; \
+        icount++; \
+        if (__builtin_expect(prof_real_local && (icount & 0x3FFFULL) == 0, 0)) goto T_PROF; \
+        if (__builtin_expect(limit > 0 && icount > limit, 0)) goto T_LIMIT; \
+        op = code[f_pc]; \
+        if (__builtin_expect(--sched_countdown == 0, 0)) goto T_YIELD; \
+        goto *disp[op]; \
+    } while (0)
+/* fast-case source stays IDENTICAL for both dispatch shapes: the classic
+ * build compiles case labels + break; the threaded build compiles plain
+ * labels + its own dispatch tail. */
+#define FS_CASE(n) FS_LBL_##n:
+#define FS_END() NOJME_NEXT()
+#else
+#define FS_CASE(n) case n:
+#define FS_END() break
+#endif
+
+/* v36.104 [THREADED-DISPATCH]: keep the per-handler dispatch tails
+ * UNMERGED. GCC's crossjumping/tree-tail-merge folds the identical
+ * NOJME_NEXT() expansions into a handful of shared indirect branches —
+ * which re-concentrates the whole opcode-transition stream on a few
+ * sites and defeats the per-site BTB history the redesign exists for
+ * (host A/B: 21 merged sites instead of ~90). The attribute is scoped
+ * to interpret() only. */
+__attribute__((optimize("no-crossjumping,no-tree-tail-merge")))
 static int interpret(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     if (!frame || !frame->code) {
         ERROR_LOG("interpret: NULL frame or code");
@@ -1402,15 +1886,297 @@ static int interpret(JVM* jvm, JavaThread* thread, JavaFrame* frame) {
     uint64_t icount = jvm->instr_count;   /* batched; flushed at exits/safepoints */
     uint64_t limit = jvm->instr_limit;    /* immutable after env read */
 
+    /* v36.103 [FAST-INVOKES]: the frame this interpret() invocation was
+     * entered with. Calls dispatched by the new inline invoke path push
+     * frames onto the SAME loop (no execute_method/interpret C nesting),
+     * so returns/unwinds must distinguish "pop an inline frame and keep
+     * looping" from "this entry frame is done — return to execute_method"
+     * (which owns its monitor/destroy bookkeeping). Never changes within
+     * one interpret() call. */
+    JavaFrame* const entry_frame = frame;
+    /* v36.103 [FAST-INVOKES]: resolve the two gates once per interpret()
+     * (same lazy-static pattern as prof_real_on above). NOJME_FAST_INVOKES=0
+     * routes every invoke through cold_dispatch -> handler IC paths —
+     * exactly the v36.102 semantics (field kill switch, also env.txt). */
+    const int fast_invokes_on = fast_invokes_enabled();
+    /* v36.103: recursion cap shared with execute_method (single lazy
+     * resolution — the two call paths must throw StackOverflowError at
+     * the SAME depth). */
+    const int fast_rec_cap = exec_max_recursion_depth();
+#if J2ME_DEBUG
+    /* Both are consumed only by the #if !J2ME_DEBUG fast core below. */
+    (void)fast_invokes_on;
+    (void)fast_rec_cap;
+#endif
+
 continue_execution:
     ;  /* declarations above; exception-handler gotos resume here */
+    /* v36.103 [FAST-INVOKES]: an exception handler may now live in a
+     * CALLER frame reached by the inline unwind — reload the whole
+     * register file from the thread's current frame, not just pc/st.
+     * (In the no-unwind case these are the values we already had.) */
+    if (thread->current_frame) frame = thread->current_frame;
+    locals = frame->locals;
+    stack = frame->stack;
+    code = frame->code;
+    code_len = frame->code_length;
     f_pc = frame->pc;
     st = frame->stack_top;
     icount = jvm->instr_count;
 
+#if NOJME_THREADED_DISPATCH
+    /* v36.104 [THREADED-DISPATCH]: per-interpret() dispatch table select.
+     * t_disp_fast: hot opcodes -> their label, everything else ->
+     * cold_dispatch (exactly the v36.103 switch default). t_disp_cold:
+     * the NOJME_THREADED_DISPATCH=0 emergency brake — every opcode
+     * through the cold handler table. `disp` lives in a callee-saved
+     * register for the whole fast run (no fast handler calls C). */
+    /* -Wextra's -Woverride-init fires on the range-then-specific
+     * designated-initializer idiom; the override is exactly the intent. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Woverride-init"
+    static void* const t_disp_fast[256] = {
+        [0 ... 255] = &&cold_dispatch,
+        [OPC_NOP] = &&FS_LBL_OPC_NOP,
+        [OPC_ACONST_NULL] = &&FS_LBL_OPC_ACONST_NULL,
+        [OPC_ICONST_M1] = &&FS_LBL_OPC_ICONST_M1,
+        [OPC_ICONST_0] = &&FS_LBL_OPC_ICONST_0,
+        [OPC_ICONST_1] = &&FS_LBL_OPC_ICONST_1,
+        [OPC_ICONST_2] = &&FS_LBL_OPC_ICONST_2,
+        [OPC_ICONST_3] = &&FS_LBL_OPC_ICONST_3,
+        [OPC_ICONST_4] = &&FS_LBL_OPC_ICONST_4,
+        [OPC_ICONST_5] = &&FS_LBL_OPC_ICONST_5,
+        [OPC_ILOAD] = &&FS_LBL_OPC_ILOAD,
+        [OPC_FLOAD] = &&FS_LBL_OPC_FLOAD,
+        [OPC_ALOAD] = &&FS_LBL_OPC_ALOAD,
+        [OPC_ILOAD_0] = &&FS_LBL_OPC_ILOAD_0,
+        [OPC_ILOAD_1] = &&FS_LBL_OPC_ILOAD_1,
+        [OPC_ILOAD_2] = &&FS_LBL_OPC_ILOAD_2,
+        [OPC_ILOAD_3] = &&FS_LBL_OPC_ILOAD_3,
+        [OPC_FLOAD_0] = &&FS_LBL_OPC_FLOAD_0,
+        [OPC_FLOAD_1] = &&FS_LBL_OPC_FLOAD_1,
+        [OPC_FLOAD_2] = &&FS_LBL_OPC_FLOAD_2,
+        [OPC_FLOAD_3] = &&FS_LBL_OPC_FLOAD_3,
+        [OPC_ALOAD_0] = &&FS_LBL_OPC_ALOAD_0,
+        [OPC_ALOAD_1] = &&FS_LBL_OPC_ALOAD_1,
+        [OPC_ALOAD_2] = &&FS_LBL_OPC_ALOAD_2,
+        [OPC_ALOAD_3] = &&FS_LBL_OPC_ALOAD_3,
+        [OPC_ISTORE] = &&FS_LBL_OPC_ISTORE,
+        [OPC_FSTORE] = &&FS_LBL_OPC_FSTORE,
+        [OPC_ASTORE] = &&FS_LBL_OPC_ASTORE,
+        [OPC_ISTORE_0] = &&FS_LBL_OPC_ISTORE_0,
+        [OPC_ISTORE_1] = &&FS_LBL_OPC_ISTORE_1,
+        [OPC_ISTORE_2] = &&FS_LBL_OPC_ISTORE_2,
+        [OPC_ISTORE_3] = &&FS_LBL_OPC_ISTORE_3,
+        [OPC_FSTORE_0] = &&FS_LBL_OPC_FSTORE_0,
+        [OPC_FSTORE_1] = &&FS_LBL_OPC_FSTORE_1,
+        [OPC_FSTORE_2] = &&FS_LBL_OPC_FSTORE_2,
+        [OPC_FSTORE_3] = &&FS_LBL_OPC_FSTORE_3,
+        [OPC_ASTORE_0] = &&FS_LBL_OPC_ASTORE_0,
+        [OPC_ASTORE_1] = &&FS_LBL_OPC_ASTORE_1,
+        [OPC_ASTORE_2] = &&FS_LBL_OPC_ASTORE_2,
+        [OPC_ASTORE_3] = &&FS_LBL_OPC_ASTORE_3,
+        [OPC_IINC] = &&FS_LBL_OPC_IINC,
+        [OPC_SIPUSH] = &&FS_LBL_OPC_SIPUSH,
+        [OPC_BIPUSH] = &&FS_LBL_OPC_BIPUSH,
+        [OPC_FCONST_0] = &&FS_LBL_OPC_FCONST_0,
+        [OPC_FCONST_1] = &&FS_LBL_OPC_FCONST_1,
+        [OPC_FCONST_2] = &&FS_LBL_OPC_FCONST_2,
+        [OPC_LCONST_0] = &&FS_LBL_OPC_LCONST_0,
+        [OPC_LCONST_1] = &&FS_LBL_OPC_LCONST_1,
+        [OPC_DCONST_0] = &&FS_LBL_OPC_DCONST_0,
+        [OPC_DCONST_1] = &&FS_LBL_OPC_DCONST_1,
+        [OPC_FNEG] = &&FS_LBL_OPC_FNEG,
+        [OPC_DADD] = &&FS_LBL_OPC_DADD,
+        [OPC_DSUB] = &&FS_LBL_OPC_DSUB,
+        [OPC_DMUL] = &&FS_LBL_OPC_DMUL,
+        [OPC_DDIV] = &&FS_LBL_OPC_DDIV,
+        [OPC_DNEG] = &&FS_LBL_OPC_DNEG,
+        [OPC_FCMPL] = &&FS_LBL_OPC_FCMPL,
+        [OPC_FCMPG] = &&FS_LBL_OPC_FCMPG,
+        [OPC_DCMPL] = &&FS_LBL_OPC_DCMPL,
+        [OPC_DCMPG] = &&FS_LBL_OPC_DCMPG,
+        [OPC_LDC_W] = &&FS_LBL_OPC_LDC_W,
+        [OPC_LDC2_W] = &&FS_LBL_OPC_LDC2_W,
+        [OPC_GETSTATIC] = &&FS_LBL_OPC_GETSTATIC,
+        [OPC_PUTSTATIC] = &&FS_LBL_OPC_PUTSTATIC,
+        [OPC_GETFIELD] = &&FS_LBL_OPC_GETFIELD,
+        [OPC_PUTFIELD] = &&FS_LBL_OPC_PUTFIELD,
+        [OPC_I2L] = &&FS_LBL_OPC_I2L,
+        [OPC_L2I] = &&FS_LBL_OPC_L2I,
+        [OPC_I2B] = &&FS_LBL_OPC_I2B,
+        [OPC_I2C] = &&FS_LBL_OPC_I2C,
+        [OPC_I2S] = &&FS_LBL_OPC_I2S,
+        [OPC_I2F] = &&FS_LBL_OPC_I2F,
+        [OPC_F2I] = &&FS_LBL_OPC_F2I,
+        [OPC_F2L] = &&FS_LBL_OPC_F2L,
+        [OPC_L2F] = &&FS_LBL_OPC_L2F,
+        [OPC_L2D] = &&FS_LBL_OPC_L2D,
+        [OPC_D2L] = &&FS_LBL_OPC_D2L,
+        [OPC_D2I] = &&FS_LBL_OPC_D2I,
+        [OPC_D2F] = &&FS_LBL_OPC_D2F,
+        [OPC_F2D] = &&FS_LBL_OPC_F2D,
+        [OPC_LCMP] = &&FS_LBL_OPC_LCMP,
+        [OPC_LADD] = &&FS_LBL_OPC_LADD,
+        [OPC_LSUB] = &&FS_LBL_OPC_LSUB,
+        [OPC_LMUL] = &&FS_LBL_OPC_LMUL,
+        [OPC_LAND] = &&FS_LBL_OPC_LAND,
+        [OPC_LOR] = &&FS_LBL_OPC_LOR,
+        [OPC_LXOR] = &&FS_LBL_OPC_LXOR,
+        [OPC_LSHL] = &&FS_LBL_OPC_LSHL,
+        [OPC_LSHR] = &&FS_LBL_OPC_LSHR,
+        [OPC_LUSHR] = &&FS_LBL_OPC_LUSHR,
+        [OPC_LLOAD] = &&FS_LBL_OPC_LLOAD,
+        [OPC_DLOAD] = &&FS_LBL_OPC_DLOAD,
+        [OPC_LLOAD_0] = &&FS_LBL_OPC_LLOAD_0,
+        [OPC_LLOAD_1] = &&FS_LBL_OPC_LLOAD_1,
+        [OPC_LLOAD_2] = &&FS_LBL_OPC_LLOAD_2,
+        [OPC_LLOAD_3] = &&FS_LBL_OPC_LLOAD_3,
+        [OPC_DLOAD_0] = &&FS_LBL_OPC_DLOAD_0,
+        [OPC_DLOAD_1] = &&FS_LBL_OPC_DLOAD_1,
+        [OPC_DLOAD_2] = &&FS_LBL_OPC_DLOAD_2,
+        [OPC_DLOAD_3] = &&FS_LBL_OPC_DLOAD_3,
+        [OPC_LSTORE] = &&FS_LBL_OPC_LSTORE,
+        [OPC_DSTORE] = &&FS_LBL_OPC_DSTORE,
+        [OPC_LSTORE_0] = &&FS_LBL_OPC_LSTORE_0,
+        [OPC_LSTORE_1] = &&FS_LBL_OPC_LSTORE_1,
+        [OPC_LSTORE_2] = &&FS_LBL_OPC_LSTORE_2,
+        [OPC_LSTORE_3] = &&FS_LBL_OPC_LSTORE_3,
+        [OPC_DSTORE_0] = &&FS_LBL_OPC_DSTORE_0,
+        [OPC_DSTORE_1] = &&FS_LBL_OPC_DSTORE_1,
+        [OPC_DSTORE_2] = &&FS_LBL_OPC_DSTORE_2,
+        [OPC_DSTORE_3] = &&FS_LBL_OPC_DSTORE_3,
+        [OPC_POP] = &&FS_LBL_OPC_POP,
+        [OPC_POP2] = &&FS_LBL_OPC_POP2,
+        [OPC_DUP] = &&FS_LBL_OPC_DUP,
+        [OPC_DUP2] = &&FS_LBL_OPC_DUP2,
+        [OPC_IADD] = &&FS_LBL_OPC_IADD,
+        [OPC_ISUB] = &&FS_LBL_OPC_ISUB,
+        [OPC_IMUL] = &&FS_LBL_OPC_IMUL,
+        [OPC_IDIV] = &&FS_LBL_OPC_IDIV,
+        [OPC_IREM] = &&FS_LBL_OPC_IREM,
+        [OPC_INEG] = &&FS_LBL_OPC_INEG,
+        [OPC_ISHL] = &&FS_LBL_OPC_ISHL,
+        [OPC_ISHR] = &&FS_LBL_OPC_ISHR,
+        [OPC_IUSHR] = &&FS_LBL_OPC_IUSHR,
+        [OPC_IAND] = &&FS_LBL_OPC_IAND,
+        [OPC_IOR] = &&FS_LBL_OPC_IOR,
+        [OPC_IXOR] = &&FS_LBL_OPC_IXOR,
+        [OPC_FADD] = &&FS_LBL_OPC_FADD,
+        [OPC_FSUB] = &&FS_LBL_OPC_FSUB,
+        [OPC_FMUL] = &&FS_LBL_OPC_FMUL,
+        [OPC_FDIV] = &&FS_LBL_OPC_FDIV,
+        [OPC_IFEQ] = &&FS_LBL_OPC_IFEQ,
+        [OPC_IFNE] = &&FS_LBL_OPC_IFNE,
+        [OPC_IFLT] = &&FS_LBL_OPC_IFLT,
+        [OPC_IFGE] = &&FS_LBL_OPC_IFGE,
+        [OPC_IFGT] = &&FS_LBL_OPC_IFGT,
+        [OPC_IFLE] = &&FS_LBL_OPC_IFLE,
+        [OPC_IFNULL] = &&FS_LBL_OPC_IFNULL,
+        [OPC_IFNONNULL] = &&FS_LBL_OPC_IFNONNULL,
+        [OPC_IF_ICMPEQ] = &&FS_LBL_OPC_IF_ICMPEQ,
+        [OPC_IF_ICMPNE] = &&FS_LBL_OPC_IF_ICMPNE,
+        [OPC_IF_ICMPLT] = &&FS_LBL_OPC_IF_ICMPLT,
+        [OPC_IF_ICMPGE] = &&FS_LBL_OPC_IF_ICMPGE,
+        [OPC_IF_ICMPGT] = &&FS_LBL_OPC_IF_ICMPGT,
+        [OPC_IF_ICMPLE] = &&FS_LBL_OPC_IF_ICMPLE,
+        [OPC_IF_ACMPEQ] = &&FS_LBL_OPC_IF_ACMPEQ,
+        [OPC_IF_ACMPNE] = &&FS_LBL_OPC_IF_ACMPNE,
+        [OPC_GOTO] = &&FS_LBL_OPC_GOTO,
+        [OPC_ARRAYLENGTH] = &&FS_LBL_OPC_ARRAYLENGTH,
+        [OPC_IALOAD] = &&FS_LBL_OPC_IALOAD,
+        [OPC_FALOAD] = &&FS_LBL_OPC_FALOAD,
+        [OPC_AALOAD] = &&FS_LBL_OPC_AALOAD,
+        [OPC_BALOAD] = &&FS_LBL_OPC_BALOAD,
+        [OPC_CALOAD] = &&FS_LBL_OPC_CALOAD,
+        [OPC_SALOAD] = &&FS_LBL_OPC_SALOAD,
+        [OPC_IASTORE] = &&FS_LBL_OPC_IASTORE,
+        [OPC_FASTORE] = &&FS_LBL_OPC_FASTORE,
+        [OPC_AASTORE] = &&FS_LBL_OPC_AASTORE,
+        [OPC_BASTORE] = &&FS_LBL_OPC_BASTORE,
+        [OPC_CASTORE] = &&FS_LBL_OPC_CASTORE,
+        [OPC_SASTORE] = &&FS_LBL_OPC_SASTORE,
+        [OPC_INVOKEVIRTUAL] = &&FS_LBL_OPC_INVOKEVIRTUAL,
+        [OPC_INVOKESPECIAL] = &&FS_LBL_OPC_INVOKESPECIAL,
+        [OPC_INVOKESTATIC] = &&FS_LBL_OPC_INVOKESTATIC,
+        [OPC_INVOKEINTERFACE] = &&FS_LBL_OPC_INVOKEINTERFACE,
+        [OPC_IRETURN] = &&FS_LBL_OPC_IRETURN,
+        [OPC_FRETURN] = &&FS_LBL_OPC_FRETURN,
+        [OPC_ARETURN] = &&FS_LBL_OPC_ARETURN,
+        [OPC_LRETURN] = &&FS_LBL_OPC_LRETURN,
+        [OPC_DRETURN] = &&FS_LBL_OPC_DRETURN,
+        [OPC_RETURN] = &&FS_LBL_OPC_RETURN,
+    };
+    static void* const t_disp_cold[256] = {
+        [0 ... 255] = &&cold_dispatch,
+    };
+#pragma GCC diagnostic pop
+    /* v36.105 [SUPERI]: третья таблица — копия t_disp_fast, где ПРОДЮСЕРЫ
+     * спарок перенаправлены на слитые метки. Патчится ОДИН РАЗ при первом
+     * входе в interpret() с включёнными спарками ( гонка двух потоков
+     * безвредна: оба пишут одни и те же значения; всякая промежуточная
+     * таблица валидна — слот либо старый, либо новый адрес метки).
+     * Видимость для ПОЗЖЕ созданных потоков гарантирует pthread_create
+     * (барьер); runner-потоки рождаются только из Java-кода, который
+     * исполняется ПОСЛЕ первой interpret() главного потока. */
+    static void* t_disp_superi[256];
+    static volatile int t_disp_superi_ready = 0;
+    void* const* disp;
+    if (threaded_dispatch_enabled()) {
+        if (superi_enabled()) {
+            if (!t_disp_superi_ready) {
+                memcpy(t_disp_superi, t_disp_fast, sizeof(t_disp_superi));
+                t_disp_superi[OPC_ILOAD]  = &&FS_LBL_SUPERI_LOAD;
+                t_disp_superi[OPC_FLOAD]  = &&FS_LBL_SUPERI_LOAD;
+                t_disp_superi[OPC_ALOAD]  = &&FS_LBL_SUPERI_LOAD;
+                t_disp_superi[OPC_ISTORE] = &&FS_LBL_SUPERI_STORE;
+                t_disp_superi[OPC_FSTORE] = &&FS_LBL_SUPERI_STORE;
+                t_disp_superi[OPC_ASTORE] = &&FS_LBL_SUPERI_STORE;
+                t_disp_superi[OPC_SIPUSH] = &&FS_LBL_SUPERI_SIPUSH;
+                t_disp_superi[OPC_BIPUSH] = &&FS_LBL_SUPERI_BIPUSH;
+                t_disp_superi[OPC_IAND]   = &&FS_LBL_SUPERI_IAND;
+                t_disp_superi[OPC_IADD]   = &&FS_LBL_SUPERI_IADD;
+                t_disp_superi[OPC_IMUL]   = &&FS_LBL_SUPERI_IMUL;
+                t_disp_superi[OPC_ISHR]   = &&FS_LBL_SUPERI_ISHR;
+                t_disp_superi[OPC_ILOAD_0] = t_disp_superi[OPC_ILOAD_1] =
+                t_disp_superi[OPC_ILOAD_2] = t_disp_superi[OPC_ILOAD_3] =
+                t_disp_superi[OPC_FLOAD_0] = t_disp_superi[OPC_FLOAD_1] =
+                t_disp_superi[OPC_FLOAD_2] = t_disp_superi[OPC_FLOAD_3] =
+                t_disp_superi[OPC_ALOAD_0] = t_disp_superi[OPC_ALOAD_1] =
+                t_disp_superi[OPC_ALOAD_2] = t_disp_superi[OPC_ALOAD_3] =
+                    &&FS_LBL_SUPERI_LOAD_N;
+                t_disp_superi[OPC_ISTORE_0] = t_disp_superi[OPC_ISTORE_1] =
+                t_disp_superi[OPC_ISTORE_2] = t_disp_superi[OPC_ISTORE_3] =
+                t_disp_superi[OPC_FSTORE_0] = t_disp_superi[OPC_FSTORE_1] =
+                t_disp_superi[OPC_FSTORE_2] = t_disp_superi[OPC_FSTORE_3] =
+                t_disp_superi[OPC_ASTORE_0] = t_disp_superi[OPC_ASTORE_1] =
+                t_disp_superi[OPC_ASTORE_2] = t_disp_superi[OPC_ASTORE_3] =
+                    &&FS_LBL_SUPERI_STORE_N;
+                t_disp_superi_ready = 1;
+            }
+            disp = t_disp_superi;
+        } else {
+            disp = t_disp_fast;
+        }
+    } else {
+        disp = t_disp_cold;
+    }
+    uint8_t op = 0;   /* fetched by NOJME_NEXT / the cold re-entry paths */
+
+    /* first dispatch: the macro IS the loop head */
+    NOJME_NEXT();
+    /* control never falls past NOJME_NEXT() — below this line are only
+     * labels and their bodies. T_SLOW: the 64-instruction cadence body
+     * (verbatim v36.103 block), entered when the tail's countdown trips
+     * BEFORE the pending instruction is counted/fetched — same ordering
+     * as the old loop head. */
+T_SLOW:
+    slow_check_countdown = SLOW_CHECK_INTERVAL;
+#else
     while (f_pc < code_len && jvm->running) {
         if (__builtin_expect(--slow_check_countdown == 0, 0)) {
             slow_check_countdown = SLOW_CHECK_INTERVAL;
+#endif
             jvm->instr_count = icount;
             frame->pc = f_pc;
             frame->stack_top = (int16_t)st;
@@ -1421,7 +2187,34 @@ continue_execution:
              * Одна TLS-читка + запись на 64 инструкции — холодный путь. */
             {
                 JavaThread* self_bump = thread_current(jvm);
-                if (self_bump) self_bump->spin_instr += SLOW_CHECK_INTERVAL;
+                if (self_bump) {
+                    self_bump->spin_instr += SLOW_CHECK_INTERVAL;
+                    /* v36.94 [STALL-RING]: оп/pc каждые 64 инструкции —
+                     * печатается удалённым дампом [STALLSTACK-REMOTE]. */
+                    uint8_t ridx = (uint8_t)((self_bump->stall_ring_idx + 1) & 15);
+                    self_bump->stall_ring_idx = ridx;
+                    /* op ещё не прочитан на этой итерации — берём байт кода
+                     * напрямую: это СЛЕДУЮЩАЯ инструкция к исполнению. */
+                    self_bump->stall_ring_op[ridx] = code[f_pc];
+                    self_bump->stall_ring_pc[ridx] = f_pc;
+                    /* v36.104 [VM-OPS]: та же систематическая 1/64 выборка
+                     * позиций — гистограмма микса опкодов для [VM-OPS].
+                     * v36.106 [PERF-GATE]: только в диагностических сборках
+                     * (NOJME_PERF=1) — выборка стоит инкремент на 64 команды. */
+#if NOJME_PERF_DEBUG
+                    self_bump->ops_hist[code[f_pc]]++;
+#endif
+#if NOJME_THREADED_DISPATCH && NOJME_PERF_DEBUG
+                    /* v36.105 [VM-PAIRS]: в threaded-сборке регистр op в этой
+                     * точке — ЗАВЕРШЁННАЯ команда (хвост NOJME_NEXT читает
+                     * следующую только ПОСЛЕ каденса), а code[f_pc] — следующая:
+                     * динамическая пара без лишней работы. В classic-сборке
+                     * op здесь затёрт внутренней переменной цикла — выборку
+                     * не делаем (диагностика поля = всегда threaded).
+                     * v36.106 [PERF-GATE]: тем же рубильником, что [VM-OPS]. */
+                    g_vm_pairs_hist[op][code[f_pc]]++;
+#endif
+                }
             }
             if (g_gc_safepoint_request) {
                 jvm_gc_safepoint_park();
@@ -1582,6 +2375,8 @@ continue_execution:
                                     nanosleep(&req, NULL);
 #endif
                                     vpace_ms += 2;
+                                    /* v36.97 [VM-PERF]: темп-сон раннера в бюджет. */
+                                    __sync_fetch_and_add(&g_perf_budget_ms_acc, 2u);
                                 }
                                 g_vmpace_sleep_ms += (uint32_t)vpace_ms;
                                 {
@@ -1698,6 +2493,35 @@ continue_execution:
              * стеку ищутся штатно.
              *
              * Порог NOJME_SPIN_BREAK_MS (по умолчанию 1500, 0 = выкл). */
+            /* v36.99 [SBC-CADENCE]:    spin-break проверка теперь не на
+             * КАЖДОМ slow-check (64 команды), а раз в NOJME_SPIN_BREAK_EVERY
+             * slow-check'ов (дефолт 16 = 1024 команды). ПОЛЕВОЙ КОРЕНЬ
+             * (Zombie Infection, лог v36.98-loadfix1 2026-10-08): тяжёлый
+             * уровень держит paint ~100-200 мс при vi=8.4M/с (~51 такт
+             * A57 на команду) — а каждые 64 команды брейкер платил
+             * jvm_exec_now_ms() (clock_gettime) + jvm_threads_have_free_sibling
+             * (ЕЩЁ один clock_gettime + проход по реестру живых потоков с
+             * чтками last_native_ms) + проход по цепочке кадров (owns_mon)
+             * + midp_paint_window_active(). На 19.7M/с пиковой скорости это
+             * ~308 тысяч полных проверок в секунду — сотни мс чистого
+             * диагностического налога на каждый игровой кадр. Порог
+             * выстрела 1500 мс: задержка обнаружения +1024 команды
+             * (~52 мкс при 19.7M/с) статистически незаметна; выстрел
+             * по-прежнему гарантирован (чистый спин набирает порог при
+             * ЛЮБОМ каденсе опроса). Счётчик g_perf_sbcheck_acc (vsbc=
+             * в [VM-PERF]) даёт полевое доказательство снижения частоты.
+             * Рубильник: NOJME_SPIN_BREAK_EVERY=1 — семантика v36.98. */
+            {
+                static long s_sb_every = -2;
+                static _Thread_local uint32_t tl_sb_div = 1;
+                if (s_sb_every == -2) {
+                    const char* ce = getenv("NOJME_SPIN_BREAK_EVERY");
+                    long v = (ce && atol(ce) >= 1) ? atol(ce) : 16L;
+                    s_sb_every = v;
+                }
+                if (--tl_sb_div == 0) {
+                    tl_sb_div = (uint32_t)s_sb_every;
+                    __sync_fetch_and_add(&g_perf_sbcheck_acc, 1u);
             {
                 static long s_spin_break_ms = -1;
                 if (s_spin_break_ms < 0) {
@@ -1724,6 +2548,62 @@ continue_execution:
                             extern int jvm_threads_have_free_sibling(int);
                             if (jvm_threads_have_free_sibling(self_sb->id))
                                 sb_threshold *= 8;
+                        }
+                        /* v36.91 [SPIN-BREAK-MON]: поток, ВЛАДЕЮЩИЙ
+                         * мониторами, не бьём по базовому порогу.
+                         * Исключение, брошенное в поток внутри его
+                         * synchronized-блока, диспетчеризуется штатным
+                         * поиском обработчиков этого же кадра; у игр с
+                         * catch-all ВНУТРИ блока (Metal Slug 6:
+                         * at.run [606,709)->704) unwind выходит боком к
+                         * протоколу мониторов — либо утечка владельца
+                         * (фриз на 20 с до MON-STEAL), либо двойной
+                         * monitorexit в обработчике (IMS-петля и вечный
+                         * join при выходе). Легитимные спины под
+                         * монитором (GD-физика) конвергентны и
+                         * разрешаются сами — им даём x8 окна (12 с),
+                         * вечный спин всё равно будет прерван. */
+                        {
+                            int owns_mon = 0;
+                            for (JavaFrame* mf = self_sb->current_frame;
+                                 mf && !owns_mon; mf = mf->prev) {
+                                if (mf->mon_owned_n > 0) owns_mon = 1;
+                            }
+                            if (owns_mon) sb_threshold *= 8;
+                        }
+                        /* v36.98 [SPIN-BREAK-PAINT]: чисто-Java окно ГЛАВНОГО
+                         * потока ВНУТРИ paint() — порог x8 (12 с при дефолтных
+                         * 1.5 с). Это второй пояс защиты легитимных
+                         * межпоточных ожиданий в paint (идиома Gameloft-
+                         * загрузки: paint крутит `while (!groupDone)
+                         * tick();`, время тикает ВТОРОЙ поток — см.
+                         * [ZFENCE-PAINT] v36.83 и [SPIN-BREAK-SIBLING]).
+                         * ПЕРВЫЙ пояс — sibling-правило — зависит от
+                         * свежести штампа соседа и уже трижды в поле
+                         * проваливался по независящим причинам (v36.62
+                         * меню паузы, v36.87 сон консоли, v36.97 штамп
+                         * NATIVE-NOTE-LITE — все три ложных выстрела
+                         * пришлись ИМЕННО в main+paint, все три убили
+                         * загрузку/возобновление игры). Легитимных
+                         * выстрелов в main+paint в полевой истории НЕТ:
+                         * настоящие спины-кандидаты (ГД-физика v36.57,
+                         * Metal Slug at.run v36.91) всегда живут на
+                         * VM-раннерах и этим гардом не затрагиваются —
+                         * их порог не меняется. Вечный спин в main+paint
+                         * всё равно будет прерван — окном 12 с.
+                         * Рубильник NOJME_SPIN_BREAK_PAINT=0. */
+                        {
+                            static int s_sbp_on = -1;
+                            if (s_sbp_on < 0) {
+                                const char* e = getenv("NOJME_SPIN_BREAK_PAINT");
+                                s_sbp_on = (e && e[0] == '0') ? 0 : 1;
+                            }
+                            if (s_sbp_on &&
+                                self_sb == jvm->main_thread) {
+                                extern int midp_paint_window_active(void);
+                                if (midp_paint_window_active())
+                                    sb_threshold *= 8;
+                            }
                         }
                         if (sb_age > sb_threshold) {
                             /* v36.88 [SPIN-BREAK-ICOUNT]: гейт «работа
@@ -1776,7 +2656,7 @@ continue_execution:
                                  * трогаем (реальный пост-пробужденческий
                                  * спин наберёт порог и выстрелит). */
                                 static uint64_t s_gate_reports = 0;
-                                if ((s_gate_reports++ & 1023ULL) == 0) {
+                                if ((s_gate_reports++ & 255ULL) == 0) {
                                     LOG_SAFE("[SPIN-GATE] tid=%d wall-age %lld ms but only %llu instrs of work since last native — suspend/freeze debt, shot suppressed (NOJME_SPIN_BREAK_INSTR=%ld)\n",
                                              self_sb->id, (long long)sb_age,
                                              (unsigned long long)self_sb->spin_instr,
@@ -1815,13 +2695,60 @@ continue_execution:
                     }
                 }
             }
+            } /* v36.99 [SBC-CADENCE]: закрытие cadence-гейта */
+            }
             f_pc = frame->pc;
             st = frame->stack_top;
             /* v34.35 FIX: re-seed the cached counter — the block above may run
              * NESTED Java (key delivery) which advances jvm->instr_count. */
             icount = jvm->instr_count;
+#if NOJME_THREADED_DISPATCH
+            /* Deferred spin-breaker shot: in the v36.103 loop this flag was
+             * polled EVERY instruction, but it is armed ONLY by the cadence
+             * body above and consumed immediately after it — checking it
+             * here is semantically identical, minus one predicted branch
+             * per instruction. */
+            if (__builtin_expect(tls_sb_inject, 0)) {
+                tls_sb_inject = 0;
+                frame->pc = f_pc + 1;
+                frame->stack_top = (int16_t)st;
+                frame->throwing_pc = (int)f_pc;
+                jvm->instr_count = icount;
+                goto exception_search;
+            }
+            /* F12 tracer engage: <=64 instructions of latency; once tripped,
+             * the cold path holds EVERY opcode cold while the flag is up
+             * (see the cold_dispatch tail below). */
+            if (__builtin_expect(g_j2me_runtime_debug, 0)) {
+                op = code[f_pc];
+                goto cold_dispatch;
+            }
+            /* (fall-through: the cadence body above re-seeded the register
+             * file; count and dispatch the pending instruction) */
+            icount++;
+            if (__builtin_expect(prof_real_local && (icount & 0x3FFFULL) == 0, 0)) goto T_PROF;
+            goto T_TAIL;
+T_PROF:
+            jvm->instr_count = icount;
+            frame->pc = f_pc;
+            frame->stack_top = (int16_t)st;
+            prof_sample_real(frame, icount);
+            goto T_TAIL;
+T_TAIL:
+            if (__builtin_expect(limit > 0 && icount > limit, 0)) goto T_LIMIT;
+            op = code[f_pc];
+            if (__builtin_expect(--sched_countdown == 0, 0)) goto T_YIELD;
+            goto *disp[op];
+T_LIMIT:
+            jvm->instr_count = icount;
+            LOG_SAFE("[JVM] Instruction limit reached (%llu instructions). Stopping.\n",
+                    (unsigned long long)icount);
+            jvm->running = false;
+            return -1;
+T_YIELD:
+            sched_countdown = YIELD_INTERVAL;
+#else
         }
-
         if (__builtin_expect(tls_sb_inject, 0)) {
             /* v36.57 [SPIN-BREAK]: исключение брейкера диспетчеризуется как
              * обычное athrow-подобное — с поиском catch-обработчиков в ЭТОМ
@@ -1835,7 +2762,6 @@ continue_execution:
             jvm->instr_count = icount;
             goto exception_search;
         }
-
         icount++;
 
         if (__builtin_expect(prof_real_local && (icount & 0x3FFFULL) == 0, 0)) {
@@ -1853,7 +2779,6 @@ continue_execution:
         }
 
         uint8_t op = code[f_pc];
-
 #ifdef NOJME_STKDIAG
         /* v36.04 STKDIAG: catch operand-stack drift BEFORE an OOB write.
          * The frame allocation is padded (+24 slots) so the drift itself no
@@ -1896,9 +2821,9 @@ continue_execution:
             dg_i_local = (dg_i_local + 1) % 2048;
         }
 #endif
-
         if (__builtin_expect(--sched_countdown == 0, 0)) {
             sched_countdown = YIELD_INTERVAL;
+#endif
             g_instruction_counter += YIELD_INTERVAL;
             jvm->instr_count = icount;
             frame->pc = f_pc;
@@ -1913,6 +2838,41 @@ continue_execution:
                     jvm_thread_note_site(thread, frame);
                 }
             }
+            /* v36.92 [LONGFRAME-DIAG]: поток САМ печатает свою цепочку Java
+             * кадров (обход собственных кадров безопасен в отличие от beat-
+             * обхода), если не диспетчеризовал ни одного натива дольше
+             * NOJME_LONGFRAME_DUMP_MS (0 = выкл, дефолт). Диагностика «длинных
+             * кадров» — полевой кейс Metal Slug 6: один вызов at.bl держит
+             * монитор 12.5 c (поле v36.91), keyPressed блочится, пользователь
+             * видит фриз. Печатаем ОДИН дамп на эпизод (+ повтор каждые 5 c),
+             * чтобы полевой лог назвал ТОЧНЫЙ путь вычисления. */
+            {
+                static long s_lf_ms = -2;
+                if (s_lf_ms == -2) {
+                    const char* e = getenv("NOJME_LONGFRAME_DUMP_MS");
+                    s_lf_ms = (e && atol(e) > 0) ? atol(e) : 0;
+                }
+                if (s_lf_ms > 0 && thread && thread->last_native_ms) {
+                    static _Thread_local int64_t s_lf_next = 0;
+                    int64_t lf_now = jvm_exec_now_ms();
+                    int64_t lf_age = lf_now - (int64_t)thread->last_native_ms;
+                    if (lf_age > s_lf_ms && lf_now >= s_lf_next) {
+                        int d = 0;
+                        s_lf_next = lf_now + 5000;
+                        LOG_SAFE("[LONGFRAME] tid=%d no native for %lld ms, site %s — frame chain:\n",
+                                 thread->id, (long long)lf_age,
+                                 thread->jsite[0] ? thread->jsite : "(?)");
+                        for (JavaFrame* lf = frame; lf && d < 14; lf = lf->prev, d++) {
+                            LOG_SAFE("[LONGFRAME]   %d. %s.%s@%u (mon_owned=%d)\n",
+                                     d,
+                                     lf->clazz && lf->clazz->class_name ? lf->clazz->class_name : "?",
+                                     lf->method && lf->method->name ? lf->method->name : "?",
+                                     (unsigned)lf->pc,
+                                     (int)lf->mon_owned_n);
+                        }
+                    }
+                }
+            }
             {
                 extern void midp_media_poll_events(JVM* jvm, JavaThread* thread);
                 midp_media_poll_events(jvm, thread);
@@ -1923,65 +2883,164 @@ continue_execution:
             /* v34.35 FIX: re-seed — thread_yield may run other threads, and
              * media polling above may run nested Java. */
             icount = jvm->instr_count;
+#if NOJME_THREADED_DISPATCH
+            /* op was fetched before the yield countdown tripped — the
+             * body above may have re-seeded f_pc/st/icount (nested Java
+             * in media polling), and the v36.103 switch dispatched the
+             * pre-yield opcode exactly like this. */
+            goto *disp[op];
+#else
         }
 
         /* Opcode tracing / debug semantics: force the cold handler path. */
         if (__builtin_expect(g_j2me_runtime_debug, 0)) goto cold_dispatch;
-
-
+#endif
 #if !J2ME_DEBUG
+#if NOJME_THREADED_DISPATCH
+        /* (threaded) handlers: plain labels; every body ends with
+         * its own NOJME_NEXT() dispatch tail */
+#else
         switch (op) {
+#endif
         /* ---------------- constants ---------------- */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_NOP)
+#else
         case OPC_NOP:
+#endif
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_ACONST_NULL)
+#else
         case OPC_ACONST_NULL:
+#endif
             stack[++st].raw = 0;   /* full 8-byte null ref (high half matters) */
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_ICONST_M1) FS_CASE(OPC_ICONST_0) FS_CASE(OPC_ICONST_1)
+#else
         case OPC_ICONST_M1: case OPC_ICONST_0: case OPC_ICONST_1:
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_ICONST_2) FS_CASE(OPC_ICONST_3) FS_CASE(OPC_ICONST_4)
+#else
         case OPC_ICONST_2: case OPC_ICONST_3: case OPC_ICONST_4:
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_ICONST_5)
+#else
         case OPC_ICONST_5:
+#endif
             stack[++st].raw = (uint64_t)(uint32_t)((jint)op - (jint)OPC_ICONST_0);
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
 
         /* ---------------- local loads ---------------- */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_ILOAD) FS_CASE(OPC_FLOAD) FS_CASE(OPC_ALOAD)
+#else
         case OPC_ILOAD: case OPC_FLOAD: case OPC_ALOAD:
+#endif
             stack[++st] = locals[code[f_pc + 1]];
             f_pc += 2;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         /* Load groups (iload_n/lload_n/fload_n/dload_n/aload_n) all start at
          * an opcode ≡ 2 (mod 4), so (op + 2) & 3 yields the local index 0-3.
          * (Plain `op & 3` would be WRONG: e.g. ALOAD_0 = 0x2A -> 2.) */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_ILOAD_0) FS_CASE(OPC_ILOAD_1) FS_CASE(OPC_ILOAD_2) FS_CASE(OPC_ILOAD_3)
+#else
         case OPC_ILOAD_0: case OPC_ILOAD_1: case OPC_ILOAD_2: case OPC_ILOAD_3:
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_FLOAD_0) FS_CASE(OPC_FLOAD_1) FS_CASE(OPC_FLOAD_2) FS_CASE(OPC_FLOAD_3)
+#else
         case OPC_FLOAD_0: case OPC_FLOAD_1: case OPC_FLOAD_2: case OPC_FLOAD_3:
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_ALOAD_0) FS_CASE(OPC_ALOAD_1) FS_CASE(OPC_ALOAD_2) FS_CASE(OPC_ALOAD_3)
+#else
         case OPC_ALOAD_0: case OPC_ALOAD_1: case OPC_ALOAD_2: case OPC_ALOAD_3:
+#endif
             stack[++st] = locals[(op + 2) & 3];
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
 
         /* ---------------- local stores ---------------- */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_ISTORE) FS_CASE(OPC_FSTORE) FS_CASE(OPC_ASTORE)
+#else
         case OPC_ISTORE: case OPC_FSTORE: case OPC_ASTORE:
+#endif
             locals[code[f_pc + 1]] = stack[st--];
             f_pc += 2;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         /* Store groups (istore_n/.../astore_n) start at an opcode ≡ 3 (mod 4):
          * (op + 1) & 3 yields the local index 0-3. */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_ISTORE_0) FS_CASE(OPC_ISTORE_1) FS_CASE(OPC_ISTORE_2) FS_CASE(OPC_ISTORE_3)
+#else
         case OPC_ISTORE_0: case OPC_ISTORE_1: case OPC_ISTORE_2: case OPC_ISTORE_3:
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_FSTORE_0) FS_CASE(OPC_FSTORE_1) FS_CASE(OPC_FSTORE_2) FS_CASE(OPC_FSTORE_3)
+#else
         case OPC_FSTORE_0: case OPC_FSTORE_1: case OPC_FSTORE_2: case OPC_FSTORE_3:
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_ASTORE_0) FS_CASE(OPC_ASTORE_1) FS_CASE(OPC_ASTORE_2) FS_CASE(OPC_ASTORE_3)
+#else
         case OPC_ASTORE_0: case OPC_ASTORE_1: case OPC_ASTORE_2: case OPC_ASTORE_3:
+#endif
             locals[(op + 1) & 3] = stack[st--];
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
 
         /* ---------------- iinc ---------------- */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IINC) {
+#else
         case OPC_IINC: {
+#endif
             uint8_t idx = code[f_pc + 1];
             int8_t c = (int8_t)code[f_pc + 2];
             locals[idx].i += c;
             f_pc += 3;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
 
         /* ============ v36.37 PERF: extended inline set ============
@@ -1996,99 +3055,207 @@ continue_execution:
          * miss (null receiver, bad CP tag, locals out of range) deopts to
          * the SAME handler with the state un-consumed, so exceptions and
          * DRM bypass behave identically. */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_SIPUSH)
+#else
         case OPC_SIPUSH:
+#endif
             stack[++st].i = (jint)(int16_t)(uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);
             f_pc += 3;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
 
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_BIPUSH)
+#else
         case OPC_BIPUSH:
+#endif
             stack[++st].i = (jint)(int8_t)code[f_pc + 1];
             f_pc += 2;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
 
         /* v36.37 wave 2: gprof (A3D in-game 200 s) — op_bipush 67M,
          * op_mul(DMUL) 17.9M, dconst 5.5M cold calls. FADD/FSUB/FMUL/FDIV
          * were ALREADY inline in v36.36. Same contract: bit-matched, miss
          * -> deopt. */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_FCONST_0) FS_CASE(OPC_FCONST_1) FS_CASE(OPC_FCONST_2)
+#else
         case OPC_FCONST_0: case OPC_FCONST_1: case OPC_FCONST_2:
+#endif
             stack[++st].raw = 0;
             stack[st].f = (jfloat)(op - OPC_FCONST_0);
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LCONST_0) FS_CASE(OPC_LCONST_1)
+#else
         case OPC_LCONST_0: case OPC_LCONST_1:
+#endif
             stack[++st].raw = 0;
             stack[st].j = (jlong)(op - OPC_LCONST_0);
             stack[st + 1] = stack[st];
             st++;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_DCONST_0) FS_CASE(OPC_DCONST_1)
+#else
         case OPC_DCONST_0: case OPC_DCONST_1:
+#endif
             stack[++st].raw = 0;
             stack[st].d = (jdouble)(op - OPC_DCONST_0);
             stack[st + 1] = stack[st];
             st++;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
 
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_FNEG)
+#else
         case OPC_FNEG:
+#endif
             stack[st].f = -stack[st].f;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         /* v36.38-BT2: d-арифметика читала/писала ТОЛЬКО верхние слоты
          * (stack[st-2], stack[st]) и оставляла нижний (канонический,
          * который читают dcmpl/d2f/invoke-маршаллинг) устаревшим.
          * Приведено к low-канонической инварианте long-семейства. */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_DADD)
+#else
         case OPC_DADD:
+#endif
             stack[st - 3].d = stack[st - 3].d + stack[st - 1].d;
             stack[st - 2] = stack[st - 3];
             st -= 2;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_DSUB)
+#else
         case OPC_DSUB:
+#endif
             stack[st - 3].d = stack[st - 3].d - stack[st - 1].d;
             stack[st - 2] = stack[st - 3];
             st -= 2;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_DMUL)
+#else
         case OPC_DMUL:
+#endif
             stack[st - 3].d = stack[st - 3].d * stack[st - 1].d;
             stack[st - 2] = stack[st - 3];
             st -= 2;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_DDIV)
+#else
         case OPC_DDIV:
+#endif
             stack[st - 3].d = stack[st - 3].d / stack[st - 1].d;
             stack[st - 2] = stack[st - 3];
             st -= 2;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         /* v36.38-BT2: dneg писал только верхний слот — нижний (канонический)
          * оставался устаревшим. Теперь: низ = значение, верх = копия. */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_DNEG)
+#else
         case OPC_DNEG:
+#endif
             stack[st - 1].d = -stack[st - 1].d;
             stack[st] = stack[st - 1];
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_FCMPL) FS_CASE(OPC_FCMPG) {
+#else
         case OPC_FCMPL: case OPC_FCMPG: {
+#endif
             jfloat v2 = stack[st].f;
             jfloat v1 = stack[st - 1].f;
             st--;
             if (isnan(v1) || isnan(v2)) stack[st].i = (op == OPC_FCMPL) ? -1 : 1;
             else stack[st].i = (v1 > v2) ? 1 : (v1 < v2) ? -1 : 0;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_DCMPL) FS_CASE(OPC_DCMPG) {
+#else
         case OPC_DCMPL: case OPC_DCMPG: {
+#endif
             jdouble v2 = stack[st - 1].d;
             jdouble v1 = stack[st - 3].d;
             st -= 3;
             if (isnan(v1) || isnan(v2)) stack[st].i = (op == OPC_DCMPL) ? -1 : 1;
             else stack[st].i = (v1 > v2) ? 1 : (v1 < v2) ? -1 : 0;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
 
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LDC_W) {
+#else
         case OPC_LDC_W: {
+#endif
             /* Integer/Float are pure CP reads; anything else (String/Class)
              * stays on the cold path (interning / class loading). */
             uint16_t ci = (uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);
@@ -2100,19 +3267,31 @@ continue_execution:
                     stack[++st].raw = 0;
                     stack[st].i = e->info.integer.value;
                     f_pc += 3;
+#if NOJME_THREADED_DISPATCH
+                    FS_END();
+#else
                     break;
+#endif
                 }
                 if (e->tag == CONSTANT_Float) {
                     stack[++st].raw = 0;
                     stack[st].f = e->info.float_val.value;
                     f_pc += 3;
+#if NOJME_THREADED_DISPATCH
+                    FS_END();
+#else
                     break;
+#endif
                 }
             }
             goto cold_dispatch;
         }
 
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LDC2_W) {
+#else
         case OPC_LDC2_W: {
+#endif
             uint16_t ci = (uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);
             JavaClass* dc = frame->clazz;
             if (__builtin_expect(dc && dc->constant_pool && ci > 0 &&
@@ -2124,7 +3303,11 @@ continue_execution:
                     stack[st + 1] = stack[st];  /* high slot = copy */
                     st++;
                     f_pc += 3;
+#if NOJME_THREADED_DISPATCH
+                    FS_END();
+#else
                     break;
+#endif
                 }
                 if (e->tag == CONSTANT_Double) {
                     stack[++st].raw = 0;
@@ -2132,13 +3315,21 @@ continue_execution:
                     stack[st + 1] = stack[st];
                     st++;
                     f_pc += 3;
+#if NOJME_THREADED_DISPATCH
+                    FS_END();
+#else
                     break;
+#endif
                 }
             }
             goto cold_dispatch;
         }
 
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_GETSTATIC) {
+#else
         case OPC_GETSTATIC: {
+#endif
             uint16_t fi = (uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);
             StaticFieldRefCache* sc = static_field_cache_entry(frame, fi);
             if (__builtin_expect(sc && sc->valid && sc->gen == g_vm_cache_gen &&
@@ -2150,12 +3341,20 @@ continue_execution:
                     stack[++st] = v;
                 }
                 f_pc += 3;
+#if NOJME_THREADED_DISPATCH
+                FS_END();
+#else
                 break;
+#endif
             }
             goto cold_dispatch;
         }
 
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_PUTSTATIC) {
+#else
         case OPC_PUTSTATIC: {
+#endif
             uint16_t fi = (uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);
             StaticFieldRefCache* sc = static_field_cache_entry(frame, fi);
             if (__builtin_expect(sc && sc->valid && sc->gen == g_vm_cache_gen &&
@@ -2165,12 +3364,20 @@ continue_execution:
                 sc->owner->static_fields[sc->slot].value = stack[st];
                 st--;
                 f_pc += 3;
+#if NOJME_THREADED_DISPATCH
+                FS_END();
+#else
                 break;
+#endif
             }
             goto cold_dispatch;
         }
 
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_GETFIELD) {
+#else
         case OPC_GETFIELD: {
+#endif
             uint16_t fi = (uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);
             FieldRefCache* fc = field_cache_entry(frame, fi);
             if (__builtin_expect(fc && fc->valid && fc->gen == g_vm_cache_gen, 1)) {
@@ -2185,14 +3392,22 @@ continue_execution:
                             stack[++st] = v;
                         }
                         f_pc += 3;
+#if NOJME_THREADED_DISPATCH
+                        FS_END();
+#else
                         break;
+#endif
                     }
                 }
             }
             goto cold_dispatch;  /* null receiver: handler throws exactly */
         }
 
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_PUTFIELD) {
+#else
         case OPC_PUTFIELD: {
+#endif
             uint16_t fi = (uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);
             FieldRefCache* fc = field_cache_entry(frame, fi);
             if (__builtin_expect(fc && fc->valid && fc->gen == g_vm_cache_gen, 1)) {
@@ -2206,7 +3421,11 @@ continue_execution:
                         st -= voff + 1;  /* value (+ high slot) + receiver */
                         obj->fields[fc->slot] = v;
                         f_pc += 3;
+#if NOJME_THREADED_DISPATCH
+                        FS_END();
+#else
                         break;
+#endif
                     }
                 }
             }
@@ -2214,43 +3433,103 @@ continue_execution:
         }
 
         /* ---------------- conversions (op_convert twins) ---------------- */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_I2L)
+#else
         case OPC_I2L:
+#endif
             stack[st].j = (jlong)stack[st].i;
             stack[st + 1] = stack[st];
             st++;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_L2I)
+#else
         case OPC_L2I:
+#endif
             st--;
             stack[st].i = (jint)stack[st].j;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_I2B)
+#else
         case OPC_I2B:
+#endif
             stack[st].i = (jint)(int8_t)stack[st].i;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_I2C)
+#else
         case OPC_I2C:
+#endif
             stack[st].i = (jint)(uint16_t)stack[st].i;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_I2S)
+#else
         case OPC_I2S:
+#endif
             stack[st].i = (jint)(int16_t)stack[st].i;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_I2F)
+#else
         case OPC_I2F:
+#endif
             stack[st].f = (jfloat)stack[st].i;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_F2I) {
+#else
         case OPC_F2I: {
+#endif
             jfloat f_ = stack[st].f;
             /* JVMS saturating (J-2): NaN -> 0, clamp to int range */
             stack[st].i = isnan(f_) ? 0 :
                           (f_ >= 2147483647.0f) ? INT32_MAX :
                           (f_ <= -2147483648.0f) ? INT32_MIN : (jint)f_;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_F2L) {
+#else
         case OPC_F2L: {
+#endif
             jfloat f_ = stack[st].f;
             stack[st].j = isnan(f_) ? (jlong)0 :
                           (f_ >= 9223372036854775808.0f) ? INT64_MAX :
@@ -2258,13 +3537,25 @@ continue_execution:
             stack[st + 1] = stack[st];
             st++;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_L2F)
+#else
         case OPC_L2F:
+#endif
             st--;
             stack[st].f = (jfloat)stack[st].j;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         /* v36.38-BT2 CONV-SLOTS: long/double занимают 2 слота (low=value,
          * high=copy — см. холодный путь opcodes.c: "pop high (фиктивный),
          * потом low с реальным значением"). Быстрые варианты l2d/d2l/d2i
@@ -2283,48 +3574,96 @@ continue_execution:
          *      c.a PC=1526 каждый тик физики, шарик проваливался сквозь
          *      землю. Теперь: чтение с нижнего слота, запись в оба слота,
          *      счёт слотов как в спецификации JVM. */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_L2D)
+#else
         case OPC_L2D:
+#endif
             stack[st - 1].d = (jdouble)stack[st - 1].j;  /* long low -> double low */
             stack[st] = stack[st - 1];                   /* high = копия */
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_D2L) {
+#else
         case OPC_D2L: {
+#endif
             jdouble d_ = stack[st - 1].d;                /* double low (канонический) */
             stack[st - 1].j = isnan(d_) ? (jlong)0 :
                               (d_ >= 9223372036854775807.0) ? INT64_MAX :
                               (d_ <= -9223372036854775808.0) ? INT64_MIN : (jlong)d_;
             stack[st] = stack[st - 1];                   /* high = копия */
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_D2I) {
+#else
         case OPC_D2I: {
+#endif
             jdouble d_ = stack[st - 1].d;                /* double low (канонический) */
             st--;                                         /* 2 слота -> 1, как l2i */
             stack[st].i = isnan(d_) ? 0 :
                           (d_ >= 2147483647.0) ? INT32_MAX :
                           (d_ <= -2147483648.0) ? INT32_MIN : (jint)d_;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_D2F)
+#else
         case OPC_D2F:
+#endif
             st--;
             stack[st].f = (jfloat)stack[st].d;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_F2D)
+#else
         case OPC_F2D:
+#endif
             stack[st].d = (jdouble)stack[st].f;
             stack[st + 1] = stack[st];
             st++;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
 
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LCMP) {
+#else
         case OPC_LCMP: {
+#endif
             jlong v2 = stack[st - 1].j;
             jlong v1 = stack[st - 3].j;
             st -= 3;
             stack[st].i = (v1 > v2) ? 1 : (v1 < v2) ? -1 : 0;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
 
         /* ---------------- long arithmetic (op_add/op_sub twins) -------- */
@@ -2333,140 +3672,312 @@ continue_execution:
          * верхний слот держал устаревшее значение, и любые читатели
          * верхнего слота (старые l2d/d2i, dcmpl после dadd) получали
          * мусор. Инварианта: оба слота пары всегда валидны. */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LADD)
+#else
         case OPC_LADD:
+#endif
             stack[st - 3].j = stack[st - 3].j + stack[st - 1].j;
             stack[st - 2] = stack[st - 3];
             st -= 2;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LSUB)
+#else
         case OPC_LSUB:
+#endif
             stack[st - 3].j = stack[st - 3].j - stack[st - 1].j;
             stack[st - 2] = stack[st - 3];
             st -= 2;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LMUL)
+#else
         case OPC_LMUL:
+#endif
             stack[st - 3].j = stack[st - 3].j * stack[st - 1].j;
             stack[st - 2] = stack[st - 3];
             st -= 2;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LAND)
+#else
         case OPC_LAND:
+#endif
             stack[st - 3].j = stack[st - 3].j & stack[st - 1].j;
             stack[st - 2] = stack[st - 3];
             st -= 2;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LOR)
+#else
         case OPC_LOR:
+#endif
             stack[st - 3].j = stack[st - 3].j | stack[st - 1].j;
             stack[st - 2] = stack[st - 3];
             st -= 2;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LXOR)
+#else
         case OPC_LXOR:
+#endif
             stack[st - 3].j = stack[st - 3].j ^ stack[st - 1].j;
             stack[st - 2] = stack[st - 3];
             st -= 2;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LSHL)
+#else
         case OPC_LSHL:
+#endif
             stack[st - 2].j = stack[st - 2].j << (stack[st].i & 63);
             stack[st - 1] = stack[st - 2];
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LSHR)
+#else
         case OPC_LSHR:
+#endif
             stack[st - 2].j = stack[st - 2].j >> (stack[st].i & 63);
             stack[st - 1] = stack[st - 2];
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LUSHR)
+#else
         case OPC_LUSHR:
+#endif
             stack[st - 2].j = (jlong)((uint64_t)stack[st - 2].j >> (stack[st].i & 63));
             stack[st - 1] = stack[st - 2];
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
 
         /* ---------------- long locals (lload/lstore groups) ------------ */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LLOAD) FS_CASE(OPC_DLOAD) {
+#else
         case OPC_LLOAD: case OPC_DLOAD: {
+#endif
             uint8_t li = code[f_pc + 1];
             if (__builtin_expect((uint32_t)(li + 1) >= (uint32_t)frame->max_locals, 0))
                 goto cold_dispatch;
             stack[++st] = locals[li];
             stack[++st] = locals[li + 1];
             f_pc += 2;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LLOAD_0) FS_CASE(OPC_LLOAD_1) FS_CASE(OPC_LLOAD_2) FS_CASE(OPC_LLOAD_3)
+#else
         case OPC_LLOAD_0: case OPC_LLOAD_1: case OPC_LLOAD_2: case OPC_LLOAD_3:
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_DLOAD_0) FS_CASE(OPC_DLOAD_1) FS_CASE(OPC_DLOAD_2) FS_CASE(OPC_DLOAD_3) {
+#else
         case OPC_DLOAD_0: case OPC_DLOAD_1: case OPC_DLOAD_2: case OPC_DLOAD_3: {
+#endif
             uint8_t li = (uint8_t)((op - OPC_LLOAD_0) & 3);
             if (__builtin_expect((uint32_t)(li + 1) >= (uint32_t)frame->max_locals, 0))
                 goto cold_dispatch;
             stack[++st] = locals[li];
             stack[++st] = locals[li + 1];
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LSTORE) FS_CASE(OPC_DSTORE) {
+#else
         case OPC_LSTORE: case OPC_DSTORE: {
+#endif
             uint8_t li = code[f_pc + 1];
             if (__builtin_expect((uint32_t)(li + 1) >= (uint32_t)frame->max_locals, 0))
                 goto cold_dispatch;
             locals[li + 1] = stack[st--];
             locals[li] = stack[st--];
             f_pc += 2;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LSTORE_0) FS_CASE(OPC_LSTORE_1) FS_CASE(OPC_LSTORE_2) FS_CASE(OPC_LSTORE_3)
+#else
         case OPC_LSTORE_0: case OPC_LSTORE_1: case OPC_LSTORE_2: case OPC_LSTORE_3:
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_DSTORE_0) FS_CASE(OPC_DSTORE_1) FS_CASE(OPC_DSTORE_2) FS_CASE(OPC_DSTORE_3) {
+#else
         case OPC_DSTORE_0: case OPC_DSTORE_1: case OPC_DSTORE_2: case OPC_DSTORE_3: {
+#endif
             uint8_t li = (uint8_t)((op - OPC_LSTORE_0) & 3);
             if (__builtin_expect((uint32_t)(li + 1) >= (uint32_t)frame->max_locals, 0))
                 goto cold_dispatch;
             locals[li + 1] = stack[st--];
             locals[li] = stack[st--];
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
         /* ============ end v36.37 extended inline set ============ */
 
         /* ---------------- operand stack ---------------- */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_POP)
+#else
         case OPC_POP:
+#endif
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_POP2)
+#else
         case OPC_POP2:
+#endif
             st -= 2;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_DUP)
+#else
         case OPC_DUP:
+#endif
             stack[st + 1] = stack[st];
             st++;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_DUP2)  /* [a,b] -> [a,b,a,b] */
+#else
         case OPC_DUP2:  /* [a,b] -> [a,b,a,b] */
+#endif
             stack[st + 1] = stack[st - 1];
             stack[st + 2] = stack[st];
             st += 2;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
 
         /* ---------------- int arithmetic ---------------- */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IADD)
+#else
         case OPC_IADD:
+#endif
             stack[st - 1].i = stack[st - 1].i + stack[st].i;
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_ISUB)
+#else
         case OPC_ISUB:
+#endif
             stack[st - 1].i = stack[st - 1].i - stack[st].i;
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IMUL)
+#else
         case OPC_IMUL:
+#endif
             stack[st - 1].i = stack[st - 1].i * stack[st].i;
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IDIV) {
+#else
         case OPC_IDIV: {
+#endif
             jint v2 = stack[st].i;
             jint v1 = stack[st - 1].i;
             if (__builtin_expect(v2 == 0, 0)) goto cold_dispatch;  /* handler throws */
@@ -2474,9 +3985,17 @@ continue_execution:
             else stack[st - 1].i = v1 / v2;
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IREM) {
+#else
         case OPC_IREM: {
+#endif
             jint v2 = stack[st].i;
             jint v1 = stack[st - 1].i;
             if (__builtin_expect(v2 == 0, 0)) goto cold_dispatch;  /* handler throws */
@@ -2484,23 +4003,55 @@ continue_execution:
             else stack[st - 1].i = v1 % v2;
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_INEG)
+#else
         case OPC_INEG:
+#endif
             stack[st].i = -stack[st].i;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_ISHL)
+#else
         case OPC_ISHL:
+#endif
             stack[st - 1].i = stack[st - 1].i << (stack[st].i & 0x1F);
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_ISHR)
+#else
         case OPC_ISHR:
+#endif
             stack[st - 1].i = stack[st - 1].i >> (stack[st].i & 0x1F);
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IUSHR)
+#else
         case OPC_IUSHR:
+#endif
             /* v34.77 FIX (Spore /-13.bin): C-приоритет! Старая запись
              * (jint)((juint)x) >> y кастовала x обратно в ЗНАКОВЫЙ jint
              * ещё ДО сдвига — сдвиг выходил арифметическим (sarl):
@@ -2510,48 +4061,116 @@ continue_execution:
             stack[st - 1].i = (jint)(((juint)stack[st - 1].i) >> (stack[st].i & 0x1F));
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IAND)
+#else
         case OPC_IAND:
+#endif
             stack[st - 1].i = stack[st - 1].i & stack[st].i;
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IOR)
+#else
         case OPC_IOR:
+#endif
             stack[st - 1].i = stack[st - 1].i | stack[st].i;
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IXOR)
+#else
         case OPC_IXOR:
+#endif
             stack[st - 1].i = stack[st - 1].i ^ stack[st].i;
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
 
         /* ---------------- float arithmetic ---------------- */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_FADD)
+#else
         case OPC_FADD:
+#endif
             stack[st - 1].f = stack[st - 1].f + stack[st].f;
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_FSUB)
+#else
         case OPC_FSUB:
+#endif
             stack[st - 1].f = stack[st - 1].f - stack[st].f;
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_FMUL)
+#else
         case OPC_FMUL:
+#endif
             stack[st - 1].f = stack[st - 1].f * stack[st].f;
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_FDIV)
+#else
         case OPC_FDIV:
+#endif
             stack[st - 1].f = stack[st - 1].f / stack[st].f;
             st--;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
 
         /* ---------------- branches (target = pc_of_opcode + s16 offset) --- */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IFEQ) FS_CASE(OPC_IFNE) FS_CASE(OPC_IFLT)
+#else
         case OPC_IFEQ: case OPC_IFNE: case OPC_IFLT:
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IFGE) FS_CASE(OPC_IFGT) FS_CASE(OPC_IFLE) {
+#else
         case OPC_IFGE: case OPC_IFGT: case OPC_IFLE: {
+#endif
             jint v = stack[st--].i;
             int16_t off = (int16_t)(uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);  /* JVMS: big-endian s16 */
             bool branch;
@@ -2565,18 +4184,38 @@ continue_execution:
             }
             if (branch) f_pc += (uint32_t)(int32_t)off;
             else f_pc += 3;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IFNULL) FS_CASE(OPC_IFNONNULL) {
+#else
         case OPC_IFNULL: case OPC_IFNONNULL: {
+#endif
             void* r = stack[st--].ref;
             int16_t off = (int16_t)(uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);  /* JVMS: big-endian s16 */
             bool branch = (op == OPC_IFNULL) ? (r == NULL) : (r != NULL);
             if (branch) f_pc += (uint32_t)(int32_t)off;
             else f_pc += 3;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IF_ICMPEQ) FS_CASE(OPC_IF_ICMPNE) FS_CASE(OPC_IF_ICMPLT)
+#else
         case OPC_IF_ICMPEQ: case OPC_IF_ICMPNE: case OPC_IF_ICMPLT:
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IF_ICMPGE) FS_CASE(OPC_IF_ICMPGT) FS_CASE(OPC_IF_ICMPLE) {
+#else
         case OPC_IF_ICMPGE: case OPC_IF_ICMPGT: case OPC_IF_ICMPLE: {
+#endif
             jint v2 = stack[st--].i;
             jint v1 = stack[st--].i;
             int16_t off = (int16_t)(uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);  /* JVMS: big-endian s16 */
@@ -2591,35 +4230,71 @@ continue_execution:
             }
             if (branch) f_pc += (uint32_t)(int32_t)off;
             else f_pc += 3;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IF_ACMPEQ) FS_CASE(OPC_IF_ACMPNE) {
+#else
         case OPC_IF_ACMPEQ: case OPC_IF_ACMPNE: {
+#endif
             void* v2 = stack[st--].ref;
             void* v1 = stack[st--].ref;
             int16_t off = (int16_t)(uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);  /* JVMS: big-endian s16 */
             bool branch = (op == OPC_IF_ACMPEQ) ? (v1 == v2) : (v1 != v2);
             if (branch) f_pc += (uint32_t)(int32_t)off;
             else f_pc += 3;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_GOTO) {
+#else
         case OPC_GOTO: {
+#endif
             int16_t off = (int16_t)(uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);  /* JVMS: big-endian s16 */
             f_pc += (uint32_t)(int32_t)off;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
 
         /* ---------------- array length ---------------- */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_ARRAYLENGTH) {
+#else
         case OPC_ARRAYLENGTH: {
+#endif
             JavaArray* arr = (JavaArray*)stack[st].ref;
             if (__builtin_expect(arr == NULL, 0)) goto cold_dispatch;  /* NPE / DRM bypass */
             stack[st].i = arr->length;
             f_pc++;
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
 
         /* ---------------- array loads (peek -> validate -> commit) -------- */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IALOAD) FS_CASE(OPC_FALOAD) FS_CASE(OPC_AALOAD) FS_CASE(OPC_BALOAD)
+#else
         case OPC_IALOAD: case OPC_FALOAD: case OPC_AALOAD: case OPC_BALOAD:
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_CALOAD) FS_CASE(OPC_SALOAD) {
+#else
         case OPC_CALOAD: case OPC_SALOAD: {
+#endif
             JavaArray* arr = (JavaArray*)stack[st - 1].ref;
             jint idx = stack[st].i;
             if (__builtin_expect(arr != NULL && (uint32_t)idx < (uint32_t)arr->length, 1)) {
@@ -2642,12 +4317,24 @@ continue_execution:
             } else {
                 goto cold_dispatch;  /* null / OOB: handler throws exactly */
             }
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
 
         /* ---------------- array stores (peek -> validate -> commit) ------ */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IASTORE) FS_CASE(OPC_FASTORE) FS_CASE(OPC_AASTORE) FS_CASE(OPC_BASTORE)
+#else
         case OPC_IASTORE: case OPC_FASTORE: case OPC_AASTORE: case OPC_BASTORE:
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_CASTORE) FS_CASE(OPC_SASTORE) {
+#else
         case OPC_CASTORE: case OPC_SASTORE: {
+#endif
             JavaArray* arr = (JavaArray*)stack[st - 2].ref;
             jint idx = stack[st - 1].i;
             if (__builtin_expect(arr != NULL && (uint32_t)idx < (uint32_t)arr->length, 1)) {
@@ -2668,14 +4355,709 @@ continue_execution:
             } else {
                 goto cold_dispatch;  /* null / OOB: handler throws exactly */
             }
+#if NOJME_THREADED_DISPATCH
+            FS_END();
+#else
             break;
+#endif
         }
 
+        /* ---------------- v36.103 [FAST-INVOKES]: invoke* inline ----------------
+         * The v36.102 field log nailed the remaining bottleneck: gameplay
+         * vi=8.2M/s vs 16.7M/s on parse loops of the SAME binary at
+         * ivk=300K calls/s — the per-call C scaffold (cold_dispatch ->
+         * op_invoke* handler -> compact args[] -> execute_method prologue
+         * -> frame_create -> interpret entry) dominated the frame budget
+         * while natives fell to 1.5%. This block takes the IC-HIT call
+         * entirely inside the core loop:
+         *   - no cold_dispatch round trip, no handler C call;
+         *   - no compact args[] intermediate — args are copied DIRECTLY
+         *     from the caller operand stack into the callee locals;
+         *   - no execute_method prologue (fence/depth/native/sync checks
+         *     are folded into one guarded predicate below);
+         *   - no second interpret() invocation — the SAME loop simply
+         *     continues with the callee's register file (frame swap).
+         * Semantics preserved bit-for-bit vs the op_invoke* IC paths:
+         *   - IC validity: kind==0, gen, argc>=0 (kill switches
+         *     NOJME_IFACE_IC/NOJME_SPECIAL_IC gate the FILL, so disabled
+         *     sites simply never have valid entries here);
+         *   - receiver: non-null + argguard-plausible + (virtual/interface)
+         *     exact monomorphic class match, else slow path (compat/NPE
+         *     hooks live there);
+         *   - args: J/D double into both callee local slots (low slot is
+         *     the canonical value, BT2), ref args argguard-defused exactly
+         *     like execute_method's copy loop (mask from the shared
+         *     args_layout memo — methods without a clean memo never take
+         *     this path);
+         *   - locals tail beyond the arg block zeroed ([FRAME-ZERO-TAIL]);
+         *   - caller frame synced (pc past the instruction, args popped,
+         *     throwing_pc at the invoke) so callee returns / unwinds /
+         *     remote dumps see exactly what the cold path would leave;
+         *   - ACC_SYNCHRONIZED / native / no-code / >pool-size / over-cap
+         *     cases bail to cold BEFORE any mutation; execute_method keeps
+         *     owning monitor entry/exit and StackOverflowError diagnostics.
+         * icount is NOT flushed: the register keeps accumulating across
+         * the frame swap (slow-checks flush it on the usual cadence), so
+         * vi= semantics are unchanged. */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_INVOKEVIRTUAL) FS_CASE(OPC_INVOKESPECIAL)
+#else
+        case OPC_INVOKEVIRTUAL: case OPC_INVOKESPECIAL:
+#endif
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_INVOKESTATIC) FS_CASE(OPC_INVOKEINTERFACE) {
+#else
+        case OPC_INVOKESTATIC: case OPC_INVOKEINTERFACE: {
+#endif
+            if (__builtin_expect(fast_invokes_on, 1)) {
+                /* All four formats carry the CP index in the two bytes
+                 * after the opcode; only the total length differs
+                 * (invokeinterface: count + 0 pad bytes follow). */
+                const int inslen = (op == OPC_INVOKEINTERFACE) ? 5 : 3;
+                const uint16_t iv_idx =
+                    (uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);
+                JavaClass* iclazz = frame->clazz;
+                InvokeRefCache* ic =
+                    (iclazz && iclazz->invoke_cache && iv_idx < iclazz->constant_pool_count)
+                        ? &iclazz->invoke_cache[iv_idx] : NULL;
+                if (!(ic && ic->valid && ic->kind == 0 && ic->java_argc >= 0 &&
+                      ic->gen == g_vm_cache_gen)) { goto cold_dispatch; }  /* miss */
+                {
+                    const int has_this = (op != OPC_INVOKESTATIC);
+                    const int jac = ic->java_argc;
+                    int total_slots = has_this ? 1 : 0;
+                    for (int i = 0; i < jac; i++) total_slots += ic->arg_slots[i];
+                    if (st + 1 < total_slots) { goto cold_dispatch; }  /* miss */
+                    const int base = st + 1 - total_slots;
+
+                    /* v36.103 [PIC]: the target method depends on the
+                     * receiver's runtime class — resolve it BEFORE any
+                     * method-field read below. Monomorphic pair first,
+                     * then the 3 polymorphic slots (2-class sites used to
+                     * pay the FULL slow path per call — CallBench: 44% of
+                     * invokes). static/special are CP-deterministic. */
+                    JavaMethod* m = NULL;
+                    if (has_this) {
+                        JavaObject* recv = (JavaObject*)stack[base].ref;
+                        if (recv && !argguard_bad_ptr((uintptr_t)recv)) {
+                            if (op == OPC_INVOKEVIRTUAL || op == OPC_INVOKEINTERFACE) {
+                                JavaClass* rc = recv->header.clazz;
+                                m = (rc == ic->target_class) ? ic->method : NULL;
+                                if (!m) {
+                                    for (int pi = 0; pi < 3 && !m; pi++) {
+                                        if (rc == ic->pic_class[pi]) m = ic->pic_method[pi];
+                                    }
+                                }
+                            } else {
+                                m = ic->method;   /* special: exact dispatch */
+                            }
+                        }
+                    } else {
+                        m = ic->method;           /* static */
+                    }
+                    if (!m) { goto cold_dispatch; }  /* miss */
+
+                    const int ml = (int)m->code.max_locals;
+                    const int ms = (int)m->code.max_stack + 4;   /* frame_create pad */
+                    const uint64_t layout = m->args_layout;
+                    if (total_slots > ml) { goto cold_dispatch; }  /* miss */
+                    if (!(m->code.code && m->code.code_length > 0)) { goto cold_dispatch; }  /* miss */
+                    if (m->is_native) { goto cold_dispatch; }  /* miss */
+                    if (m->access_flags & ACC_SYNCHRONIZED) { goto cold_dispatch; }  /* miss */
+                    if (!((layout >> 63) != 0)) { goto cold_dispatch; }  /* miss */
+                    if (!((int)frame->depth <= fast_rec_cap)) { goto cold_dispatch; }  /* miss */
+                    {
+                        /* Pool take (identical policy to frame_create;
+                         * mismatch restores the slot and goes cold). */
+                        FramePool* fp = frame_pool_get();
+                        JavaValue* nl = NULL;
+                        JavaValue* ns = NULL;
+                        JavaFrame* nf = NULL;
+                        /* v36.103 [POOL-SCAN]: top-down scan for the first
+                         * capacity fit (same policy as frame_create). */
+                        int pidx = -1;
+                        if (fp && fp->count > 0 && fp->count <= FRAME_POOL_SIZE) {
+                            for (int i = fp->count - 1; i >= 0; i--) {
+                                if (fp->max_locals[i] >= ml && fp->max_stack[i] >= ms) {
+                                    pidx = i;
+                                    break;
+                                }
+                            }
+                        }
+                        if (pidx < 0) {
+                            /* (v36.103 [DEEP-NOCSPLIT] continues) */
+                            /* v36.103 [DEEP-NOCSPLIT]: scan miss — the
+                             * pool is empty OR holds only ill-fitting
+                             * entries (RecBench: 2 stale small frames
+                             * blocked EVERY deep() push past depth 256 —
+                             * a count==0-only fallback bailed to
+                             * execute_method per level, nesting C frames
+                             * until a raw SIGSEGV beat the 2048-frame cap,
+                             * the v34.33 class). Allocate INLINE instead:
+                             * the inline path consumes NO C stack, so the
+                             * cap is the real limit and deep recursion
+                             * gets a clean StackOverflowError. Steady
+                             * state never reaches here (the pool
+                             * recycles; ill-fitting leftovers just occupy
+                             * their slots). */
+                            nf = (JavaFrame*)calloc(1, sizeof(JavaFrame));
+                            if (nf) {
+                                nl = (JavaValue*)calloc(ml > 0 ? (size_t)ml : 1,
+                                                        sizeof(JavaValue));
+                                ns = (JavaValue*)calloc(ms > 0 ? (size_t)ms : 1,
+                                                        sizeof(JavaValue));
+                                if (!nl || !ns) {
+                                    free(nl); free(ns); free(nf);
+                                    nf = NULL; nl = NULL; ns = NULL;
+                                } else {
+                                    nf->cap_locals = (uint16_t)ml;
+                                    nf->cap_stack = (uint16_t)ms;
+                                }
+                            }
+                        } else if (pidx >= 0) {
+                            int ptop = --fp->count;
+                            if (pidx != ptop) {
+                                JavaFrame* tf = fp->frames[pidx];
+                                JavaValue* tl = fp->locals_blocks[pidx];
+                                JavaValue* ts = fp->stack_blocks[pidx];
+                                int tml = fp->max_locals[pidx];
+                                int tms = fp->max_stack[pidx];
+                                fp->frames[pidx] = fp->frames[ptop];
+                                fp->locals_blocks[pidx] = fp->locals_blocks[ptop];
+                                fp->stack_blocks[pidx] = fp->stack_blocks[ptop];
+                                fp->max_locals[pidx] = fp->max_locals[ptop];
+                                fp->max_stack[pidx] = fp->max_stack[ptop];
+                                fp->frames[ptop] = tf;
+                                fp->locals_blocks[ptop] = tl;
+                                fp->stack_blocks[ptop] = ts;
+                                fp->max_locals[ptop] = tml;
+                                fp->max_stack[ptop] = tms;
+                            }
+                            nf = fp->frames[ptop];
+                            nl = fp->locals_blocks[ptop];
+                            ns = fp->stack_blocks[ptop];
+                            /* v36.103 [POOL-CAP]: keep the block's true
+                             * capacity for the put-back. */
+                            nf->cap_locals = (uint16_t)fp->max_locals[ptop];
+                            nf->cap_stack = (uint16_t)fp->max_stack[ptop];
+                        }
+                        if (nf == NULL) { goto cold_dispatch; }  /* miss */
+                        {
+                            /* ---- all checks passed: pure mutation below ---- */
+                            const int ag_on = argguard_enabled();
+                            uint32_t refm = (uint32_t)((layout >> 24) & 0xFFFF);
+                            int li = 0;
+                            if (has_this) {
+                                JavaValue tv = stack[base];
+                                if (ag_on && argguard_bad_ptr((uintptr_t)tv.ref)) {
+                                    argguard_report("this",
+                                                    m->clazz ? m->clazz->class_name : NULL,
+                                                    m->name, m->descriptor, 0,
+                                                    tv.raw, __builtin_return_address(0));
+                                    tv.ref = NULL;
+                                }
+                                nl[li++] = tv;
+                            }
+                            /* v36.103 FIX: STATIC sites carry their first
+                             * Java argument AT base (no 'this' slot) — the
+                             * base+1 start is the VIRTUAL layout. Reading
+                             * base+1 on a static site fed the callee a
+                             * stale operand-slot value as arg #1 (RecBench
+                             * d120: arg=-175633792 while stack[0]=120). */
+                            int cur = has_this ? (base + 1) : base;
+                            for (int i = 0; i < jac; i++) {
+                                JavaValue v = stack[cur];
+                                if ((refm & 1) && ag_on &&
+                                    argguard_bad_ptr((uintptr_t)v.ref)) {
+                                    argguard_report("arg",
+                                                    m->clazz ? m->clazz->class_name : NULL,
+                                                    m->name, m->descriptor,
+                                                    (has_this ? 1 : 0) + i,
+                                                    v.raw, __builtin_return_address(0));
+                                    v.ref = NULL;
+                                }
+                                nl[li] = v;
+                                if (ic->arg_slots[i] == 2) {
+                                    nl[li + 1] = v;   /* J/D: both slots = copy */
+                                    li += 2;
+                                } else {
+                                    li += 1;
+                                }
+                                refm >>= 1;
+                                cur += ic->arg_slots[i];
+                            }
+                            if (li < ml) {
+                                memset(&nl[li], 0,
+                                       (size_t)(ml - li) * sizeof(JavaValue));
+                            }
+                            /* Caller sync: the callee's returns deposit
+                             * onto frame->prev, the unwinder walks
+                             * throwing_pc, remote dumps read the chain. */
+                            frame->pc = f_pc + inslen;
+                            frame->stack_top = (int16_t)(base - 1);
+                            frame->throwing_pc = (int)f_pc;
+                            /* Callee frame (field set order mirrors
+                             * frame_create's pool path). */
+                            nf->prev = frame;
+                            nf->depth = frame->depth + 1;
+                            nf->method = m;
+                            nf->clazz = m->clazz;
+                            nf->code = m->code.code;
+                            nf->code_length = m->code.code_length;
+                            nf->locals = nl;
+                            nf->stack = ns;
+                            nf->max_locals = (uint16_t)ml;
+                            nf->max_stack = (uint16_t)ms;
+                            nf->pc = 0;
+                            nf->stack_top = -1;
+                            nf->throwing_pc = 0;
+                            nf->exception_table = m->code.exception_table;
+                            nf->exception_table_length = m->code.exception_table_length;
+                            nf->mon_owned_n = 0;
+                            thread->current_frame = nf;
+                            thread->frame_seq++;
+#if NOJME_PERF_DEBUG /* v36.106 [PERF-GATE] */
+                            thread->perf_ivk++;
+                            thread->perf_fiv++;
+#endif
+
+
+                            /* Register swap: THIS loop becomes the callee. */
+                            frame = nf;
+                            locals = nl;
+                            stack = ns;
+                            code = nf->code;
+                            code_len = nf->code_length;
+                            f_pc = 0;
+                            st = -1;
+#if NOJME_THREADED_DISPATCH
+                            FS_END();
+#else
+                            break;
+#endif
+                        }
+                    }
+                }
+            }
+            goto cold_dispatch;   /* any miss: handler re-runs everything */
+        }
+
+        /* ---------------- v36.101 [FAST-RETURN]: method returns ----------------
+         * Mirrors op_ireturn/op_lreturn/op_freturn/op_dreturn/op_areturn/
+         * op_return bit-for-bit (deposit onto frame->prev, two-slot J/D
+         * convention with the low slot canonical), but WITHOUT the
+         * cold_dispatch round trip (frame sync -> opcode_table indirect
+         * call -> handler -> re-seed). Every Java call ends in one of
+         * these; on the A57 the indirect call through the big table was
+         * an unavoidable branch-miss + icache pressure per RETURN.
+         * Deposit-overflow / missing-caller cases deopt to the handlers
+         * (exact diagnostics preserved). icount was already bumped for
+         * this opcode before the switch, so the flush below matches the
+         * cold path's jvm->instr_count = icount (which ALSO includes the
+         * current op) — vi= semantics unchanged.
+         * v36.103 [FAST-INVOKES]: for a frame pushed by the inline invoke
+         * path (frame != entry_frame) the return pops it right here and
+         * resumes the caller in the same loop (inline_pop); only the
+         * ENTRY frame returns to execute_method, which owns its monitor /
+         * destroy bookkeeping. */
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_IRETURN) FS_CASE(OPC_FRETURN) FS_CASE(OPC_ARETURN) {
+#else
+        case OPC_IRETURN: case OPC_FRETURN: case OPC_ARETURN: {
+#endif
+            JavaFrame* rprev = frame->prev;
+            if (__builtin_expect(rprev != NULL &&
+                                 rprev->stack_top + 1 < (int)rprev->max_stack, 1)) {
+                JavaValue rv = stack[st];
+                st--;
+                rprev->stack[++rprev->stack_top] = rv;
+                if (frame != entry_frame) goto inline_pop;
+                frame->pc = f_pc + 1;
+                jvm->instr_count = icount;
+                return 0;   /* normal return (same as cold result > 0) */
+            }
+            if (frame != entry_frame) goto inline_return_deopt;
+            goto cold_dispatch;  /* no caller / RETURN-DEPOSIT: handler logs exactly */
+        }
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_LRETURN) FS_CASE(OPC_DRETURN) {
+#else
+        case OPC_LRETURN: case OPC_DRETURN: {
+#endif
+            JavaFrame* rprev = frame->prev;
+            if (__builtin_expect(rprev != NULL &&
+                                 rprev->stack_top + 2 < (int)rprev->max_stack, 1)) {
+                JavaValue rv = stack[st - 1];   /* low slot canonical (BT2) */
+
+                st -= 2;
+                rprev->stack[++rprev->stack_top] = rv;
+                rprev->stack[++rprev->stack_top] = rv;  /* both slots = copy */
+                if (frame != entry_frame) goto inline_pop;
+                frame->pc = f_pc + 1;
+                jvm->instr_count = icount;
+                return 0;
+            }
+            if (frame != entry_frame) goto inline_return_deopt;
+            goto cold_dispatch;
+        }
+#if NOJME_THREADED_DISPATCH
+        FS_CASE(OPC_RETURN) {
+#else
+        case OPC_RETURN: {
+#endif
+            /* op_return has NO caller check (void) — plain signal. */
+            if (frame != entry_frame) goto inline_pop;
+            frame->pc = f_pc + 1;
+            jvm->instr_count = icount;
+            return 0;
+        }
+
+#if NOJME_THREADED_DISPATCH
+        /* (threaded) default: the dispatch table already routes
+         * every non-hot opcode to cold_dispatch */
+#else
         default:
             goto cold_dispatch;
         }  /* end fast switch */
+#endif
+#if NOJME_THREADED_DISPATCH
+        /* (threaded) unreachable: every handler ends with its own
+         * dispatch tail; the classic 'continue' has no loop here */
+#else
         continue;
+#endif
+
+/* v36.103 [FAST-INVOKES]: pop one inline frame (pushed by the core invoke
+ * path) and resume its caller IN THIS LOOP. The deposit onto the caller
+ * stack already happened (FAST-RETURN wrote it / the cold return handler
+ * wrote it). Monitors acquired by monitorenter in the dying frame are
+ * released exactly like execute_method does on a normal return; the frame
+ * goes back to the thread pool via frame_destroy (same policy). The caller
+ * frame was synced at push time (pc past the invoke, args popped) — but
+ * the deposit may have advanced stack_top since, so st re-seeds from the
+ * frame. Reached from: FAST-RETURN cases, the cold result>0 tail, and the
+ * loop-exit path (fall-off-the-end / !running unwind). */
+inline_pop:
+        {
+            if (frame->mon_owned_n > 0) {
+                extern void jvm_frame_release_monitors(JVM* jvm, JavaThread* jt,
+                                                       JavaFrame* fr, int on_exception);
+                jvm_frame_release_monitors(jvm, thread, frame, 0);
+            }
+            {
+                JavaFrame* dying = frame;
+                frame = dying->prev;   /* never NULL for an inline frame */
+                frame_destroy(dying);
+                thread->current_frame = frame;
+                thread->frame_seq++;
+            }
+            locals = frame->locals;
+            stack = frame->stack;
+            code = frame->code;
+            code_len = frame->code_length;
+            f_pc = frame->pc;
+            st = frame->stack_top;
+#if NOJME_THREADED_DISPATCH
+            NOJME_NEXT();
+#else
+            continue;
+#endif
+        }
+
+/* v36.103 [FAST-INVOKES]: RETURN deposit would overflow the caller's
+ * operand stack on an INLINE frame. For valid bytecode this cannot happen
+ * (the args pop + the +4 pad leave room; see return_deposit_ok in
+ * opcodes.c) — reaching here means operand-stack drift, the error class
+ * [STKDIAG] instruments. The cold handler's answer is a loud log + a
+ * -1 WITHOUT a pending exception; mirror it, then unwind every inline
+ * frame to the entry (releasing monitors) so the C-level unwinder sees
+ * the chain it owns. */
+inline_return_deopt:
+        LOG_SAFE("[EXEC] RETURN-DEPOSIT overflow (inline): caller stack_top=%d max=%d in %s.%s\n",
+                 frame->prev ? (int)frame->prev->stack_top : -1,
+                 frame->prev ? (int)frame->prev->max_stack : -1,
+                 frame->clazz ? (frame->clazz->class_name ? frame->clazz->class_name : "?") : "?",
+                 frame->method ? (frame->method->name ? frame->method->name : "?") : "?");
+        goto fatal_unwind_inline;
 #endif /* !J2ME_DEBUG */
+
+#if NOJME_THREADED_DISPATCH
+/* ==================== v36.105 [SUPERI] fused pairs ====================
+ * Слитые хендлеры: тело продюсера (бит-в-бит из его быстрого хендлера),
+ * подсмотр следующего опкода (охрана f_pc < code_len — байт ОПКОДА в
+ * оригинале читается только после проверки границ; операнды консюмеров
+ * читаются их родными телами ровно как раньше), при совпадении — тело
+ * консюмера бит-в-бит и ОДНА диспетчеризация через NOJME_NEXT2 (счёт
+ * обеих команд). Промах всех консюмеров — обычный NOJME_NEXT: поведение
+ * идентично v36.104 (продюсер без спарки). Все слитые тела свободны от
+ * исключений/нативов (loads/stores/constants/int-арифметика) — точки
+ * синхронизации кадра (T_SLOW/T_EXIT) видят консистентное состояние.
+ * Порядок проверок консюмеров — по убыванию полевой частоты пары. */
+FS_LBL_SUPERI_LOAD:      /* ILOAD/FLOAD/ALOAD (generic) */
+        stack[++st] = locals[code[f_pc + 1]];
+        f_pc += 2;
+        if (__builtin_expect(f_pc < code_len, 1)) {
+            uint8_t op2 = code[f_pc];
+            if (op2 == OPC_BIPUSH) {
+                stack[++st].i = (jint)(int8_t)code[f_pc + 1];
+                f_pc += 2;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_SIPUSH) {
+                stack[++st].i = (jint)(int16_t)(uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);
+                f_pc += 3;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_ILOAD || op2 == OPC_ALOAD) {
+                stack[++st] = locals[code[f_pc + 1]];
+                f_pc += 2;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_IMUL) {
+                stack[st - 1].i = stack[st - 1].i * stack[st].i;
+                st--; f_pc++;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_IADD) {
+                stack[st - 1].i = stack[st - 1].i + stack[st].i;
+                st--; f_pc++;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_IAND) {
+                stack[st - 1].i = stack[st - 1].i & stack[st].i;
+                st--; f_pc++;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_ISTORE || op2 == OPC_ASTORE) {  /* local-to-local move */
+                locals[code[f_pc + 1]] = stack[st--];
+                f_pc += 2;
+                NOJME_NEXT2();
+            }
+            if (SUPERI_IS_LOAD_N(op2)) {
+                stack[++st] = locals[(op2 + 2) & 3];
+                f_pc++;
+                NOJME_NEXT2();
+            }
+        }
+        NOJME_NEXT();
+
+FS_LBL_SUPERI_LOAD_N:    /* iload_n/fload_n/aload_n groups */
+        stack[++st] = locals[(op + 2) & 3];
+        f_pc++;
+        if (__builtin_expect(f_pc < code_len, 1)) {
+            uint8_t op2 = code[f_pc];
+            if (op2 == OPC_BIPUSH) {
+                stack[++st].i = (jint)(int8_t)code[f_pc + 1];
+                f_pc += 2;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_SIPUSH) {
+                stack[++st].i = (jint)(int16_t)(uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);
+                f_pc += 3;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_ILOAD || op2 == OPC_ALOAD) {
+                stack[++st] = locals[code[f_pc + 1]];
+                f_pc += 2;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_IMUL) {
+                stack[st - 1].i = stack[st - 1].i * stack[st].i;
+                st--; f_pc++;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_IADD) {
+                stack[st - 1].i = stack[st - 1].i + stack[st].i;
+                st--; f_pc++;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_IAND) {
+                stack[st - 1].i = stack[st - 1].i & stack[st].i;
+                st--; f_pc++;
+                NOJME_NEXT2();
+            }
+            if (SUPERI_IS_LOAD_N(op2)) {
+                stack[++st] = locals[(op2 + 2) & 3];
+                f_pc++;
+                NOJME_NEXT2();
+            }
+        }
+        NOJME_NEXT();
+
+FS_LBL_SUPERI_STORE:     /* ISTORE/FSTORE/ASTORE (generic) */
+        locals[code[f_pc + 1]] = stack[st--];
+        f_pc += 2;
+        if (__builtin_expect(f_pc < code_len, 1)) {
+            uint8_t op2 = code[f_pc];
+            if (op2 == OPC_ILOAD || op2 == OPC_ALOAD) {  /* istore+iload: 7.1% пар */
+                stack[++st] = locals[code[f_pc + 1]];
+                f_pc += 2;
+                NOJME_NEXT2();
+            }
+            if (SUPERI_IS_LOAD_N(op2)) {
+                stack[++st] = locals[(op2 + 2) & 3];
+                f_pc++;
+                NOJME_NEXT2();
+            }
+        }
+        NOJME_NEXT();
+
+FS_LBL_SUPERI_STORE_N:   /* istore_n/fstore_n/astore_n groups */
+        locals[(op + 1) & 3] = stack[st--];
+        f_pc++;
+        if (__builtin_expect(f_pc < code_len, 1)) {
+            uint8_t op2 = code[f_pc];
+            if (op2 == OPC_ILOAD || op2 == OPC_ALOAD) {
+                stack[++st] = locals[code[f_pc + 1]];
+                f_pc += 2;
+                NOJME_NEXT2();
+            }
+            if (SUPERI_IS_LOAD_N(op2)) {
+                stack[++st] = locals[(op2 + 2) & 3];
+                f_pc++;
+                NOJME_NEXT2();
+            }
+        }
+        NOJME_NEXT();
+
+FS_LBL_SUPERI_SIPUSH:
+        stack[++st].i = (jint)(int16_t)(uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);
+        f_pc += 3;
+        if (__builtin_expect(f_pc < code_len, 1)) {
+            uint8_t op2 = code[f_pc];
+            if (op2 == OPC_IAND) {  /* sipush+iand: 5.2% пар (маска) */
+                stack[st - 1].i = stack[st - 1].i & stack[st].i;
+                st--; f_pc++;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_IADD) {
+                stack[st - 1].i = stack[st - 1].i + stack[st].i;
+                st--; f_pc++;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_IMUL) {
+                stack[st - 1].i = stack[st - 1].i * stack[st].i;
+                st--; f_pc++;
+                NOJME_NEXT2();
+            }
+        }
+        NOJME_NEXT();
+
+FS_LBL_SUPERI_BIPUSH:
+        stack[++st].i = (jint)(int8_t)code[f_pc + 1];
+        f_pc += 2;
+        if (__builtin_expect(f_pc < code_len, 1)) {
+            uint8_t op2 = code[f_pc];
+            if (op2 == OPC_ISHR) {  /* bipush+ishr: 2.4% (fixed-point >>) */
+                stack[st - 1].i = stack[st - 1].i >> (stack[st].i & 0x1F);
+                st--; f_pc++;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_IUSHR) {  /* bipush+iushr: 2.4% */
+                stack[st - 1].i = (jint)(((juint)stack[st - 1].i) >> (stack[st].i & 0x1F));
+                st--; f_pc++;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_ISHL) {
+                stack[st - 1].i = stack[st - 1].i << (stack[st].i & 0x1F);
+                st--; f_pc++;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_IADD) {
+                stack[st - 1].i = stack[st - 1].i + stack[st].i;
+                st--; f_pc++;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_IAND) {
+                stack[st - 1].i = stack[st - 1].i & stack[st].i;
+                st--; f_pc++;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_IMUL) {
+                stack[st - 1].i = stack[st - 1].i * stack[st].i;
+                st--; f_pc++;
+                NOJME_NEXT2();
+            }
+        }
+        NOJME_NEXT();
+
+FS_LBL_SUPERI_IAND:
+        stack[st - 1].i = stack[st - 1].i & stack[st].i;
+        st--; f_pc++;
+        if (__builtin_expect(f_pc < code_len, 1)) {
+            uint8_t op2 = code[f_pc];
+            if (op2 == OPC_ISTORE || op2 == OPC_ASTORE) {  /* iand+istore: 3.5% */
+                locals[code[f_pc + 1]] = stack[st--];
+                f_pc += 2;
+                NOJME_NEXT2();
+            }
+            if (SUPERI_IS_STORE_N(op2)) {
+                locals[(op2 + 1) & 3] = stack[st--];
+                f_pc++;
+                NOJME_NEXT2();
+            }
+        }
+        NOJME_NEXT();
+
+FS_LBL_SUPERI_IADD:
+        stack[st - 1].i = stack[st - 1].i + stack[st].i;
+        st--; f_pc++;
+        if (__builtin_expect(f_pc < code_len, 1)) {
+            uint8_t op2 = code[f_pc];
+            if (op2 == OPC_ISTORE || op2 == OPC_ASTORE) {
+                locals[code[f_pc + 1]] = stack[st--];
+                f_pc += 2;
+                NOJME_NEXT2();
+            }
+            if (SUPERI_IS_STORE_N(op2)) {
+                locals[(op2 + 1) & 3] = stack[st--];
+                f_pc++;
+                NOJME_NEXT2();
+            }
+        }
+        NOJME_NEXT();
+
+FS_LBL_SUPERI_IMUL:
+        stack[st - 1].i = stack[st - 1].i * stack[st].i;
+        st--; f_pc++;
+        if (__builtin_expect(f_pc < code_len, 1)) {
+            uint8_t op2 = code[f_pc];
+            if (op2 == OPC_IADD) {  /* imul+iadd: 3.1% (fixed-point аккумуляция) */
+                stack[st - 1].i = stack[st - 1].i + stack[st].i;
+                st--; f_pc++;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_ILOAD || op2 == OPC_ALOAD) {  /* imul+iload: 2.8% */
+                stack[++st] = locals[code[f_pc + 1]];
+                f_pc += 2;
+                NOJME_NEXT2();
+            }
+            if (SUPERI_IS_LOAD_N(op2)) {
+                stack[++st] = locals[(op2 + 2) & 3];
+                f_pc++;
+                NOJME_NEXT2();
+            }
+        }
+        NOJME_NEXT();
+
+FS_LBL_SUPERI_ISHR:
+        stack[st - 1].i = stack[st - 1].i >> (stack[st].i & 0x1F);
+        st--; f_pc++;
+        if (__builtin_expect(f_pc < code_len, 1)) {
+            uint8_t op2 = code[f_pc];
+            if (op2 == OPC_SIPUSH) {  /* ishr+sipush: 2.4% */
+                stack[++st].i = (jint)(int16_t)(uint16_t)(((uint16_t)code[f_pc + 1] << 8) | (uint16_t)code[f_pc + 2]);
+                f_pc += 3;
+                NOJME_NEXT2();
+            }
+            if (op2 == OPC_BIPUSH) {
+                stack[++st].i = (jint)(int8_t)code[f_pc + 1];
+                f_pc += 2;
+                NOJME_NEXT2();
+            }
+        }
+        NOJME_NEXT();
+#endif /* NOJME_THREADED_DISPATCH */
 
 cold_dispatch:
         {
@@ -2692,7 +5074,11 @@ cold_dispatch:
                 ERROR_LOG("Unknown opcode: 0x%02X at PC=%d", op, (int)f_pc);
                 jvm_throw_by_name(jvm, "java/lang/VirtualMachineError", "Unknown opcode");
                 jvm->instr_count = icount;
-                return -1;
+                /* v36.103 [FAST-INVOKES]: pending exception — an inline
+                 * frame must leave via the propagate path (cold path:
+                 * execute_method pops, the CALLER's cold site runs its
+                 * exception_search). */
+                goto propagate_exception_inline;
             }
 
             int result = handler(jvm, thread, frame);
@@ -2706,6 +5092,16 @@ cold_dispatch:
             if (result > 0) {
                 jvm->instr_count = icount;
                 EXEC_DEBUG("Method returned");
+                /* v36.103 [FAST-INVOKES]: a cold return handler (edge
+                 * deposit cases) signalled "method returned" — for an
+                 * inline frame that means pop it here and resume the
+                 * caller; the deposit onto frame->prev already happened
+                 * inside the handler. (Guarded: the label lives inside
+                 * the #if !J2ME_DEBUG fast core; debug builds never have
+                 * inline frames.) */
+#if !J2ME_DEBUG
+                if (frame != entry_frame) goto inline_pop;
+#endif
                 return 0;  /* Normal return */
             }
 
@@ -2719,6 +5115,10 @@ cold_dispatch:
                             frame->clazz ? (frame->clazz->class_name ? frame->clazz->class_name : "?") : "?",
                             frame->method ? (frame->method->name ? frame->method->name : "?") : "?",
                             result);
+                    /* v36.103 [FAST-INVOKES]: fatal without exception —
+                     * unwind inline frames so execute_method's chain
+                     * unwinder sees only frames it owns. */
+                    if (frame != entry_frame) goto fatal_unwind_inline;
                     return -1;
                 }
 exception_search:
@@ -2860,13 +5260,119 @@ exception_search:
                             thread->exception_throw_info = strdup(info);
                         }
 
+                        /* v36.103 [FAST-INVOKES]: no handler in THIS frame —
+                         * an inline frame pops here and the search re-runs
+                         * on its caller (throwing_pc of every inline caller
+                         * was recorded at push time = the invoke site),
+                         * exactly the frame-by-frame propagation the cold
+                         * path performed through nested interpret levels.
+                         * EX-PROP above logs each frame; the trace builds
+                         * once (exception_stack_trace != NULL guard). */
+                        if (frame != entry_frame) {
+                            if (frame->mon_owned_n > 0) {
+                                extern void jvm_frame_release_monitors(JVM* jvm, JavaThread* jt,
+                                                                       JavaFrame* fr, int on_exception);
+                                jvm_frame_release_monitors(jvm, thread, frame, 1);
+                            }
+                            {
+                                JavaFrame* dying = frame;
+                                frame = dying->prev;
+                                frame_destroy(dying);
+                                thread->current_frame = frame;
+                                thread->frame_seq++;
+                            }
+                            goto exception_search;
+                        }
                         return -1;  /* Caller will handle */
                     }
                 }
             }
         }
-    }  /* end while */
+        /* v36.103 [FAST-INVOKES] FIX: a cold handler that returned 0
+         * ("continue executing") must RE-ENTER the loop condition — with
+         * the unwind labels sitting between this block and the end of the
+         * while body, plain fall-through would drop every normal cold
+         * opcode into fatal_unwind_inline (silent -1 on the FIRST cold
+         * opcode — host Bench caught it: iconst_0 fast, putstatic cold,
+         * dead). continue; preserves the original control flow exactly
+         * (the pre-v36.103 body simply fell out of the block into the
+         * loop's closing brace). */
+#if NOJME_THREADED_DISPATCH
+        /* v36.104 [THREADED-DISPATCH]: F12 opcode tracing — while the
+         * debug flag is up, the cold path re-dispatches every opcode
+         * through itself (the tracer sees each opcode from engage to
+         * release). The fast core samples the flag only at the 64-cadence
+         * (zero hot-path cost). */
+        if (__builtin_expect(g_j2me_runtime_debug, 0)) {
+            if (__builtin_expect(f_pc >= code_len || !jvm->running, 0)) goto T_EXIT;
+            op = code[f_pc];
+            goto cold_dispatch;
+        }
+        NOJME_NEXT();
+#else
+        continue;
+#endif
 
+/* v36.103 [FAST-INVOKES]: interpret-level fatal with NO pending exception
+ * (the OPCODE FAIL class). Unwind every inline frame to the entry
+ * (releasing monitors, on_exception=1 — execute_method does the same for
+ * its own frame on exec_result<0) so the C-level unwinder only ever sees
+ * the chain it owns. */
+fatal_unwind_inline:
+        while (frame != entry_frame) {
+            if (frame->mon_owned_n > 0) {
+                extern void jvm_frame_release_monitors(JVM* jvm, JavaThread* jt,
+                                                       JavaFrame* fr, int on_exception);
+                jvm_frame_release_monitors(jvm, thread, frame, 1);
+            }
+            {
+                JavaFrame* dying = frame;
+                frame = dying->prev;
+                frame_destroy(dying);
+                thread->current_frame = frame;
+                thread->frame_seq++;
+            }
+        }
+        jvm->instr_count = icount;
+        return -1;
+
+/* v36.103 [FAST-INVOKES]: pending exception while inside an inline frame —
+ * leave it exactly like the cold path would (execute_method pops with
+ * on_exception monitor release; op_invoke* returns -1; the CALLER's cold
+ * site then runs ITS exception_search with throwing_pc at the invoke —
+ * which the inline push already recorded on the caller frame). */
+propagate_exception_inline:
+        if (frame != entry_frame) {
+            if (frame->mon_owned_n > 0) {
+                extern void jvm_frame_release_monitors(JVM* jvm, JavaThread* jt,
+                                                       JavaFrame* fr, int on_exception);
+                jvm_frame_release_monitors(jvm, thread, frame, 1);
+            }
+            {
+                JavaFrame* dying = frame;
+                frame = dying->prev;
+                frame_destroy(dying);
+                thread->current_frame = frame;
+                thread->frame_seq++;
+            }
+            goto exception_search;
+        }
+        jvm->instr_count = icount;
+        return -1;
+#if NOJME_THREADED_DISPATCH
+T_EXIT:
+#else
+    }  /* end while */
+#endif
+
+#if !J2ME_DEBUG
+    /* v36.103 [FAST-INVOKES]: the loop exited while executing an INLINE
+     * frame — either the code fell off the end (malformed bytecode: the
+     * cold path let the CALLER continue after the callee's interpret
+     * returned 0) or !jvm->running (shutdown: pop through, the next
+     * iteration exits again). Pop ONE frame and resume the caller. */
+    if (frame != entry_frame) goto inline_pop;
+#endif
     frame->pc = f_pc;
     frame->stack_top = (int16_t)st;
     jvm->instr_count = icount;

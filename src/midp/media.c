@@ -1116,7 +1116,9 @@ static void mix_midi_player(MediaPlayer* player, int16_t* buffer, int samples) {
     if (samples > MAX_MIX_SAMPLES) samples = MAX_MIX_SAMPLES; /* v34.27 */
 
     int16_t* temp_buf = g_midi_scratch;
-    memset(temp_buf, 0, (size_t)samples * 2 * sizeof(int16_t));
+    /* v36.90: temp_buf is fully (re)written by midi_generate_samples()
+     * (it zeroes the buffer first even on its early-exit paths), so the
+     * extra memset here was pure duplicated work per mix cycle. */
 
     /* v36.27 TEMPO FIX («музыка в Asphalt 3 3D замедлена»): секвенсор
      * двигается на время РЕНДЕРЕННЫХ СЭМПЛОВ (аудио-часы), а НЕ по
@@ -2072,9 +2074,12 @@ static JavaValue native_player_start(JVM* jvm, JavaThread* thread,
         player->wav_read_pos = 0.0;
     } else if (player->type == PLAYER_TYPE_MIDI && player->midi) {
         midi_set_loop(player->midi, player->looping);
-        if (player->midi->sequencer) {
-            player->midi->sequencer->end_reached = false;
-        }
+        /* [MIDI-LOOP-FIX] v36.95: do NOT clear end_reached here.
+         * midi_play() uses end_reached as the trigger to rewind the SMF
+         * parser (EAS_Locate(0)) before resuming; clearing it made any
+         * start() after a natural EOF or stop() resume from the END of
+         * the file (instant silence / instant END_OF_MEDIA again).
+         * midi_play() consumes and resets the flag itself. */
         midi_play(player->midi);
     } else if ((player->type == PLAYER_TYPE_TONE || player->type == PLAYER_TYPE_TONE_DEVICE) && player->tone_seq) {
         player->tone_seq->playing = true;

@@ -258,6 +258,19 @@ struct JavaMethod {
     /* FIX (audit M-4, v18): was int8_t — descriptors with >127 argument slots
      * (spec max 255) overflowed and corrupted native arg marshalling. */
     int16_t cached_arg_count;  /* -1 = not yet computed */
+
+    /* v36.101 [ARG-LAYOUT]: memoized compact-args -> locals expansion plan
+     * for execute_method, packed into ONE aligned 64-bit word so the lazy
+     * fill is a single atomic store (no store/load reordering window on
+     * weakly-ordered ARM — three separate fields + a valid flag could
+     * publish mid-update and corrupt the callee's locals):
+     *   bit 63    = valid (0 = walk the descriptor, as before)
+     *   bits 0-7  = java arg count (compact args[] entries, J/D = 1)
+     *   bits 8-23 = args_wide mask: bit i = arg i is J/D (2 local slots,
+     *               both filled with the same JavaValue — two-slot conv.)
+     *   bits 24-39= args_ref mask: bit i = arg i is L/[ (argguard target)
+     * >15 java args / unparsable descriptor -> stays 0 -> original loop. */
+    uint64_t args_layout;
 };
 
 /* Java Class Structure */
@@ -434,6 +447,28 @@ struct JavaFrame {
         
     /* Previous frame */
     JavaFrame* prev;
+
+    /* v36.101 [FRAME-DEPTH]: 1-based depth of this frame on its thread's
+     * chain (root frame = 1). Maintained by push_frame() — the single place
+     * a frame is linked in — so execute_method can read the call depth in
+     * O(1) instead of walking prev-pointers on EVERY Java call (the walk
+     * was a dependent-load chain per call: hot on x86, expensive on the
+     * in-order-ish A57 of the Switch). Threads reset current_frame to NULL
+     * at teardown; the next root frame recomputes depth=1. */
+    uint32_t depth;
+
+    /* v36.103 [POOL-CAP]: TRUE capacity of the locals/stack BLOCKS this
+     * frame points at (>= max_locals/max_stack). The frame pool keyed its
+     * reuse on the LAST-SERVED method's sizes, so a big block that ran a
+     * small method was returned with shrunken metadata — later big methods
+     * missed the pool forever and calloc'd fresh blocks every call
+     * (CallBench: 33% of invokes). Capacity is monotone per block: set at
+     * allocation, preserved across reuse, stored back on pool-put. The
+     * method-facing max_locals/max_stack stay exactly what the bytecode
+     * expects (GC scans [0..max_locals), [STKDIAG] bounds-checks
+     * max_stack). */
+    uint16_t cap_locals;
+    uint16_t cap_stack;
 };
 
 /* Java Thread */
@@ -496,6 +531,17 @@ struct JavaThread {
     char last_native[96];
     jlong last_native_ms;
 
+    /* v36.93 diagnostics: 1 = поток СЕЙЧАС исполняет натив (между
+     * jvm_note_native_call и jvm_note_native_return). Раньше td-дампер
+     * печатал last_native+age всегда: простой поток (фронтенд-цикл без
+     * Java-работы) рапортовал устаревшее «nat=java/lang/Thread.start
+     * age=12550» — выглядело как 12.5-секундное зависание, хотя
+     * Thread.start вернулся за 3 мс (Bounce Tales, сессия 1 полевого
+     * лога v36.91). Дампер печатает nat/age только при in_native=1;
+     * для простоя — «(idle) age=-1». ta=/liveness-семантика (последняя
+     * активность по last_native_ms) не меняется. */
+    volatile uint8_t in_native;
+
     /* v36.88 [SPIN-BREAK-ICOUNT]: приблизительное число ИНСТРУКЦИЙ,
      * исполненных ЭТИМ потоком с последнего натива/парковки/выстрела
      * брейкера. Аккумулируется в slow-check интерпретатора (+64 за каждый
@@ -512,6 +558,52 @@ struct JavaThread {
      * навсегда, музыка продолжала играть). Гейт на выстрел: работа
      * ПОДТВЕРЖДАЕТ спин; возраст без работы = долг сна ОС. */
     uint64_t spin_instr;
+
+    /* v36.103 [IVK-TLS]: per-thread call-tax telemetry (plain increments,
+     * owned by THIS thread — no shared atomic on the hot call path; the
+     * old __sync_fetch_and_add on one g_perf_ivk_acc line bounced between
+     * main and the runner's cores at 300K+ calls/s). Summed+reset by the
+     * diag printer walking jvm->threads[]:
+     *   perf_ivk — every Java call entered (execute_method entries +
+     *              [FAST-INVOKES] core-inline invokes);
+     *   perf_fiv — the subset dispatched by the core-inline fast path
+     *              (field proof the new path is taken; ivk-fiv = what is
+     *              still paying the execute_method scaffold);
+     *   perf_ifc — invokeinterface IC misses (slow-path entries). */
+    uint32_t perf_ivk;
+    uint32_t perf_fiv;
+    uint32_t perf_ifc;
+
+    /* v36.104 [VM-OPS]: per-thread opcode-position histogram — sampled
+     * by the interpreter's 64-instruction cadence block (the opcode at
+     * code[f_pc] when the countdown trips: a systematic 1/64 sample of
+     * instruction POSITIONS, unbiased for mix shares). One array
+     * increment per 64 instructions = free on the hot path. Summed+
+     * reset by the diag printer ([VM-OPS] line, top-8 shares) — the
+     * FIELD evidence for the next interpreter round on the A57 (which
+     * opcodes actually burn the effects-scene cycles there). */
+    uint32_t ops_hist[256];
+
+    /* v36.94 [STALLSTACK-REMOTE]: seqlock для БЕЗОПАСНОГО чтения цепочки
+     * кадров этого потока ИЗ ДРУГОГО потока (beat-сторож). Пишется
+     * владельцем в push_frame/pop_frame (единственные точки мутации
+     * цепочки). Читатель (beat) требует стабильности: два чтения seq
+     * до/после обхода совпали => кадры не мутировали в процессе чтения.
+     * Это закрывает дыру v36.92 [STALL-PROBE]: [STALLSTACK] печатает
+     * САМ застрявший поток на ближайшем yield (1024 инструкции) — а
+     * полевой фриз Metal Slug 6 (v36.93) молчал 22.5 с: поток выполнил
+     * МЕНЬШЕ 1024 инструкций за весь эпизод, yield не наступил ни
+     * разу. Удалённый дамп — единственный свидетель. */
+    volatile uint32_t frame_seq;
+
+    /* v36.94 [STALL-RING]: кольцо последних 16 (op, pc) этого потока,
+     * пишется на slow-check (каждые 64 инструкции, рядом со spin_instr).
+     * Печатается вместе со [STALLSTACK-REMOTE]: показывает, ДВИГАЕТСЯ ли
+     * pc застрявшего потока (медленный прогресс — «дорожка» pc меняется)
+     * или стоит в одном опкоде (блокировка внутри C-обработчика). */
+    uint8_t   stall_ring_op[16];
+    uint32_t  stall_ring_pc[16];
+    volatile uint8_t stall_ring_idx;
 
     /* v36.48 [DUMP-FENCE] diagnostics: последний Java-сайт «class.method@pc»
      * этого потока. Пишется ТОЛЬКО потоком-владельцем (push_frame на входе в
@@ -546,9 +638,25 @@ struct JavaThread {
     /* v34.98 diagnostics: short reason this thread is currently parked at an
      * interpreter slow-check ("" when running). Values: "fe-pause" (frontend
      * pause park), "gc-sp" (GC safepoint park), "budget" (runner instruction
-     * budget yield). Read by the per-second td dump: answers "state=run but
-     * age grows" — the thread is parked here, not spinning. */
+     * budget yield), "fence" (v36.96: EXIT-FENCE wait at the slow-check —
+     * the frame thread is executing a fenced Java window). Read by the
+     * per-second td dump: answers "state=run but age grows" — the thread is
+     * parked here, not spinning. */
     char park_why[16];
+
+    /* v36.96 [FENCE-DEADLOCK-BREAK]: 1 = this thread is SPINNING inside
+     * jvm_frame_fence_wait_public() (the EXIT-FENCE hold: the frame thread
+     * executes a fenced Java window — key delivery/timers/destroyApp — and
+     * every runner parks at its 64-insn poll). Read by monitor_enter's wait
+     * loop of the FRAME thread: if the OWNER of the monitor we are blocked
+     * on is fence-waiting, the fence executor IS us and the owner waits for
+     * OUR window to finish while we wait for its monitor — a textbook
+     * mutual deadlock (field: Metal Slug 6 v36.95 log, 5 pauses of exactly
+     * ~1 s = the KEY-BUDGET expiry; pre-v36.94 the same deadlock ran 22.5 s
+     * via the 2.5 s fence-cap loop). The pump aborts its delivery at once;
+     * the unwind disarms the fence, the owner proceeds and releases the
+     * monitor, the key is re-queued and delivered on a later attempt. */
+    volatile uint8_t in_fence_wait;
 
     /* v36.06 diagnostics: stream-read shadow. Updated by the BAIS/DIS read
      * natives on every read: position/limit/underlying-buffer length and a
@@ -577,7 +685,17 @@ struct JavaThread {
      * which turns the eternal loading screen into the game's own error path
      * (thread exit -> THREAD-EXIT/MIDLET-STUCK graceful recovery). */
     volatile jlong last_stm_eof_streak;
-    
+
+    /* v36.97 [NATIVE-NOTE-LITE]: per-native bookkeeping cache. The dispatch
+     * sites pass STABLE pointers (string literals / constant-pool entries /
+     * inline-cache-held names), so the last_native string is rebuilt only
+     * when the (cls,mth) pointer pair changes; the coarse stamp refreshes
+     * every 32nd dispatch (spin-break thresholds are seconds, td ages are
+     * diagnostic — a 32-call granularity decides nothing). */
+    const void* note_last_cls;
+    const void* note_last_mth;
+    uint32_t    note_call_tick;
+
     /* Allocator */
     struct {
         void* heap;
@@ -689,6 +807,18 @@ struct JVM {
 
 /* JVM API Functions */
 
+/* v36.93 [NATIVE-RETURN-DIAG]: отметить выход потока из натива (см.
+ * комментарий у поля JavaThread.in_native). Вызывается всеми
+ * диспетчерскими сайтами opcodes.c после возврата нативной функции. */
+void jvm_note_native_return(JavaThread* thread);
+
+/* v36.94 [STALLSTACK-REMOTE]: удалённый дамп кадров застрявшего потока
+ * (seqlock на frame_seq; печатает [STALLSTACK-REMOTE] + [STALL-RING]).
+ * Вызывается beat-сторожем (switch_trace.c), когда [STALL-PROBE] запросил
+ * [STALLSTACK], а поток не может его отдать (нет yield — <1024 инструкций
+ * за эпизод, полевой кейс Metal Slug 6 v36.93). */
+void jvm_threads_dump_stall_frames(int tid);
+
 /* Initialization */
 JVM* jvm_create(void);
 void jvm_destroy(JVM* jvm);
@@ -774,6 +904,17 @@ uint64_t jvm_read_u64(const uint8_t* data);
 int16_t jvm_read_s16(const uint8_t* data);
 int32_t jvm_read_s32(const uint8_t* data);
 int64_t jvm_read_s64(const uint8_t* data);
+
+/* v36.97 [VM-PERF] telemetry (execute.c; consumers: switch_trace.c diag,
+ * threads.c GC-park accounting). All diagnostic-only, lock-free. */
+int64_t jvm_exec_now_ms(void);
+uint64_t jvm_perf_instr_total(void);
+long     jvm_perf_budget_value(void);
+uint32_t jvm_perf_vmpace_slept_ms(void);
+extern volatile uint32_t g_perf_fence_ms_acc;
+extern volatile uint32_t g_perf_srep_ms_acc;
+extern volatile uint32_t g_perf_budget_ms_acc;
+extern volatile uint32_t g_perf_gcsp_ms_acc;
 
 /* Debug Functions */
 void jvm_dump_class(JavaClass* clazz);

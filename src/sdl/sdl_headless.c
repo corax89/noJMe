@@ -192,8 +192,11 @@ void sdl_run(SdlContext* ctx) {
     extern void midp_call_pointerReleased(JVM* jvm, int x, int y);
     extern void midp_call_pointerDragged(JVM* jvm, int x, int y);
 
-    /* v34.33: key script (one-shot scheduled injections) */
-#define KEYSCRIPT_MAX 64
+    /* v34.33: key script (one-shot scheduled injections)
+     * v36.92: 64 -> 512 entries — real-game field replays (Metal Slug 6
+     * mash scripts, 397 events) were silently TRUNCATED at 64, breaking
+     * repro Caps. 512*sizeof(int)*2 = 4 KB stack, negligible. */
+#define KEYSCRIPT_MAX 1200
     int script_frame[KEYSCRIPT_MAX];
     int script_key[KEYSCRIPT_MAX];
     int script_len = 0;
